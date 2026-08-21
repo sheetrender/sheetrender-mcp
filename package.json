@@ -34,7 +34,7 @@
     "access": "public"
   },
   "bugs": "https://github.com/sheetrender/sheetrender-mcp/issues",
-  "author": "SheetRender <info@finaldynamics.com>",
+  "author": "SheetRender <contact@sheetrender.com>",
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",
     "zod": "4.4.3"
