@@ -20,7 +20,9 @@ DENO_VOLUME="sheetrender-mcp-deno-dir"
 docker build -q -t "$IMAGE" -f "$REPO_ROOT/Dockerfile.dev" "$REPO_ROOT" >/dev/null
 
 docker_run() {
-  docker run --rm --init --network=host \
+  # -i so stdin reaches the container: the MCP server speaks JSON-RPC over stdio,
+  # and smoke-testing it means piping request frames in.
+  docker run --rm --init -i --network=host \
     -v "$REPO_ROOT":/repo \
     -v "$VOLUME":/repo/node_modules \
     -v "$DENO_VOLUME":/deno-dir \

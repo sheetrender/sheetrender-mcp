@@ -6,6 +6,10 @@
     "outDir": "dist",
     "rootDir": "src",
     "strict": true,
+    // Named explicitly: Deno's node_modules symlinks every package into .deno/,
+    // and tsc's automatic @types discovery does not follow that layout — without
+    // this, node builtins and globals (process, Buffer) fail to resolve.
+    "types": ["node"],
     "declaration": false,
     "sourceMap": false,
     "skipLibCheck": true

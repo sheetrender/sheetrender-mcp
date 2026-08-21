@@ -1,0 +1,13 @@
+{
+  // Unit tests. Compiles src/ alongside src-test/ into dist-test/ so the tests
+  // run against a self-contained build: the published dist/ emits no .d.ts, so
+  // importing it from here would have nothing to type-check against.
+  // dist-test/ is gitignored and excluded from the published "files" list.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "dist-test",
+    "noEmitOnError": true
+  },
+  "include": ["src", "src-test"]
+}
