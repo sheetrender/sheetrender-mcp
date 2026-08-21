@@ -62,7 +62,10 @@ export interface PageSettings {
     margins?: Margins;
 }
 
-/** Job statuses the backend treats as terminal (`models.TERMINAL_JOB_STATUSES`). */
+/**
+ * Job statuses that mean the job has stopped: it will not progress further and
+ * its document list is final. Anything else means it is still in flight.
+ */
 export const TERMINAL_JOB_STATUSES = new Set([
     "succeeded",
     "partial",

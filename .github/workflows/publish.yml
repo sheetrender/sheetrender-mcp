@@ -19,7 +19,15 @@ jobs:
         with:
           node-version: "22"
           registry-url: https://registry.npmjs.org
+      # Trusted publishing (OIDC) needs npm >= 11.5.1; Node 22 bundles 10.x.
+      - run: npm install -g npm@latest
+      # Refuse to publish when the tag and package.json version disagree.
+      - run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(node -p 'require("./package.json").version')"
+          [ "$tag" = "$version" ] || { echo "tag v$tag != package version $version" >&2; exit 1; }
       - run: deno install --frozen
       - run: deno task build
+      - run: deno task test
       # npm here runs in the CI runner only; the repo's dev flow never invokes it.
       - run: npm publish --provenance --access public

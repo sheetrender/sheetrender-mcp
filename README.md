@@ -39,6 +39,12 @@ Returns the path of the saved PDF and its size. Under 512 KB it is also attached
 inline as a base64 resource, so clients that display attachments show the
 document itself.
 
+Two server limits apply. HTML over 2 MB is rejected — measured both on what you
+send and on the document after `data` is substituted in, so a template that
+expands a long dataset can cross the line even when the markup you wrote does
+not. And on the free plan every rendered PDF carries a "Made with SheetRender"
+footer — from `render_pdf` and `render_template` alike; paid plans do not.
+
 ### `list_templates`
 
 No arguments. Returns each saved template's name, id and last-updated date. Call
@@ -80,7 +86,17 @@ jobs are unavailable rather than failing obscurely.
 Takes `job_id`. Returns the status, rows done and failed, and — once the job
 reaches `succeeded`, `partial`, `failed` or `cancelled` — the id and filename of
 every rendered document. The document list stays empty while the job is
-`queued`, `retry_queued` or `running`.
+`queued`, `retry_queued` or `running`. Those document ids are what `get_document`
+takes.
+
+### `get_document`
+
+Takes `document_id` and downloads that single rendered PDF. The ids come from
+`get_job` on a finished batch; there is no other way to obtain one. Same return
+as `render_pdf` — path, size, and an inline blob under 512 KB.
+
+For a whole batch, the merged PDF and ZIP in the web app beat fetching each
+document in turn.
 
 ### `page_settings`
 
@@ -100,6 +116,10 @@ Margins are plain numbers in millimetres, not CSS lengths.
 Rendered PDFs are written to the system temp directory. Errors from the API —
 a bad key, a missing template, a rate limit — come back as tool errors carrying
 the server's own message.
+
+The public API allows 120 requests per minute per API key. Past that it returns
+429 and the tool reports that you are rate limited and should retry shortly.
+Batch job creation is metered separately and more tightly.
 
 ## Development
 

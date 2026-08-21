@@ -27,8 +27,14 @@
   ],
   "scripts": {
     "build": "node node_modules/.bin/tsc -p tsconfig.json && node node_modules/.bin/tsc -p tsconfig.test.json",
-    "test": "node --test 'dist-test/**/*.test.js'"
+    "test": "cd dist-test && node --test",
+    "prepack": "npm run build"
   },
+  "publishConfig": {
+    "access": "public"
+  },
+  "bugs": "https://github.com/sheetrender/sheetrender-mcp/issues",
+  "author": "SheetRender <info@finaldynamics.com>",
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",
     "zod": "4.4.3"

@@ -5,9 +5,11 @@ import { describe, it } from "node:test";
 
 import { SheetRenderError, type JobStatus } from "../src/client.js";
 import {
+    buildPdfResult,
     formatBytes,
     formatJob,
     formatTemplates,
+    INLINE_BLOB_LIMIT_BYTES,
     looksLikeMissingRoute,
     tempPdfPath,
 } from "../src/format.js";
@@ -78,6 +80,60 @@ describe("tempPdfPath", () => {
 
         assert.equal(dirname(path), tmpdir());
         assert.match(path, /sheetrender-\d+-[0-9a-f]{6}\.pdf$/);
+    });
+});
+
+/** First text item of a tool result, narrowed for assertions. */
+function textOf(result: { content: unknown[] }): string {
+    return (result.content[0] as { text: string }).text;
+}
+
+describe("buildPdfResult", () => {
+    // Shared by render_pdf, render_template and get_document, so a regression
+    // here silently breaks every PDF-returning tool at once.
+    const label = "Downloaded document doc_1.";
+    const path = "/tmp/sheetrender-123-abc123.pdf";
+
+    it("reports the label, path and size, and inlines a small PDF", () => {
+        const bytes = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d]);
+        const result = buildPdfResult(label, path, bytes);
+
+        assert.equal(result.content.length, 2);
+        assert.equal(result.content[0]!.type, "text");
+        const text = textOf(result);
+        assert.match(text, /^Downloaded document doc_1\./);
+        assert.match(text, /Saved to: \/tmp\/sheetrender-123-abc123\.pdf/);
+        assert.match(text, /Size: 5 bytes \(5 bytes\)/);
+
+        assert.equal(result.content[1]!.type, "resource");
+        const embedded = (result.content[1] as {
+            resource: { uri: string; mimeType?: string; blob?: string };
+        }).resource;
+        assert.equal(embedded.uri, "file:///tmp/sheetrender-123-abc123.pdf");
+        assert.equal(embedded.mimeType, "application/pdf");
+        assert.deepEqual([...Buffer.from(embedded.blob!, "base64")], [...bytes]);
+    });
+
+    it("inlines a PDF exactly at the limit", () => {
+        const result = buildPdfResult(label, path, new Uint8Array(INLINE_BLOB_LIMIT_BYTES));
+
+        assert.equal(result.content.length, 2);
+        assert.equal(result.content[1]!.type, "resource");
+    });
+
+    it("drops the blob one byte over the limit and says why", () => {
+        const result = buildPdfResult(label, path, new Uint8Array(INLINE_BLOB_LIMIT_BYTES + 1));
+
+        assert.equal(result.content.length, 1);
+        assert.equal(result.content[0]!.type, "text");
+        assert.match(textOf(result), /Too large to inline/);
+        // The path still has to be there, or the PDF is unreachable.
+        assert.match(textOf(result), /Saved to: \/tmp\/sheetrender/);
+        assert.match(textOf(result), /Size: 512\.0 KB/);
+    });
+
+    it("never marks a delivered PDF as an error", () => {
+        assert.equal(buildPdfResult(label, path, new Uint8Array(10)).isError, undefined);
     });
 });
 

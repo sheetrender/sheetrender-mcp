@@ -159,6 +159,35 @@ describe("requests", () => {
         assert.equal(stub.calls[0]!.url, "https://api.test/api/v1/documents/doc%2F..%2Fsecret");
     });
 
+    it("returns the document bytes verbatim", async () => {
+        const pdf = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x34, 0x00, 0xff]);
+        stubFetch(new Response(pdf, {
+            status: 200,
+            headers: { "content-type": "application/pdf" },
+        }));
+        const bytes = await client().getDocument("doc_1");
+
+        assert.deepEqual([...bytes], [...pdf]);
+    });
+
+    it("surfaces a missing document as a 404 error", async () => {
+        stubFetch(jsonResponse(404, { detail: "Document not found" }));
+        const error = await expectError(client().getDocument("doc_gone"));
+
+        assert.equal(error.status, 404);
+        assert.match(error.message, /Downloading document doc_gone failed: Document not found/);
+    });
+
+    it("rejects an empty PDF body", async () => {
+        stubFetch(new Response(new Uint8Array(), {
+            status: 200,
+            headers: { "content-type": "application/pdf" },
+        }));
+        const error = await expectError(client().getDocument("doc_1"));
+
+        assert.match(error.message, /empty PDF/);
+    });
+
     it("rejects a non-PDF body on a PDF route", async () => {
         stubFetch(new Response("not a pdf", {
             status: 200,

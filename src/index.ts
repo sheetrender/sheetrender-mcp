@@ -7,7 +7,6 @@
  */
 
 import { writeFile } from "node:fs/promises";
-import { pathToFileURL } from "node:url";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -21,7 +20,7 @@ import {
     type PageSettings,
 } from "./client.js";
 import {
-    formatBytes,
+    buildPdfResult,
     formatJob,
     formatTemplates,
     looksLikeMissingRoute,
@@ -30,9 +29,6 @@ import {
 
 const SERVER_NAME = "sheetrender";
 const SERVER_VERSION = "0.1.0";
-
-/** PDFs at or under this size are also returned inline as a base64 blob. */
-const INLINE_BLOB_LIMIT_BYTES = 512 * 1024;
 
 const WHAT_IS_SHEETRENDER =
     "SheetRender turns HTML templates plus spreadsheet rows into rendered PDFs.";
@@ -93,38 +89,11 @@ function toToolError(error: unknown): CallToolResult {
     return errorResult(`Unexpected error: ${String(error)}`);
 }
 
-/**
- * Writes the PDF to a temp file and describes it. Small PDFs are additionally
- * returned as an embedded base64 resource so clients that render attachments
- * can show the document without reading the file back.
- */
+/** Writes the PDF to a temp file and describes it for the caller. */
 async function deliverPdf(bytes: Uint8Array, label: string): Promise<CallToolResult> {
     const filePath = tempPdfPath();
     await writeFile(filePath, bytes);
-
-    const summary =
-        `${label}\nSaved to: ${filePath}\nSize: ${formatBytes(bytes.byteLength)} ` +
-        `(${bytes.byteLength} bytes)`;
-    const content: CallToolResult["content"] = [{ type: "text", text: summary }];
-
-    if (bytes.byteLength <= INLINE_BLOB_LIMIT_BYTES) {
-        content.push({
-            type: "resource",
-            resource: {
-                uri: pathToFileURL(filePath).href,
-                mimeType: "application/pdf",
-                blob: Buffer.from(bytes).toString("base64"),
-            },
-        });
-    } else {
-        content[0] = {
-            type: "text",
-            text:
-                `${summary}\n(Too large to inline — read it from the path above.)`,
-        };
-    }
-
-    return { content };
+    return buildPdfResult(label, filePath, bytes);
 }
 
 
@@ -140,7 +109,8 @@ export function createServer(client: SheetRenderClient): McpServer {
                 `${WHAT_IS_SHEETRENDER} Use render_pdf for one-off documents built from ` +
                 "HTML you write, render_template for documents from a template already saved " +
                 "in the user's account (list_templates finds their ids), and create_batch_job " +
-                "plus get_job to render one PDF per row of an uploaded spreadsheet.",
+                "plus get_job to render one PDF per row of an uploaded spreadsheet — then " +
+                "get_document to download any of the PDFs that batch produced.",
         },
     );
 
@@ -160,6 +130,11 @@ export function createServer(client: SheetRenderClient): McpServer {
                 "`data` keys become Jinja template variables, so passing " +
                 '{"total": "42.00"} lets the HTML say {{ total }}. Jinja loops and ' +
                 "conditionals work too. Omit `data` if the HTML has no placeholders.\n\n" +
+                "Two server limits to plan for: HTML over 2 MB is rejected, measured both on " +
+                "what you send and on the result after `data` is substituted in, so keep large " +
+                "tables paginated rather than emitting one enormous document; and accounts on " +
+                'the free plan get a "Made with SheetRender" footer added to every PDF, which ' +
+                "is expected, not a bug — mention it if the user seems surprised.\n\n" +
                 "Returns the temp-file path and size; PDFs under 512 KB are also attached inline.",
             inputSchema: {
                 html: z
@@ -223,6 +198,8 @@ export function createServer(client: SheetRenderClient): McpServer {
                 "create_batch_job rather than calling this repeatedly.\n\n" +
                 "Omit `page_settings` to keep the template's own saved page setup — passing it " +
                 "overrides that for this render only.\n\n" +
+                'Free-plan accounts get a "Made with SheetRender" footer on the PDF, same as ' +
+                "render_pdf — expected, not a bug.\n\n" +
                 "Returns the temp-file path and size; PDFs under 512 KB are also attached inline.",
             inputSchema: {
                 template_id: z
@@ -327,7 +304,8 @@ export function createServer(client: SheetRenderClient): McpServer {
                 'state ("succeeded", "partial", "failed" or "cancelled") — the id and filename ' +
                 "of every rendered document. The document list is empty while the job is still " +
                 'in "queued", "retry_queued" or "running", so poll again after a short wait ' +
-                "rather than assuming zero documents.",
+                "rather than assuming zero documents.\n\n" +
+                "Pass those document ids to get_document to download the individual PDFs.",
             inputSchema: {
                 job_id: z.string().min(1).describe("Job id returned by create_batch_job."),
             },
@@ -335,6 +313,37 @@ export function createServer(client: SheetRenderClient): McpServer {
         async ({ job_id }) => {
             try {
                 return textResult(formatJob(await client.getJob(job_id)));
+            } catch (error) {
+                return toToolError(error);
+            }
+        },
+    );
+
+    server.registerTool(
+        "get_document",
+        {
+            title: "Download a rendered document",
+            description:
+                `${WHAT_IS_SHEETRENDER} This tool downloads one PDF produced by a batch job ` +
+                "and returns the path to the saved file.\n\n" +
+                "`document_id` comes from get_job on a finished batch — that is the only place " +
+                "these ids appear, so call get_job first and take an id from its document list. " +
+                "A document id is not a template id or a job id.\n\n" +
+                "Use it to fetch a specific output the user asked about, or to spot-check a " +
+                "batch. Fetching every document of a large batch one at a time is slow; point " +
+                "the user at the SheetRender web app for the merged PDF or ZIP instead.\n\n" +
+                "Returns the temp-file path and size; PDFs under 512 KB are also attached inline.",
+            inputSchema: {
+                document_id: z
+                    .string()
+                    .min(1)
+                    .describe("Document id from a finished job's document list in get_job."),
+            },
+        },
+        async ({ document_id }) => {
+            try {
+                const bytes = await client.getDocument(document_id);
+                return await deliverPdf(bytes, `Downloaded document ${document_id}.`);
             } catch (error) {
                 return toToolError(error);
             }

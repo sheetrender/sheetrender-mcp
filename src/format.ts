@@ -8,6 +8,9 @@
 import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 
 import {
     SheetRenderError,
@@ -21,6 +24,49 @@ export function tempPdfPath(): string {
     // The random suffix is not decoration: two renders in the same millisecond
     // would otherwise write to the same path and the first would be lost.
     return join(tmpdir(), `sheetrender-${Date.now()}-${randomBytes(3).toString("hex")}.pdf`);
+}
+
+/** PDFs at or under this size are also returned inline as a base64 blob. */
+export const INLINE_BLOB_LIMIT_BYTES = 512 * 1024;
+
+/**
+ * Describes a PDF that has already been written to `filePath`.
+ *
+ * Small PDFs are additionally returned as an embedded base64 resource so that
+ * clients which render attachments can show the document without reading the
+ * file back; large ones would blow up the context, so they get the path only.
+ */
+export function buildPdfResult(
+    label: string,
+    filePath: string,
+    bytes: Uint8Array,
+): CallToolResult {
+    const summary =
+        `${label}\nSaved to: ${filePath}\nSize: ${formatBytes(bytes.byteLength)} ` +
+        `(${bytes.byteLength} bytes)`;
+
+    if (bytes.byteLength > INLINE_BLOB_LIMIT_BYTES) {
+        return {
+            content: [{
+                type: "text",
+                text: `${summary}\n(Too large to inline — read it from the path above.)`,
+            }],
+        };
+    }
+
+    return {
+        content: [
+            { type: "text", text: summary },
+            {
+                type: "resource",
+                resource: {
+                    uri: pathToFileURL(filePath).href,
+                    mimeType: "application/pdf",
+                    blob: Buffer.from(bytes).toString("base64"),
+                },
+            },
+        ],
+    };
 }
 
 export function formatBytes(byteLength: number): string {
