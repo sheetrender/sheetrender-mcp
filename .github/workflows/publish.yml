@@ -1,0 +1,25 @@
+name: Publish to npm
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # npm trusted publishing + provenance
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: "2.9.4"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: https://registry.npmjs.org
+      - run: deno install --frozen
+      - run: deno task build
+      # npm here runs in the CI runner only; the repo's dev flow never invokes it.
+      - run: npm publish --provenance --access public

@@ -1,0 +1,40 @@
+{
+  "name": "@sheetrender/mcp",
+  "version": "0.1.0",
+  "description": "MCP server for SheetRender: render PDFs from HTML templates and spreadsheet data via the SheetRender API.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "sheetrender-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sheetrender/sheetrender-mcp.git"
+  },
+  "homepage": "https://sheetrender.com",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "pdf",
+    "spreadsheet",
+    "sheetrender"
+  ],
+  "scripts": {
+    "build": "node node_modules/.bin/tsc -p tsconfig.json",
+    "test": "node --test dist-test/"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "26.2.0",
+    "typescript": "7.0.2"
+  }
+}
