@@ -7,6 +7,7 @@
  */
 
 import { writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -28,7 +29,11 @@ import {
 } from "./format.js";
 
 const SERVER_NAME = "sheetrender";
-const SERVER_VERSION = "0.1.0";
+// package.json sits one level above the compiled dist/ both in the repo and in
+// the published tarball, so the reported version always tracks the release.
+const SERVER_VERSION: string = createRequire(import.meta.url)(
+    "../package.json",
+).version;
 
 const WHAT_IS_SHEETRENDER =
     "SheetRender turns HTML templates plus spreadsheet rows into rendered PDFs.";
