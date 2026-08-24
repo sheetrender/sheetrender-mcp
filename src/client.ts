@@ -14,6 +14,11 @@ const DEFAULT_BASE_URL = "https://sheetrender.com";
 const JSON_TIMEOUT_MS = 30_000;
 /** Render timeout. A Chromium render of a large document is not quick. */
 const RENDER_TIMEOUT_MS = 180_000;
+/**
+ * Dataset timeout. A 20 MB workbook has to be uploaded, parsed and stored, and
+ * 50,000 JSON rows are written out as a workbook and parsed straight back.
+ */
+const DATASET_TIMEOUT_MS = 120_000;
 
 export interface SheetRenderConfig {
     baseUrl: string;
@@ -25,6 +30,26 @@ export interface TemplateSummary {
     name: string;
     created_at: string | null;
     updated_at: string | null;
+}
+
+export interface DatasetColumn {
+    /**
+     * The sanitized column key. This — not `original` — is what a template's
+     * placeholders and a job's `group_by` address the column by.
+     */
+    key: string;
+    /** The header text as it appeared in the spreadsheet or JSON rows. */
+    original: string;
+    inferred_type: "string" | "number";
+}
+
+export interface DatasetSummary {
+    id: string;
+    filename: string | null;
+    sheet_name: string | null;
+    columns: DatasetColumn[];
+    row_count: number | null;
+    created_at: string | null;
 }
 
 export interface JobDocument {
@@ -157,7 +182,21 @@ const STATUS_HINTS: Record<number, string> = {
     503: "the server is temporarily unavailable",
 };
 
-async function toError(response: Response, what: string): Promise<SheetRenderError> {
+/**
+ * Extra sentences appended to a failure, keyed by status.
+ *
+ * The status hints above only ever appear when the body carried no detail, and
+ * the dataset routes always carry one — a good one, written for a human. What
+ * they cannot say is which *other* SheetRender call gets the caller unstuck, so
+ * that advice is added here rather than replacing the server's wording.
+ */
+type StatusAdvice = Record<number, string>;
+
+async function toError(
+    response: Response,
+    what: string,
+    advice?: StatusAdvice,
+): Promise<SheetRenderError> {
     let detail: unknown;
     let bodyText = "";
     try {
@@ -179,12 +218,14 @@ async function toError(response: Response, what: string): Promise<SheetRenderErr
     }
 
     const described = describeDetail(detail);
+    const extra = advice?.[response.status];
+    const suffix = extra ? ` ${extra}` : "";
 
     if (response.status === 429) {
         return new SheetRenderError(
             `${what} failed: rate limited, retry shortly (HTTP 429${
                 described ? ` — ${described}` : ""
-            }).`,
+            }).${suffix}`,
             429,
             detail,
         );
@@ -193,11 +234,55 @@ async function toError(response: Response, what: string): Promise<SheetRenderErr
     const hint = STATUS_HINTS[response.status];
     const tail = described ?? hint ?? response.statusText ?? "unknown error";
     return new SheetRenderError(
-        `${what} failed: ${tail} (HTTP ${response.status}).`,
+        `${what} failed: ${tail} (HTTP ${response.status}).${suffix}`,
         response.status,
         detail,
     );
 }
+
+/**
+ * Rejects the row values `JSON.stringify` would quietly rewrite.
+ *
+ * The server has its own check for these and a better message for most of what
+ * a row can hold — but it never sees these three. `JSON.stringify` turns NaN
+ * and Infinity into `null` and drops an `undefined` value's key entirely, so
+ * without this the server's 400 cannot fire and a bad number lands in the
+ * spreadsheet as an empty cell. Everything else — nested objects, oversized
+ * integers, the row and cell caps — is left to the server, whose messages name
+ * the offending column and whose limits must not be duplicated here to drift.
+ */
+function assertSerialisableRows(rows: Record<string, unknown>[]): void {
+    for (const [index, row] of rows.entries()) {
+        for (const [column, value] of Object.entries(row)) {
+            if (typeof value === "number" && !Number.isFinite(value)) {
+                throw new SheetRenderError(
+                    `Row ${index + 1}, column "${column}" is ${
+                        Number.isNaN(value) ? "NaN" : String(value)
+                    }, which a spreadsheet cell cannot hold. Send a number, a string or null.`,
+                );
+            }
+            if (value === undefined) {
+                throw new SheetRenderError(
+                    `Row ${index + 1}, column "${column}" is undefined. Use null for a blank ` +
+                        "cell, or leave the key out of that row entirely.",
+                );
+            }
+        }
+    }
+}
+
+/**
+ * Advice for the three dataset routes. 404 is deliberate: the API answers a
+ * template belonging to someone else with the same "Template not found" as one
+ * that never existed, so the only useful next step is re-checking the id.
+ */
+const DATASET_ADVICE: StatusAdvice = {
+    400: "Check the data itself: a file has to be a .csv or .xlsx with a header row, " +
+        "and JSON rows have to be flat — no nested objects or arrays, no NaN or Infinity, " +
+        "and whole numbers beyond 2^53 sent as strings.",
+    404: "Check template_id against list_templates.",
+    413: "Split it into smaller datasets and create one job per part.",
+};
 
 /** Turns a fetch/network rejection into a `SheetRenderError` with the cause kept. */
 function toNetworkError(error: unknown, what: string, baseUrl: string): SheetRenderError {
@@ -223,9 +308,12 @@ interface RequestOptions {
     path: string;
     /** Human-readable description of the operation, used in error messages. */
     what: string;
+    /** JSON-serialised, unless it is a `FormData`, which is sent as multipart. */
     body?: unknown;
     accept: "json" | "pdf";
     timeoutMs?: number;
+    /** Per-status sentences appended to the error message. */
+    advice?: StatusAdvice;
 }
 
 export class SheetRenderClient {
@@ -245,21 +333,29 @@ export class SheetRenderClient {
             Authorization: `Bearer ${this.#apiKey}`,
             Accept: accept === "pdf" ? "application/pdf" : "application/json",
         };
-        if (body !== undefined) headers["Content-Type"] = "application/json";
+        const multipart = body instanceof FormData;
+        // A multipart Content-Type is deliberately left unset: fetch derives it
+        // from the FormData along with the boundary, and naming it here would
+        // send a boundary-less header the server cannot split the parts with.
+        if (body !== undefined && !multipart) headers["Content-Type"] = "application/json";
 
         let response: Response;
         try {
             response = await fetch(`${this.baseUrl}${path}`, {
                 method,
                 headers,
-                body: body === undefined ? undefined : JSON.stringify(body),
+                body: body === undefined
+                    ? undefined
+                    : multipart
+                    ? body
+                    : JSON.stringify(body),
                 signal: AbortSignal.timeout(timeoutMs),
                 redirect: "follow",
             });
         } catch (error) {
             throw toNetworkError(error, what, this.baseUrl);
         }
-        if (!response.ok) throw await toError(response, what);
+        if (!response.ok) throw await toError(response, what, options.advice);
         return response;
     }
 
@@ -340,6 +436,75 @@ export class SheetRenderClient {
             what: `Rendering template ${templateId}`,
             body,
             accept: "pdf",
+        });
+    }
+
+    /**
+     * POST /api/v1/templates/{id}/datasets/rows — a dataset from JSON rows.
+     *
+     * The server builds the header from the union of the row keys in first-seen
+     * order, so a row that omits a key gets a blank cell rather than a shifted
+     * one. Rows are otherwise sent as given: shaping them into a rectangle here
+     * would only disagree with the server about what a missing cell means.
+     */
+    // `async` so the row check below rejects rather than throwing synchronously:
+    // every other method here hands back a promise, and a caller that reaches
+    // for `.catch()` instead of `try` would otherwise miss this one.
+    async createDatasetFromRows(
+        templateId: string,
+        rows: Record<string, unknown>[],
+        name?: string,
+    ): Promise<DatasetSummary> {
+        assertSerialisableRows(rows);
+        const body: Record<string, unknown> = { rows };
+        if (name !== undefined) body.name = name;
+        return this.#json<DatasetSummary>({
+            method: "POST",
+            path: `/api/v1/templates/${encodeURIComponent(templateId)}/datasets/rows`,
+            what: `Creating a dataset on template ${templateId}`,
+            body,
+            accept: "json",
+            timeoutMs: DATASET_TIMEOUT_MS,
+            advice: DATASET_ADVICE,
+        });
+    }
+
+    /**
+     * POST /api/v1/templates/{id}/datasets — a dataset from spreadsheet bytes.
+     *
+     * Takes bytes rather than a path so the client stays a pure HTTP layer; the
+     * caller reads and vets the file (see `readDatasetFile`).
+     */
+    uploadDataset(
+        templateId: string,
+        filename: string,
+        data: Uint8Array,
+    ): Promise<DatasetSummary> {
+        const form = new FormData();
+        // Copied into its own ArrayBuffer: a Uint8Array view of a larger pooled
+        // Node Buffer would otherwise upload the whole underlying allocation.
+        const bytes = new Uint8Array(data.byteLength);
+        bytes.set(data);
+        form.append("file", new Blob([bytes]), filename);
+        return this.#json<DatasetSummary>({
+            method: "POST",
+            path: `/api/v1/templates/${encodeURIComponent(templateId)}/datasets`,
+            what: `Uploading ${filename} to template ${templateId}`,
+            body: form,
+            accept: "json",
+            timeoutMs: DATASET_TIMEOUT_MS,
+            advice: DATASET_ADVICE,
+        });
+    }
+
+    /** GET /api/v1/templates/{id}/datasets — datasets this template can run. */
+    listDatasets(templateId: string): Promise<DatasetSummary[]> {
+        return this.#json<DatasetSummary[]>({
+            method: "GET",
+            path: `/api/v1/templates/${encodeURIComponent(templateId)}/datasets`,
+            what: `Listing datasets for template ${templateId}`,
+            accept: "json",
+            advice: DATASET_ADVICE,
         });
     }
 

@@ -1,16 +1,25 @@
 import assert from "node:assert/strict";
-import { tmpdir } from "node:os";
-import { dirname } from "node:path";
+import { mkdir, mkdtemp, truncate, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 
-import { SheetRenderError, type JobStatus } from "../src/client.js";
+import {
+    SheetRenderError,
+    type DatasetSummary,
+    type JobStatus,
+} from "../src/client.js";
 import {
     buildPdfResult,
     formatBytes,
+    formatDataset,
+    formatDatasets,
     formatJob,
     formatTemplates,
     INLINE_BLOB_LIMIT_BYTES,
     looksLikeMissingRoute,
+    MAX_DATASET_UPLOAD_BYTES,
+    readDatasetFile,
     tempPdfPath,
 } from "../src/format.js";
 
@@ -250,5 +259,165 @@ describe("formatJob", () => {
         });
 
         assert.match(text, /Rows: 0\/0 done/);
+    });
+});
+
+describe("formatDataset", () => {
+    const dataset: DatasetSummary = {
+        id: "ds_1",
+        filename: "march-invoices.xlsx",
+        sheet_name: "Data",
+        columns: [
+            { key: "invoice_no", original: "Invoice No", inferred_type: "number" },
+            { key: "client", original: "client", inferred_type: "string" },
+        ],
+        row_count: 120,
+        created_at: "2026-08-24T10:00:00Z",
+    };
+
+    it("leads with the id, file and row count", () => {
+        const text = formatDataset(dataset);
+
+        assert.match(text, /^Dataset ds_1$/m);
+        assert.match(text, /File: march-invoices\.xlsx \(sheet "Data"\)/);
+        assert.match(text, /Rows: 120/);
+        assert.match(text, /Created: 2026-08-24T10:00:00Z/);
+    });
+
+    it("shows the sanitized key and the header it came from", () => {
+        const text = formatDataset(dataset);
+
+        // The key is what group_by and the placeholders address; a model that
+        // reads "Invoice No" off this result and passes that to create_batch_job
+        // has named a column that does not exist.
+        assert.match(text, /use the key in template placeholders/);
+        assert.match(text, /- invoice_no \(number\) — from "Invoice No"/);
+        // No "from" noise when sanitizing changed nothing.
+        assert.match(text, /- client \(string\)$/m);
+    });
+
+    it("survives a dataset with no columns and null fields", () => {
+        const text = formatDataset({
+            ...dataset,
+            filename: null,
+            sheet_name: null,
+            row_count: null,
+            created_at: null,
+            columns: [],
+        });
+
+        assert.match(text, /File: \(unnamed\)$/m);
+        assert.match(text, /Rows: 0/);
+        assert.match(text, /Columns: none detected\./);
+        assert.doesNotMatch(text, /Created:/);
+    });
+});
+
+describe("formatDatasets", () => {
+    const dataset: DatasetSummary = {
+        id: "ds_1",
+        filename: "clients.csv",
+        sheet_name: "Sheet1",
+        columns: [{ key: "client", original: "client", inferred_type: "string" }],
+        row_count: 2,
+        created_at: "2026-08-24T10:00:00Z",
+    };
+
+    it("names both ways to make one when there are none", () => {
+        const text = formatDatasets([]);
+
+        assert.match(text, /No datasets/);
+        assert.match(text, /create_dataset/);
+        assert.match(text, /upload_dataset/);
+    });
+
+    it("counts and separates the datasets it lists", () => {
+        const text = formatDatasets([dataset, { ...dataset, id: "ds_2" }]);
+
+        assert.match(text, /^2 datasets \(newest first\):/);
+        assert.match(text, /Dataset ds_1/);
+        assert.match(text, /Dataset ds_2/);
+    });
+
+    it("uses the singular for one", () => {
+        assert.match(formatDatasets([dataset]), /^1 dataset \(newest first\):/);
+    });
+});
+
+describe("readDatasetFile", () => {
+    async function tempFile(name: string, contents: string): Promise<string> {
+        const dir = await mkdtemp(join(tmpdir(), "sheetrender-test-"));
+        const path = join(dir, name);
+        await writeFile(path, contents);
+        return path;
+    }
+
+    it("reads a .csv and names it by its basename", async () => {
+        const path = await tempFile("clients.csv", "client,total\nAcme,42\n");
+        const { filename, bytes } = await readDatasetFile(path);
+
+        assert.equal(filename, "clients.csv");
+        assert.equal(new TextDecoder().decode(bytes), "client,total\nAcme,42\n");
+    });
+
+    it("accepts .xlsx and an uppercase extension", async () => {
+        const path = await tempFile("Book1.XLSX", "PKstub");
+        assert.equal((await readDatasetFile(path)).filename, "Book1.XLSX");
+    });
+
+    it("refuses a format the server cannot parse, and points at create_dataset", async () => {
+        const path = await tempFile("report.pdf", "%PDF-1.4");
+        await assert.rejects(
+            readDatasetFile(path),
+            (error: Error) =>
+                error instanceof SheetRenderError &&
+                /not a spreadsheet SheetRender can read/.test(error.message) &&
+                /create_dataset/.test(error.message),
+        );
+    });
+
+    it("refuses an empty file rather than uploading no rows", async () => {
+        const path = await tempFile("empty.csv", "");
+        await assert.rejects(readDatasetFile(path), /is empty/);
+    });
+
+    it("refuses a file over the 20 MB cap before it is sent", async () => {
+        const path = await tempFile("huge.csv", "a");
+        // Sparse: 21 MB of stat.size without 21 MB of writing.
+        await truncate(path, MAX_DATASET_UPLOAD_BYTES + 1024 * 1024);
+
+        await assert.rejects(
+            readDatasetFile(path),
+            (error: Error) =>
+                /21\.00 MB/.test(error.message) &&
+                /20\.00 MB upload limit/.test(error.message) &&
+                /Split it into smaller files/.test(error.message),
+        );
+    });
+
+    it("reports a missing file as a read failure, not a crash", async () => {
+        const path = join(tmpdir(), "sheetrender-does-not-exist-1234.csv");
+        await assert.rejects(
+            readDatasetFile(path),
+            (error: Error) =>
+                error instanceof SheetRenderError && /Could not read/.test(error.message),
+        );
+    });
+
+    it("refuses a directory", async () => {
+        const dir = await mkdtemp(join(tmpdir(), "sheetrender-test-"));
+        const path = join(dir, "data.csv");
+        await mkdir(path);
+
+        await assert.rejects(readDatasetFile(path), /is a directory/);
+    });
+
+    it("expands a leading ~ to the home directory", async () => {
+        // A test writes nothing into $HOME, so the observable effect of the
+        // expansion is the resolved path in the failure message.
+        await assert.rejects(
+            readDatasetFile("~/sheetrender-does-not-exist-1234.csv"),
+            (error: Error) => error.message.includes(homedir()),
+        );
     });
 });

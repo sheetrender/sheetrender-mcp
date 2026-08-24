@@ -63,24 +63,71 @@ Renders one PDF from a template already saved in the account.
 
 Same return as `render_pdf`.
 
-### `create_batch_job`
+### `create_dataset`
 
-Queues a background job that renders one PDF per row of a dataset already
-uploaded to the project. This server can't upload spreadsheets.
+Turns JSON rows into a dataset a batch job can render. This is the usual way to
+start a batch: assemble the rows, send them, get back a `dataset_id`.
+
+| Argument | Type | |
+| --- | --- | --- |
+| `template_id` | string | Required, from `list_templates`. The dataset lands in that template's project. |
+| `rows` | array of objects | Required. One flat object per document. |
+| `name` | string | Optional label, used as the stored filename. |
+
+The header is the union of every row's keys in first-seen order, so rows don't
+have to agree on their keys — a missing one is a blank cell rather than a
+shifted row. Values have to be scalars: strings, numbers, booleans or null.
+Nested objects and arrays are rejected, and so are NaN, Infinity and whole
+numbers past 2^53 (send those as strings to keep them exact). The caps are
+50,000 rows and 500,000 cells per call.
+
+Returns the dataset id, row count and, for each column, the **sanitized key**.
+That key is what template placeholders, `filename_template` and `group_by`
+address, and it's often not the header verbatim — `Invoice No` becomes
+`invoice_no`. Read it off this result instead of guessing.
+
+Creating a dataset is free; only rendering counts against the plan.
+
+### `upload_dataset`
+
+The same thing from a file that already exists.
 
 | Argument | Type | |
 | --- | --- | --- |
 | `template_id` | string | Required, from `list_templates`. |
-| `dataset_id` | string | Required. A dataset in the same project as the template. |
+| `file_path` | string | Required. A `.csv` or `.xlsx` on the machine running this server — the user's machine, not SheetRender's. `~` is expanded. |
+
+The first row has to be the header. Files over 20 MB, the wrong extension and
+empty files are refused locally, before anything is uploaded. Same return as
+`create_dataset`.
+
+### `list_datasets`
+
+Takes `template_id` and lists every dataset in that template's project, newest
+first, with ids, row counts and column keys. Use it to find data the user
+already loaded, or to read a dataset's column keys before writing a
+`filename_template` or picking `group_by`.
+
+### `create_batch_job`
+
+Queues a background job that renders one PDF per row of a dataset. The whole
+loop runs from here — `list_templates` → `create_dataset` or `upload_dataset` →
+`create_batch_job` → `get_job` → `get_document`.
+
+| Argument | Type | |
+| --- | --- | --- |
+| `template_id` | string | Required, from `list_templates`. |
+| `dataset_id` | string | Required, from `create_dataset`, `upload_dataset` or `list_datasets`. Must be in the same project as the template. |
 | `filename_template` | string | Optional. Output naming pattern, e.g. `invoice-{{ invoice_no }}`. |
-| `group_by` | string | Optional. Column to group rows by, giving one multi-page PDF per distinct value. |
+| `group_by` | string | Optional. Column key to group rows by, giving one multi-page PDF per distinct value. |
 
 Returns the job id to poll with `get_job`. Worth knowing: `filename_template`
 and `group_by` are persisted to the template and the project respectively, so
 they change the defaults for later runs too.
 
 If the server predates the public batch endpoint, the tool reports that batch
-jobs are unavailable rather than failing obscurely.
+jobs are unavailable rather than failing obscurely. The three dataset tools do
+the same for a server that predates the dataset endpoints.
 
 ### `get_job`
 
