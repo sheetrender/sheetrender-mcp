@@ -1,10 +1,9 @@
 name: Publish to MCP registry
 
-# Publishes server.json to the official MCP registry. OIDC from a workflow in
-# this org-owned repo grants the io.github.sheetrender/* namespace directly, so
-# no interactive GitHub login is involved. Run it manually after an npm release
-# (server.json's package version must already be live on npm, since the
-# registry verifies the published package's mcpName field).
+# Manual fallback: republishes the committed server.json as-is (e.g. after a
+# metadata-only edit). Normal releases don't need this — publish.yml pushes to
+# the registry automatically after every npm release, with versions synced from
+# the tag. OIDC from this org-owned repo grants io.github.sheetrender/*.
 on:
   workflow_dispatch:
 

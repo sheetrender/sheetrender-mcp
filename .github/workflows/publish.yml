@@ -31,3 +31,37 @@ jobs:
       - run: deno task test
       # npm here runs in the CI runner only; the repo's dev flow never invokes it.
       - run: npm publish --provenance --access public
+
+  # Publishes the release to the official MCP registry after npm. server.json's
+  # version fields are overwritten from the tag here, so a release never needs a
+  # manual server.json bump — the committed values are informational only.
+  mcp-registry:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # OIDC grants the io.github.sheetrender/* namespace
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sync server.json versions to the release tag
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          jq --arg v "$tag" '.version = $v | .packages[0].version = $v' server.json > server.json.tmp
+          mv server.json.tmp server.json
+      # The registry checks the published npm package's mcpName field, so wait
+      # until npm actually serves this version before publishing to it.
+      - name: Wait for npm to serve the release
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          for _ in $(seq 1 30); do
+            curl -fsS "https://registry.npmjs.org/@sheetrender/mcp/$tag" >/dev/null && exit 0
+            sleep 10
+          done
+          echo "npm never served $tag" >&2
+          exit 1
+      - name: Install mcp-publisher
+        run: |
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" \
+            | tar -xz mcp-publisher
+      - run: ./mcp-publisher login github-oidc
+      - run: ./mcp-publisher publish
