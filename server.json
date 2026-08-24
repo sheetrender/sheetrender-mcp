@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.sheetrender/sheetrender-mcp",
-  "description": "MCP server for SheetRender: render PDFs from HTML templates and spreadsheet data via the SheetRender API.",
+  "description": "MCP server for SheetRender: render PDFs from HTML templates and spreadsheet data.",
   "repository": {
     "url": "https://github.com/sheetrender/sheetrender-mcp",
     "source": "github"
