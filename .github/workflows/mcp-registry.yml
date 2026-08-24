@@ -1,0 +1,24 @@
+name: Publish to MCP registry
+
+# Publishes server.json to the official MCP registry. OIDC from a workflow in
+# this org-owned repo grants the io.github.sheetrender/* namespace directly, so
+# no interactive GitHub login is involved. Run it manually after an npm release
+# (server.json's package version must already be live on npm, since the
+# registry verifies the published package's mcpName field).
+on:
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # OIDC for mcp-publisher login github-oidc
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install mcp-publisher
+        run: |
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" \
+            | tar -xz mcp-publisher
+      - run: ./mcp-publisher login github-oidc
+      - run: ./mcp-publisher publish
