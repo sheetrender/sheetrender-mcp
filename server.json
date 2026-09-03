@@ -1,17 +1,17 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.sheetrender/sheetrender-mcp",
-  "description": "MCP server for SheetRender: render PDFs from HTML templates and spreadsheet data.",
+  "description": "MCP server for SheetRender: render PDFs from templates and spreadsheet data, as a local stdio server or via the hosted endpoint at mcp.sheetrender.com.",
   "repository": {
     "url": "https://github.com/sheetrender/sheetrender-mcp",
     "source": "github"
   },
-  "version": "0.1.1",
+  "version": "0.3.1",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@sheetrender/mcp",
-      "version": "0.1.1",
+      "version": "0.3.1",
       "transport": {
         "type": "stdio"
       },
@@ -29,6 +29,22 @@
           "format": "string",
           "isSecret": false,
           "name": "SHEETRENDER_API_URL"
+        }
+      ]
+    }
+  ],
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://mcp.sheetrender.com/mcp",
+      "headers": [
+        {
+          "name": "Authorization",
+          "description": "Bearer <SheetRender API key> (sr_live_..., from sheetrender.com under Settings)",
+          "isRequired": true,
+          "isSecret": true,
+          "format": "string",
+          "placeholder": "Bearer sr_live_..."
         }
       ]
     }
