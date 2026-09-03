@@ -23,6 +23,69 @@ API keys, then add this to your MCP client config:
 `SHEETRENDER_API_URL` is also read, and defaults to `https://sheetrender.com`.
 Set it only if you're pointing at a self-hosted or staging instance.
 
+## Hosted endpoint
+
+The same server runs at **`https://mcp.sheetrender.com/mcp`** over Streamable
+HTTP, so clients that can't spawn a local process can use it too. Nothing is
+installed; each request carries your API key:
+
+```
+Authorization: Bearer sr_live_...
+```
+
+Requests without that header get a 401. The key goes straight through to the
+SheetRender API for that one request and is never stored — the server keeps no
+sessions, so every request stands alone.
+
+Where the key goes depends on the client:
+
+- **Claude Code**:
+  `claude mcp add --transport http sheetrender https://mcp.sheetrender.com/mcp --header "Authorization: Bearer sr_live_..."`
+- **Cursor, Windsurf, VS Code** and other clients with an `mcp.json`:
+
+  ```json
+  {
+    "mcpServers": {
+      "sheetrender": {
+        "url": "https://mcp.sheetrender.com/mcp",
+        "headers": { "Authorization": "Bearer sr_live_..." }
+      }
+    }
+  }
+  ```
+
+- **Claude API** (the Messages API's MCP connector): add
+  `{"type": "url", "url": "https://mcp.sheetrender.com/mcp", "name": "sheetrender", "authorization_token": "sr_live_..."}`
+  to `mcp_servers`.
+- **claude.ai, Claude Desktop and ChatGPT custom connectors** take a server URL
+  and an OAuth client, not a static header. Until the endpoint speaks OAuth,
+  use the stdio package above there — it's the same tools, with the key in
+  `env` — or bridge with `npx mcp-remote https://mcp.sheetrender.com/mcp --header "Authorization: Bearer sr_live_..."`
+  as the command.
+
+Two differences from the stdio server follow from the process not running on
+your machine. Rendered PDFs come back inline as a base64 resource (up to 8 MB;
+larger ones are reported with their size and left for the web app) instead of
+as a temp-file path, and `upload_dataset` is not offered because there is no
+local file to read — send rows with `create_dataset` instead.
+
+`GET /healthz` answers 200 without credentials. Request bodies are capped at
+25 MB; anything larger is a 413.
+
+### Running it yourself
+
+`sheetrender-mcp-http` is a second bin in the package. It reads `PORT`
+(default 8080), `HOST` (default `0.0.0.0`), `SHEETRENDER_API_URL`,
+`MAX_BODY_BYTES` and `IDLE_TIMEOUT_MS` (default 60000), and logs one JSON
+line per request to stdout — method, path, status, duration, the JSON-RPC
+method and tool name, and a fingerprint of the key, never the key. The
+`Dockerfile` in this repo builds a non-root runtime image for it:
+
+```sh
+docker build -t sheetrender-mcp .
+docker run --rm -p 8080:8080 sheetrender-mcp
+```
+
 ## Tools
 
 ### `render_pdf`
@@ -172,6 +235,7 @@ Batch job creation is metered separately and more tightly.
 ## Development
 
 You don't need node or npm on the host: `scripts/dev.sh install`, then
-`scripts/dev.sh deno task build`.
+`scripts/dev.sh deno task build` and `scripts/dev.sh deno task test`.
+`scripts/dev.sh node dist/http.js` runs the HTTP server on the host network.
 
 MIT licensed.

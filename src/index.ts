@@ -23,6 +23,7 @@ import {
     type PageSettings,
 } from "./client.js";
 import {
+    buildInlinePdfResult,
     buildPdfResult,
     formatDataset,
     formatDatasets,
@@ -55,7 +56,7 @@ function readVersion(): string {
     }
 }
 
-const SERVER_VERSION: string = readVersion();
+export const SERVER_VERSION: string = readVersion();
 
 const WHAT_IS_SHEETRENDER =
     "SheetRender turns HTML templates plus spreadsheet rows into rendered PDFs.";
@@ -143,12 +144,47 @@ async function deliverPdf(bytes: Uint8Array, label: string): Promise<CallToolRes
     return buildPdfResult(label, filePath, bytes);
 }
 
+export interface ServerOptions {
+    /**
+     * True for the Streamable HTTP server at mcp.sheetrender.com, where the
+     * process runs on SheetRender's side rather than the user's machine. That
+     * changes two things: PDFs come back inline instead of as a temp-file path
+     * the caller could never open, and `upload_dataset` — which reads a file
+     * off the local disk — is not offered at all. Everything else, including
+     * the stdio server's behaviour, is unchanged.
+     */
+    hosted?: boolean;
+}
+
 
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
 
-export function createServer(client: SheetRenderClient): McpServer {
+export function createServer(
+    client: SheetRenderClient,
+    options: ServerOptions = {},
+): McpServer {
+    const hosted = options.hosted === true;
+    const deliver = hosted
+        ? async (bytes: Uint8Array, label: string) => buildInlinePdfResult(label, bytes)
+        : deliverPdf;
+    // Description fragments that differ between the two deployments. The
+    // stdio wording is the original; the hosted one drops the file-based tool.
+    const pdfReturns = hosted
+        ? "Returns the PDF inline as a base64 resource (up to 8 MB) along with its size."
+        : "Returns the temp-file path and size; PDFs under 512 KB are also attached inline.";
+    const pdfHandoff = hosted
+        ? "and returns the PDF itself."
+        : "and returns the path to the saved file.";
+    const datasetSources = hosted
+        ? "create_dataset (rows you hold as JSON)"
+        : "create_dataset (rows you hold as JSON) or upload_dataset (a local .csv/.xlsx)";
+    const datasetTools = hosted ? "create_dataset" : "create_dataset or upload_dataset";
+    const keyReporters = hosted
+        ? "create_dataset and list_datasets both report"
+        : "create_dataset, upload_dataset and list_datasets all report";
+
     const server = new McpServer(
         { name: SERVER_NAME, version: SERVER_VERSION },
         {
@@ -157,9 +193,8 @@ export function createServer(client: SheetRenderClient): McpServer {
                 "HTML you write, and render_template for documents from a template already " +
                 "saved in the user's account (list_templates finds their ids).\n\n" +
                 "For many documents at once, the whole batch runs from here without the web " +
-                "app: list_templates -> create_dataset (rows you hold as JSON) or " +
-                "upload_dataset (a local .csv/.xlsx) -> create_batch_job -> get_job to poll " +
-                "-> get_document to download each PDF. list_datasets finds datasets that " +
+                `app: list_templates -> ${datasetSources} -> create_batch_job -> get_job ` +
+                "to poll -> get_document to download each PDF. list_datasets finds datasets that " +
                 "already exist on a template's project.",
         },
     );
@@ -170,7 +205,7 @@ export function createServer(client: SheetRenderClient): McpServer {
             title: "Render HTML to PDF",
             description:
                 `${WHAT_IS_SHEETRENDER} This tool renders a single PDF from HTML you supply ` +
-                "and returns the path to the saved file.\n\n" +
+                `${pdfHandoff}\n\n` +
                 "Use it for one-off documents — an invoice, a report, a certificate — where " +
                 "you are writing the markup yourself. Use render_template instead when the " +
                 "user already has a saved template.\n\n" +
@@ -185,7 +220,7 @@ export function createServer(client: SheetRenderClient): McpServer {
                 "tables paginated rather than emitting one enormous document; and accounts on " +
                 'the free plan get a "Made with SheetRender" footer added to every PDF, which ' +
                 "is expected, not a bug — mention it if the user seems surprised.\n\n" +
-                "Returns the temp-file path and size; PDFs under 512 KB are also attached inline.",
+                pdfReturns,
             inputSchema: {
                 html: z
                     .string()
@@ -205,7 +240,7 @@ export function createServer(client: SheetRenderClient): McpServer {
                     data as Record<string, unknown> | undefined,
                     page_settings as PageSettings | undefined,
                 );
-                return await deliverPdf(bytes, "Rendered the HTML to a PDF.");
+                return await deliver(bytes, "Rendered the HTML to a PDF.");
             } catch (error) {
                 return toToolError(error);
             }
@@ -240,19 +275,19 @@ export function createServer(client: SheetRenderClient): McpServer {
             title: "Render a saved template to PDF",
             description:
                 `${WHAT_IS_SHEETRENDER} This tool renders one PDF from a template already ` +
-                "saved in the user's account and returns the path to the saved file.\n\n" +
+                `saved in the user's account ${pdfHandoff}\n\n` +
                 "Use it when the user wants a document in their existing design. Get " +
                 "`template_id` from list_templates. Use render_pdf instead when you are " +
                 "writing the HTML yourself.\n\n" +
                 "`data` supplies one row's worth of values: each key becomes a Jinja variable " +
                 "in the template's HTML. To render a PDF for every row of a spreadsheet, load " +
-                "the rows with create_dataset or upload_dataset and run create_batch_job " +
+                `the rows with ${datasetTools} and run create_batch_job ` +
                 "rather than calling this repeatedly.\n\n" +
                 "Omit `page_settings` to keep the template's own saved page setup — passing it " +
                 "overrides that for this render only.\n\n" +
                 'Free-plan accounts get a "Made with SheetRender" footer on the PDF, same as ' +
                 "render_pdf — expected, not a bug.\n\n" +
-                "Returns the temp-file path and size; PDFs under 512 KB are also attached inline.",
+                pdfReturns,
             inputSchema: {
                 template_id: z
                     .string()
@@ -269,7 +304,7 @@ export function createServer(client: SheetRenderClient): McpServer {
                     data as Record<string, unknown>,
                     page_settings as PageSettings | undefined,
                 );
-                return await deliverPdf(bytes, `Rendered template ${template_id} to a PDF.`);
+                return await deliver(bytes, `Rendered template ${template_id} to a PDF.`);
             } catch (error) {
                 return toToolError(error);
             }
@@ -286,9 +321,12 @@ export function createServer(client: SheetRenderClient): McpServer {
                 "column keys.\n\n" +
                 "This is the normal way to start a batch: the user asks for \"an invoice for " +
                 "each of these clients\" or \"a letter per employee\", you assemble the rows, " +
-                "and this uploads them. Use upload_dataset instead when the data is already a " +
-                "file on disk, and list_datasets when the user is referring to a dataset that " +
-                "already exists.\n\n" +
+                "and this uploads them. " +
+                (hosted
+                    ? ""
+                    : "Use upload_dataset instead when the data is already a file on disk, and ") +
+                `${hosted ? "Use " : ""}list_datasets when the user is referring to a dataset ` +
+                "that already exists.\n\n" +
                 "`rows` is a flat array of flat objects, one per document: " +
                 '[{"client": "Acme", "total": 42}, {"client": "Globex", "total": 17}]. ' +
                 "The header is the union of every row's keys in first-seen order, so rows " +
@@ -298,11 +336,15 @@ export function createServer(client: SheetRenderClient): McpServer {
                 "and whole numbers past 2^53 (send those as strings to keep them exact).\n\n" +
                 "The dataset is attached to the template's project, which means every template " +
                 "in that project can render it and it stays available to later jobs.\n\n" +
-                "Limits: 50,000 rows and 500,000 cells (rows x columns) per call. The row cap " +
-                "applies to JSON rows only — a bigger sheet can still go through " +
-                "upload_dataset as a file, which is bounded by size and cells rather than " +
-                "rows. Creating a dataset is free; only rendering counts against the " +
-                "account's plan.\n\n" +
+                "Limits: 50,000 rows and 500,000 cells (rows x columns) per call. " +
+                (hosted
+                    ? "A bigger sheet has to be split across several datasets and jobs, or " +
+                        "uploaded by the user in the SheetRender web app. "
+                    : "The row cap applies to JSON rows only — a bigger sheet can still go " +
+                        "through upload_dataset as a file, which is bounded by size and cells " +
+                        "rather than rows. ") +
+                "Creating a dataset is free; only rendering counts against the account's " +
+                "plan.\n\n" +
                 "Returns the dataset id and, for each column, the sanitized `key`. That key — " +
                 "not the original header — is what the template's placeholders, " +
                 "`filename_template` and `group_by` address, so read it off this result " +
@@ -350,7 +392,7 @@ export function createServer(client: SheetRenderClient): McpServer {
         },
     );
 
-    server.registerTool(
+    if (!hosted) server.registerTool(
         "upload_dataset",
         {
             title: "Upload a spreadsheet as a dataset",
@@ -415,7 +457,7 @@ export function createServer(client: SheetRenderClient): McpServer {
                 "Call it when the user refers to data they have already loaded (\"use the " +
                 "customer list I uploaded\") so you can find its id, or to re-run a batch over " +
                 "an existing dataset instead of creating a duplicate. When there is nothing " +
-                "suitable, create one with create_dataset or upload_dataset.\n\n" +
+                `suitable, create one with ${datasetTools}.\n\n` +
                 "It is also the quickest way to see a dataset's sanitized column keys before " +
                 "writing a `filename_template` or choosing `group_by`.",
             inputSchema: {
@@ -446,18 +488,17 @@ export function createServer(client: SheetRenderClient): McpServer {
                 "loop.\n\n" +
                 "The full sequence, all of it available here:\n" +
                 "1. list_templates — the user's designs, and the template_id for the rest.\n" +
-                "2. create_dataset (rows you hold as JSON) or upload_dataset (a local " +
-                ".csv/.xlsx) — returns the dataset_id. list_datasets finds one that already " +
-                "exists.\n" +
+                `2. ${datasetSources} — returns the dataset_id. list_datasets finds one that ` +
+                "already exists.\n" +
                 "3. create_batch_job — this tool, returning a job id.\n" +
                 "4. get_job — poll until the status is finished; it then lists the document " +
                 "ids.\n" +
                 "5. get_document — download any of those PDFs.\n\n" +
                 "The dataset must belong to the same template's project, which is where " +
-                "create_dataset and upload_dataset put it. Rendering happens in the " +
+                `${datasetTools} put${hosted ? "s" : ""} it. Rendering happens in the ` +
                 "background, so the job id comes back long before the PDFs do.\n\n" +
                 "`filename_template` and `group_by` name columns by their sanitized key, which " +
-                "create_dataset, upload_dataset and list_datasets all report — it is often not " +
+                `${keyReporters} — it is often not ` +
                 'the header text verbatim ("Invoice No" becomes invoice_no). Both are saved ' +
                 "onto the template/project, so they change the defaults for later runs, not " +
                 "just this one. Only pass them when the user asked to change how output is " +
@@ -549,14 +590,14 @@ export function createServer(client: SheetRenderClient): McpServer {
             title: "Download a rendered document",
             description:
                 `${WHAT_IS_SHEETRENDER} This tool downloads one PDF produced by a batch job ` +
-                "and returns the path to the saved file.\n\n" +
+                `${pdfHandoff}\n\n` +
                 "`document_id` comes from get_job on a finished batch — that is the only place " +
                 "these ids appear, so call get_job first and take an id from its document list. " +
                 "A document id is not a template id or a job id.\n\n" +
                 "Use it to fetch a specific output the user asked about, or to spot-check a " +
                 "batch. Fetching every document of a large batch one at a time is slow; point " +
                 "the user at the SheetRender web app for the merged PDF or ZIP instead.\n\n" +
-                "Returns the temp-file path and size; PDFs under 512 KB are also attached inline.",
+                pdfReturns,
             inputSchema: {
                 document_id: z
                     .string()
@@ -567,7 +608,7 @@ export function createServer(client: SheetRenderClient): McpServer {
         async ({ document_id }) => {
             try {
                 const bytes = await client.getDocument(document_id);
-                return await deliverPdf(bytes, `Downloaded document ${document_id}.`);
+                return await deliver(bytes, `Downloaded document ${document_id}.`);
             } catch (error) {
                 return toToolError(error);
             }
@@ -625,11 +666,11 @@ async function main(): Promise<void> {
  * into node_modules, and anything unexpected answers "yes" — the failure worth
  * avoiding is the published executable silently doing nothing.
  */
-function runningAsExecutable(): boolean {
+export function runningAsExecutable(moduleUrl: string = import.meta.url): boolean {
     const entry = process.argv[1];
     if (!entry) return false;
     try {
-        return realpathSync(entry) === realpathSync(fileURLToPath(import.meta.url));
+        return realpathSync(entry) === realpathSync(fileURLToPath(moduleUrl));
     } catch {
         return true;
     }

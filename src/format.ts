@@ -72,6 +72,50 @@ export function buildPdfResult(
     };
 }
 
+/**
+ * The hosted (HTTP) server has no disk the caller can reach, so a PDF is only
+ * useful inline. The cap is higher than `INLINE_BLOB_LIMIT_BYTES` because it is
+ * the whole answer rather than a bonus on top of a file path; past it the
+ * document can still be fetched from the web app.
+ */
+export const HOSTED_INLINE_LIMIT_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Describes a PDF that exists only in memory, for the hosted server.
+ *
+ * There is no path to report: the process runs on SheetRender's side, so a
+ * temp file there is unreachable from the client. The blob is the delivery.
+ */
+export function buildInlinePdfResult(label: string, bytes: Uint8Array): CallToolResult {
+    const summary = `${label}\nSize: ${formatBytes(bytes.byteLength)} (${bytes.byteLength} bytes)`;
+
+    if (bytes.byteLength > HOSTED_INLINE_LIMIT_BYTES) {
+        return {
+            content: [{
+                type: "text",
+                text:
+                    `${summary}\n(Too large to return inline over the hosted connection — ` +
+                    "download it from the SheetRender web app, or render with fewer rows " +
+                    "or smaller embedded images.)",
+            }],
+        };
+    }
+
+    return {
+        content: [
+            { type: "text", text: summary },
+            {
+                type: "resource",
+                resource: {
+                    uri: `sheetrender://pdf/${Date.now()}-${randomBytes(3).toString("hex")}.pdf`,
+                    mimeType: "application/pdf",
+                    blob: Buffer.from(bytes).toString("base64"),
+                },
+            },
+        ],
+    };
+}
+
 export function formatBytes(byteLength: number): string {
     if (byteLength < 1024) return `${byteLength} bytes`;
     if (byteLength < 1024 * 1024) return `${(byteLength / 1024).toFixed(1)} KB`;

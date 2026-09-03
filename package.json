@@ -1,12 +1,13 @@
 {
   "name": "@sheetrender/mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "mcpName": "io.github.sheetrender/sheetrender-mcp",
   "description": "MCP server for SheetRender: render PDFs from HTML templates and spreadsheet data via the SheetRender API.",
   "license": "MIT",
   "type": "module",
   "bin": {
-    "sheetrender-mcp": "dist/index.js"
+    "sheetrender-mcp": "dist/index.js",
+    "sheetrender-mcp-http": "dist/http.js"
   },
   "files": [
     "dist"
