@@ -8,7 +8,7 @@
  * can branch on it.
  */
 
-const DEFAULT_BASE_URL = "https://sheetrender.com";
+export const DEFAULT_API_URL = "https://sheetrender.com";
 
 /** JSON request timeout. Template listings and job polls are quick. */
 const JSON_TIMEOUT_MS = 30_000;
@@ -23,6 +23,12 @@ const DATASET_TIMEOUT_MS = 120_000;
 export interface SheetRenderConfig {
     baseUrl: string;
     apiKey: string;
+    /**
+     * Aborts every request this client has in flight. The hosted server builds
+     * one client per HTTP request and aborts it when the caller disconnects, so
+     * an abandoned render does not hold a connection open until its timeout.
+     */
+    signal?: AbortSignal;
 }
 
 export interface TemplateSummary {
@@ -124,16 +130,19 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): SheetRenderCon
                 'in your MCP client config, e.g. "env": { "SHEETRENDER_API_KEY": "sr_live_..." }.',
         );
     }
-    const rawBase = env.SHEETRENDER_API_URL?.trim() || DEFAULT_BASE_URL;
-    let baseUrl: string;
+    return {
+        baseUrl: parseApiUrl(env.SHEETRENDER_API_URL?.trim() || DEFAULT_API_URL),
+        apiKey,
+    };
+}
+
+/** Validates a SHEETRENDER_API_URL value and strips its trailing slashes. */
+export function parseApiUrl(raw: string): string {
     try {
-        baseUrl = new URL(rawBase).toString().replace(/\/+$/, "");
+        return new URL(raw).toString().replace(/\/+$/, "");
     } catch {
-        throw new SheetRenderError(
-            `SHEETRENDER_API_URL is not a valid URL: ${rawBase}`,
-        );
+        throw new SheetRenderError(`SHEETRENDER_API_URL is not a valid URL: ${raw}`);
     }
-    return { baseUrl, apiKey };
 }
 
 /** Flattens FastAPI's several `detail` shapes into one line of text. */
@@ -170,8 +179,9 @@ function describeDetail(detail: unknown): string | undefined {
     return undefined;
 }
 
+/** What a status means, used only when the error body carried no detail. */
 const STATUS_HINTS: Record<number, string> = {
-    401: "the API key was rejected — check SHEETRENDER_API_KEY",
+    401: "the API key was rejected — check the SheetRender API key this server was given",
     403: "the account is not allowed to do this",
     404: "not found",
     405: "this endpoint does not exist on this server",
@@ -185,7 +195,7 @@ const STATUS_HINTS: Record<number, string> = {
 /**
  * Extra sentences appended to a failure, keyed by status.
  *
- * The status hints above only ever appear when the body carried no detail, and
+ * `STATUS_HINTS` only ever appear when the body carried no detail, and
  * the dataset routes always carry one — a good one, written for a human. What
  * they cannot say is which *other* SheetRender call gets the caller unstuck, so
  * that advice is added here rather than replacing the server's wording.
@@ -319,10 +329,12 @@ interface RequestOptions {
 export class SheetRenderClient {
     readonly baseUrl: string;
     readonly #apiKey: string;
+    readonly #signal?: AbortSignal;
 
     constructor(config: SheetRenderConfig) {
         this.baseUrl = config.baseUrl.replace(/\/+$/, "");
         this.#apiKey = config.apiKey;
+        this.#signal = config.signal;
     }
 
     async #send(options: RequestOptions): Promise<Response> {
@@ -339,6 +351,7 @@ export class SheetRenderClient {
         // send a boundary-less header the server cannot split the parts with.
         if (body !== undefined && !multipart) headers["Content-Type"] = "application/json";
 
+        const timeout = AbortSignal.timeout(timeoutMs);
         let response: Response;
         try {
             response = await fetch(`${this.baseUrl}${path}`, {
@@ -349,7 +362,7 @@ export class SheetRenderClient {
                     : multipart
                     ? body
                     : JSON.stringify(body),
-                signal: AbortSignal.timeout(timeoutMs),
+                signal: this.#signal ? AbortSignal.any([timeout, this.#signal]) : timeout,
                 redirect: "follow",
             });
         } catch (error) {

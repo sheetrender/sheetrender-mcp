@@ -1,15 +1,14 @@
 /**
- * Pure helpers shared by the tool handlers.
- *
- * These live apart from `index.ts` because that module starts the server as a
- * side effect of being imported; anything worth unit-testing belongs here.
+ * Helpers shared by the tool handlers: result builders, text formatters and
+ * the one file read (`readDatasetFile`). None of them touch the MCP server or
+ * the API client, so they can be unit-tested on their own.
  */
 
 import { randomBytes } from "node:crypto";
 import { open } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { basename, extname, isAbsolute, join, resolve } from "node:path";
+import { basename, extname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -218,7 +217,7 @@ function expandUserPath(filePath: string): string {
     const trimmed = filePath.trim();
     if (trimmed === "~") return homedir();
     if (trimmed.startsWith("~/")) return join(homedir(), trimmed.slice(2));
-    return isAbsolute(trimmed) ? trimmed : resolve(trimmed);
+    return resolve(trimmed);
 }
 
 /** One dataset, with the column keys a template and `group_by` address. */
@@ -250,12 +249,17 @@ export function formatDataset(dataset: DatasetSummary): string {
     return lines.join("\n");
 }
 
-/** Every dataset on a template's project, newest first. */
-export function formatDatasets(datasets: DatasetSummary[]): string {
+/**
+ * Every dataset on a template's project, newest first. `hosted` drops the
+ * mention of upload_dataset, which the hosted server does not offer.
+ */
+export function formatDatasets(datasets: DatasetSummary[], hosted = false): string {
     if (datasets.length === 0) {
-        return "No datasets on this template's project yet. Create one with create_dataset " +
-            "(JSON rows) or upload_dataset (a local .csv/.xlsx file), then pass its id to " +
-            "create_batch_job.";
+        const tools = hosted
+            ? "create_dataset (JSON rows)"
+            : "create_dataset (JSON rows) or upload_dataset (a local .csv/.xlsx file)";
+        return `No datasets on this template's project yet. Create one with ${tools}, ` +
+            "then pass its id to create_batch_job.";
     }
     const noun = datasets.length === 1 ? "dataset" : "datasets";
     const blocks = datasets.map((dataset) => formatDataset(dataset));

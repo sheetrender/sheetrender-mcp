@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer as createNodeServer, type Server } from "node:http";
-import type { AddressInfo } from "node:net";
+import { connect as connectSocket, type AddressInfo } from "node:net";
 import { afterEach, describe, it } from "node:test";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -128,6 +128,20 @@ describe("authentication", () => {
         assert.match(body.error.message, /Authorization: Bearer/);
     });
 
+    it("rejects a bearer token that is not a SheetRender key before reading the body", async () => {
+        const { url, logs } = await startMcp("http://127.0.0.1:1");
+        const response = await fetch(`${url}/mcp`, {
+            method: "POST",
+            headers: { ...MCP_HEADERS, Authorization: "Bearer junk" },
+            body: INITIALIZE,
+        });
+        assert.equal(response.status, 401);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        const entry = logs.find((line) => line.msg === "request");
+        assert.ok(entry);
+        assert.equal("rpc" in entry, false);
+    });
+
     it("rejects a non-bearer Authorization scheme", async () => {
         const { url } = await startMcp("http://127.0.0.1:1");
         const response = await fetch(`${url}/mcp`, {
@@ -222,6 +236,34 @@ describe("MCP over HTTP", () => {
         assert.equal(JSON.stringify(logs).includes("sr_test_logged"), false);
     });
 
+    it("aborts the upstream request when the caller disconnects", async () => {
+        // A backend that never answers, and reports when its caller hangs up.
+        let hungUp: () => void = () => {};
+        const upstreamClosed = new Promise<void>((resolve) => hungUp = resolve);
+        const backend = createNodeServer((_req, res) => res.on("close", hungUp));
+        const apiUrl = await listen(backend);
+        closers.push(() => closeServer(backend));
+        const { url } = await startMcp(apiUrl);
+
+        const caller = new AbortController();
+        const pending = fetch(`${url}/mcp`, {
+            method: "POST",
+            headers: { ...MCP_HEADERS, Authorization: "Bearer sr_test_gone" },
+            body: JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                method: "tools/call",
+                params: { name: "list_templates", arguments: {} },
+            }),
+            signal: caller.signal,
+        }).then((response) => response.text()).catch(() => undefined);
+        setTimeout(() => caller.abort(), 100);
+        await pending;
+
+        const timedOut = new Promise<string>((resolve) => setTimeout(() => resolve("timeout"), 2000));
+        assert.equal(await Promise.race([upstreamClosed.then(() => "closed"), timedOut]), "closed");
+    });
+
     it("answers 413 past the body limit before touching the transport", async () => {
         const { url } = await startMcp("http://127.0.0.1:1", { maxBodyBytes: 2048 });
         const response = await fetch(`${url}/mcp`, {
@@ -237,6 +279,27 @@ describe("MCP over HTTP", () => {
         assert.equal(response.status, 413);
     });
 
+    it("answers 413, not a reset connection, when a chunked body passes the limit", async () => {
+        const { url } = await startMcp("http://127.0.0.1:1", { maxBodyBytes: 2048 });
+        const chunk = new TextEncoder().encode("x".repeat(1024));
+        let sent = 0;
+        // A stream body has no Content-Length, so only the running count can
+        // catch it.
+        const body = new ReadableStream<Uint8Array>({
+            pull(controller) {
+                if (sent++ < 64) controller.enqueue(chunk);
+                else controller.close();
+            },
+        });
+        const response = await fetch(`${url}/mcp`, {
+            method: "POST",
+            headers: { ...MCP_HEADERS, Authorization: "Bearer sr_test_chunked" },
+            body,
+            duplex: "half",
+        } as RequestInit);
+        assert.equal(response.status, 413);
+    });
+
     it("answers 400 for a body that is not JSON", async () => {
         const { url } = await startMcp("http://127.0.0.1:1");
         const response = await fetch(`${url}/mcp`, {
@@ -247,6 +310,25 @@ describe("MCP over HTTP", () => {
         assert.equal(response.status, 400);
         const body = await response.json() as { error: { code: number } };
         assert.equal(body.error.code, -32700);
+    });
+
+    it("answers 400 for a request target that is not a URL, and keeps serving", async () => {
+        const { url } = await startMcp("http://127.0.0.1:1");
+        const { port } = new URL(url);
+        // fetch() normalises its URL, so the raw target goes over a socket.
+        const statusLine = await new Promise<string>((resolve, reject) => {
+            const socket = connectSocket(Number(port), "127.0.0.1", () => {
+                socket.write("GET // HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            });
+            let received = "";
+            socket.on("data", (data) => received += data.toString());
+            socket.on("close", () => resolve(received.split("\r\n")[0]));
+            socket.on("error", reject);
+        });
+        assert.match(statusLine, /^HTTP\/1\.1 400 /);
+
+        const health = await fetch(`${url}/healthz`);
+        assert.equal(health.status, 200);
     });
 
     it("404s anything that is not /mcp or /healthz", async () => {

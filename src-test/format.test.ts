@@ -331,6 +331,13 @@ describe("formatDatasets", () => {
         assert.match(text, /upload_dataset/);
     });
 
+    it("leaves upload_dataset out for the hosted server, which does not offer it", () => {
+        const text = formatDatasets([], true);
+
+        assert.match(text, /create_dataset/);
+        assert.doesNotMatch(text, /upload_dataset/);
+    });
+
     it("counts and separates the datasets it lists", () => {
         const text = formatDatasets([dataset, { ...dataset, id: "ds_2" }]);
 

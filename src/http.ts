@@ -8,7 +8,7 @@
  * `SheetRenderClient`, `McpServer` and transport, torn down when the response
  * ends. Nothing about one caller survives into the next request, so a key can
  * never leak across tenants and any replica can answer any request. The cost
- * is re-registering nine tools per request, which is microseconds.
+ * is re-registering the tools on every request, which is microseconds.
  *
  * The stdio server in index.ts is untouched by this file.
  */
@@ -18,12 +18,11 @@ import { createServer as createNodeServer, type IncomingMessage, type Server, ty
 
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
-import { SheetRenderClient, SheetRenderError } from "./client.js";
+import { DEFAULT_API_URL, parseApiUrl, SheetRenderClient, SheetRenderError } from "./client.js";
 import { createServer, runningAsExecutable, SERVER_VERSION } from "./index.js";
 
 const DEFAULT_PORT = 8080;
 const DEFAULT_HOST = "0.0.0.0";
-const DEFAULT_API_URL = "https://sheetrender.com";
 /**
  * Request body cap. `render_pdf` carries up to 2 MB of HTML and
  * `create_dataset` up to 50,000 JSON rows; 25 MB matches the proxy in front of
@@ -58,17 +57,10 @@ export interface HttpConfig {
 export function loadHttpConfig(env: NodeJS.ProcessEnv = process.env): HttpConfig {
     const port = readInteger(env, "PORT", DEFAULT_PORT, 1, 65535);
     const host = env.HOST?.trim() || DEFAULT_HOST;
-    const rawBase = env.SHEETRENDER_API_URL?.trim() || DEFAULT_API_URL;
-    let apiUrl: string;
-    try {
-        apiUrl = new URL(rawBase).toString().replace(/\/+$/, "");
-    } catch {
-        throw new SheetRenderError(`SHEETRENDER_API_URL is not a valid URL: ${rawBase}`);
-    }
     return {
         port,
         host,
-        apiUrl,
+        apiUrl: parseApiUrl(env.SHEETRENDER_API_URL?.trim() || DEFAULT_API_URL),
         maxBodyBytes: readInteger(env, "MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES, 1024),
         idleTimeoutMs: readInteger(env, "IDLE_TIMEOUT_MS", DEFAULT_IDLE_TIMEOUT_MS, 1000),
     };
@@ -111,15 +103,20 @@ function readBody(req: IncomingMessage, limit: number): Promise<Buffer> {
         }
         const chunks: Buffer[] = [];
         let received = 0;
-        req.on("data", (chunk: Buffer) => {
+        const onData = (chunk: Buffer) => {
             received += chunk.length;
             if (received > limit) {
+                // Stop reading but leave the socket alone: req.destroy() here
+                // would reset the connection before the 413 could be written.
+                // The 413 carries `Connection: close`, which ends the upload.
+                req.off("data", onData);
+                req.pause();
                 reject(new BodyTooLarge());
-                req.destroy();
                 return;
             }
             chunks.push(chunk);
-        });
+        };
+        req.on("data", onData);
         req.on("end", () => resolve(Buffer.concat(chunks)));
         req.on("error", reject);
     });
@@ -139,6 +136,9 @@ function sendRpcError(
 ): void {
     sendJson(res, status, { jsonrpc: "2.0", error: { code, message }, id: null }, headers);
 }
+
+/** Every SheetRender API key starts with this, e.g. `sr_live_...`. */
+const API_KEY_PREFIX = "sr_";
 
 /** The bearer token from an Authorization header, or undefined when absent. */
 export function bearerToken(header: string | string[] | undefined): string | undefined {
@@ -193,10 +193,9 @@ export function createHttpServer(options: HttpServerOptions): Server {
 
     const server = createNodeServer((req, res) => {
         const started = process.hrtime.bigint();
-        const url = new URL(req.url ?? "/", "http://localhost");
         const method = req.method ?? "GET";
         // Filled in as the request is understood; emitted once on close.
-        const fields: Record<string, unknown> = { method, path: url.pathname };
+        const fields: Record<string, unknown> = { method, path: req.url ?? "/" };
 
         res.on("close", () => {
             const durationMs = Number(process.hrtime.bigint() - started) / 1e6;
@@ -208,6 +207,17 @@ export function createHttpServer(options: HttpServerOptions): Server {
                 duration_ms: Math.round(durationMs * 10) / 10,
             });
         });
+
+        // A request target such as "//" does not parse, and a throw out here
+        // is outside handle()'s catch: it would take the whole process down.
+        let url: URL;
+        try {
+            url = new URL(req.url ?? "/", "http://localhost");
+        } catch {
+            sendJson(res, 400, { error: "bad request" });
+            return;
+        }
+        fields.path = url.pathname;
 
         handle(req, res, url, method, fields).catch((error: unknown) => {
             log({ level: "error", msg: "unhandled request error", ...fields, error: String(error) });
@@ -242,15 +252,18 @@ export function createHttpServer(options: HttpServerOptions): Server {
             return;
         }
 
-        // Auth first, before any body is read or any transport built: an
-        // unauthenticated caller must not be able to make the process do work.
+        // Auth first, before any body is read or any transport built. Only
+        // the SheetRender API can say whether a key is valid, and it does so
+        // on the first tool call; the prefix check keeps a caller with no key
+        // at all from making the process read and parse a body.
         const apiKey = bearerToken(req.headers.authorization);
-        if (!apiKey) {
+        if (!apiKey?.startsWith(API_KEY_PREFIX)) {
             sendRpcError(
                 res,
                 401,
                 -32001,
-                "Missing SheetRender API key. Send it as: Authorization: Bearer sr_live_...",
+                "Missing or malformed SheetRender API key. Send it as: " +
+                    "Authorization: Bearer sr_live_...",
                 { "WWW-Authenticate": 'Bearer realm="sheetrender"' },
             );
             return;
@@ -262,7 +275,11 @@ export function createHttpServer(options: HttpServerOptions): Server {
             raw = await readBody(req, maxBodyBytes);
         } catch (error) {
             if (error instanceof BodyTooLarge) {
-                sendRpcError(res, 413, -32000, `Request body exceeds ${maxBodyBytes} bytes`);
+                // `Connection: close` so the rest of the upload is dropped
+                // rather than drained once the response has been sent.
+                sendRpcError(res, 413, -32000, `Request body exceeds ${maxBodyBytes} bytes`, {
+                    Connection: "close",
+                });
                 return;
             }
             throw error;
@@ -276,7 +293,14 @@ export function createHttpServer(options: HttpServerOptions): Server {
         }
         Object.assign(fields, describeRpc(parsedBody));
 
-        const client = new SheetRenderClient({ baseUrl: apiUrl, apiKey });
+        // Aborted when the response closes, so a caller that disconnects mid
+        // render does not leave the upstream request running to its timeout.
+        const disconnected = new AbortController();
+        const client = new SheetRenderClient({
+            baseUrl: apiUrl,
+            apiKey,
+            signal: disconnected.signal,
+        });
         const mcp = createServer(client, { hosted: true });
         const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
         transport.onerror = (error) => {
@@ -285,6 +309,7 @@ export function createHttpServer(options: HttpServerOptions): Server {
         res.on("close", () => {
             // Both are per-request; nothing else references them once the
             // response is gone. close() is idempotent and never throws.
+            disconnected.abort();
             void transport.close();
             void mcp.close();
         });
