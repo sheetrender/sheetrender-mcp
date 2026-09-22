@@ -69,10 +69,11 @@ export function describeTools(hosted: boolean): ToolDescriptions {
             "already exist on a template's project.",
 
         designTemplate:
-            "Design a saved template from dataset_id or inline rows and an example, brief, " +
+            "Design a saved template from exactly one of dataset_id, inline rows, or " +
+            "data_base64 with data_filename (CSV or XLSX, up to 10 MB), and an example, brief, " +
             "or style_id. Use an example alone, or a brief with optional style_id. " +
             "Examples accept PDF, PNG, JPG, WebP or DOCX as base64 with a filename. " +
-            (hosted ? "" : "Local example_path is also available. ") +
+            (hosted ? "" : "Local data_path can supply the data; example_path can supply the example. ") +
             "Waits up to 3 minutes; returns the design status, template id, mapping and preview URL.",
 
         getDesign:

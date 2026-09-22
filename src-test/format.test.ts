@@ -11,6 +11,7 @@ import {
 } from "../src/client.js";
 import {
     buildPdfResult,
+    decodeDesignData,
     decodeExample,
     readExampleFile,
     formatBytes,
@@ -22,6 +23,7 @@ import {
     looksLikeMissingRoute,
     MAX_DATASET_UPLOAD_BYTES,
     readDatasetFile,
+    readDesignDataFile,
     tempPdfPath,
 } from "../src/format.js";
 
@@ -456,5 +458,61 @@ describe("design examples", () => {
         await truncate(path, 10 * 1024 * 1024 + 1);
         await assert.rejects(readExampleFile(path), /10 MB/);
         await assert.rejects(readExampleFile(dir), /regular file/);
+    });
+});
+
+describe("design data files", () => {
+    it("decodes CSV and XLSX bytes and keeps only the filename", () => {
+        for (const filename of ["report.csv", "report.XLSX"]) {
+            const data = decodeDesignData("AAEC/w==", `/tmp/${filename}`);
+            assert.equal(data.filename, filename);
+            assert.deepEqual([...data.bytes], [0, 1, 2, 255]);
+        }
+    });
+
+    it("enforces the 10 MB decoded size boundary", () => {
+        const bytes = Buffer.alloc(10 * 1024 * 1024);
+        assert.equal(decodeDesignData(bytes.toString("base64"), "report.xlsx").bytes.length, bytes.length);
+        assert.throws(() => decodeDesignData(Buffer.alloc(bytes.length + 1).toString("base64"), "report.xlsx"), /10 MB/);
+        assert.equal(decodeDesignData("YQ==", "report.csv").bytes.length, 1);
+        assert.throws(() => decodeDesignData("", "report.csv"), /between 1 byte/);
+    });
+
+    it("rejects malformed base64 and unsupported extensions", () => {
+        for (const base64 of ["ab=c", "AB==", "YWJj\n", "YQ", "data:text/csv;base64,YWJj"]) {
+            assert.throws(() => decodeDesignData(base64, "report.csv"), /data_base64 must be valid padded base64/);
+        }
+        for (const filename of ["report.pdf", "report.xls", "report.csv.exe", "report"]) {
+            assert.throws(() => decodeDesignData("YWJj", filename), /Data must be a CSV or XLSX/);
+        }
+    });
+
+    it("reads both spreadsheet formats and enforces the file size boundary", async () => {
+        const dir = await mkdtemp(join(tmpdir(), "sheetrender-data-test-"));
+        for (const filename of ["report.csv", "report.XLSX"]) {
+            const path = join(dir, filename);
+            await writeFile(path, "data bytes");
+            const data = await readDesignDataFile(path);
+            assert.equal(data.filename, filename);
+            assert.equal(Buffer.from(data.bytes).toString(), "data bytes");
+        }
+        const path = join(dir, "report.csv");
+        await truncate(path, 10 * 1024 * 1024);
+        assert.equal((await readDesignDataFile(path)).bytes.length, 10 * 1024 * 1024);
+        await truncate(path, 10 * 1024 * 1024 + 1);
+        await assert.rejects(readDesignDataFile(path), /10 MB/);
+        await truncate(path, 0);
+        await assert.rejects(readDesignDataFile(path), /between 1 byte/);
+    });
+
+    it("rejects unsupported files, directories and missing paths", async () => {
+        const dir = await mkdtemp(join(tmpdir(), "sheetrender-data-test-"));
+        const path = join(dir, "report.pdf");
+        await writeFile(path, "abc");
+        await assert.rejects(readDesignDataFile(path), /Data must be a CSV or XLSX/);
+        await assert.rejects(readDesignDataFile(dir), /Data path must point to a regular file/);
+        await assert.rejects(readDesignDataFile(join(dir, "missing.csv")), /Could not read/);
+        await assert.rejects(readDesignDataFile("~/sheetrender-missing-design-data-1234.csv"),
+            (error: Error) => error.message.includes(homedir()));
     });
 });

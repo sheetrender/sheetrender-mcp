@@ -101,6 +101,7 @@ export interface DesignInput {
     name?: string;
     fit_one_page?: boolean;
     example?: { filename: string; bytes: Uint8Array };
+    data?: { filename: string; bytes: Uint8Array };
 }
 
 export interface Margins {
@@ -545,17 +546,18 @@ export class SheetRenderClient {
     }
 
     createDesign(input: DesignInput): Promise<DesignStatus> {
-        const { example, ...fields } = input;
+        const { example, data, ...fields } = input;
         if (fields.rows) assertSerialisableRows(fields.rows);
         let body: unknown = fields;
-        if (example) {
+        if (example || data) {
             const form = new FormData();
             for (const [key, value] of Object.entries(fields)) {
                 if (value !== undefined) {
                     form.append(key, key === "rows" ? JSON.stringify(value) : String(value));
                 }
             }
-            form.append("example", new Blob([new Uint8Array(example.bytes)]), example.filename);
+            if (example) form.append("example", new Blob([new Uint8Array(example.bytes)]), example.filename);
+            if (data) form.append("data", new Blob([new Uint8Array(data.bytes)]), data.filename);
             body = form;
         }
         return this.#json<DesignStatus>({
@@ -581,6 +583,7 @@ export class SheetRenderClient {
     async waitForDesign(design: DesignStatus, timeoutMs = 180_000): Promise<DesignStatus> {
         const deadline = Date.now() + timeoutMs;
         let delay = 2_000;
+        let pollError: SheetRenderError | undefined;
         while (design.status === "running" && Date.now() < deadline) {
             try {
                 await sleep(Math.min(delay, deadline - Date.now()), undefined, {
@@ -589,12 +592,18 @@ export class SheetRenderClient {
                 const remaining = deadline - Date.now();
                 if (remaining <= 0) break;
                 design = await this.getDesign(design.design_id, Math.min(JSON_TIMEOUT_MS, remaining));
+                pollError = undefined;
             } catch (error) {
-                if (!this.#signal?.aborted && Date.now() >= deadline) break;
-                throw toNetworkError(error, `Waiting for design ${design.design_id}`, this.baseUrl);
+                pollError = toNetworkError(error, `Waiting for design ${design.design_id}`, this.baseUrl);
+                const status = pollError.status;
+                if (this.#signal?.aborted || Date.now() >= deadline ||
+                    (status !== undefined && status >= 400 && status < 500 && status !== 429)) {
+                    throw pollError;
+                }
             }
             delay = Math.min(delay + 1_000, 5_000);
         }
+        if (pollError) throw pollError;
         return design;
     }
 

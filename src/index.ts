@@ -25,6 +25,7 @@ import { describeTools } from "./descriptions.js";
 import {
     buildInlinePdfResult,
     buildPdfResult,
+    decodeDesignData,
     decodeExample,
     formatDataset,
     formatDatasets,
@@ -33,6 +34,7 @@ import {
     formatTemplates,
     looksLikeMissingRoute,
     readDatasetFile,
+    readDesignDataFile,
     readExampleFile,
     tempPdfPath,
 } from "./format.js";
@@ -230,13 +232,16 @@ export function createServer(
             title: "Design a template",
             description: text.designTemplate,
             inputSchema: {
-                dataset_id: z.string().min(1).describe("Existing dataset id; omit when passing rows.").optional(),
+                dataset_id: z.string().min(1).describe("Existing dataset id; use exactly one data source.").optional(),
                 rows: z.array(z.record(z.string(), z.unknown())).min(1)
-                    .describe("Flat data rows; omit when passing dataset_id.").optional(),
+                    .describe("Flat data rows; use exactly one data source.").optional(),
+                data_base64: z.string().min(1).describe("Base64 CSV or XLSX contents; at most 10 MB decoded.").optional(),
+                data_filename: z.string().min(1).describe("Data filename including .csv or .xlsx extension.").optional(),
                 brief: z.string().trim().min(1).describe("Written design instructions.").optional(),
                 example_base64: z.string().min(1).describe("Base64 example file contents.").optional(),
                 example_filename: z.string().min(1).describe("Example filename including its extension.").optional(),
                 ...(!hosted ? {
+                    data_path: z.string().min(1).describe("Local CSV or XLSX file path; at most 10 MB; ~ is expanded.").optional(),
                     example_path: z.string().min(1).describe("Local example file path; ~ is expanded.").optional(),
                 } : {}),
                 style_id: z.string().min(1).describe("Saved style id.").optional(),
@@ -244,10 +249,15 @@ export function createServer(
                 fit_one_page: z.boolean().describe("Fit the design onto one page.").optional(),
             },
         },
-        async ({ dataset_id, rows, brief, example_base64, example_filename, example_path, style_id, name, fit_one_page }) => {
+        async ({ dataset_id, rows, data_path, data_base64, data_filename, brief, example_base64, example_filename, example_path, style_id, name, fit_one_page }) => {
             try {
-                if (Boolean(dataset_id) === Boolean(rows)) {
-                    throw new SheetRenderError("Provide exactly one of dataset_id or rows.");
+                if ([dataset_id, rows, data_path, data_base64].filter(Boolean).length !== 1) {
+                    throw new SheetRenderError(hosted
+                        ? "Provide exactly one of dataset_id, rows or data_base64."
+                        : "Provide exactly one of dataset_id, rows, data_path or data_base64.");
+                }
+                if (Boolean(data_base64) !== Boolean(data_filename)) {
+                    throw new SheetRenderError("Provide data_base64 and data_filename together.");
                 }
                 if (Boolean(example_base64) !== Boolean(example_filename)) {
                     throw new SheetRenderError("Provide example_base64 and example_filename together.");
@@ -267,8 +277,13 @@ export function createServer(
                     : example_base64 && example_filename
                     ? decodeExample(example_base64, example_filename)
                     : undefined;
+                const data = data_path
+                    ? await readDesignDataFile(data_path)
+                    : data_base64 && data_filename
+                    ? decodeDesignData(data_base64, data_filename)
+                    : undefined;
                 const created = await client.createDesign({
-                    dataset_id, rows, brief, style_id, name, fit_one_page, example,
+                    dataset_id, rows, brief, style_id, name, fit_one_page, example, data,
                 });
                 const design = await client.waitForDesign(created);
                 const result = formatDesign(design, client.baseUrl);

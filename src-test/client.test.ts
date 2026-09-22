@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { afterEach, describe, it } from "node:test";
+import { syncBuiltinESMExports } from "node:module";
+import { afterEach, describe, it, type TestContext } from "node:test";
 
 import { loadConfig, SheetRenderClient, SheetRenderError } from "../src/client.js";
 
@@ -11,6 +12,16 @@ afterEach(() => {
 
 function client(): SheetRenderClient {
     return new SheetRenderClient({ baseUrl: "https://api.test", apiKey: "sr_live_test" });
+}
+
+function mockPollingClock(t: TestContext): void {
+    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+    // The client imports the promise timer as an ESM named binding.
+    syncBuiltinESMExports();
+    t.after(() => {
+        t.mock.timers.reset();
+        syncBuiltinESMExports();
+    });
 }
 
 /**
@@ -476,6 +487,39 @@ describe("design requests", () => {
         assert.equal(stub.calls[0]!.url, "https://api.test/api/v1/designs/a%2Fb");
     });
 
+    for (const withExample of [false, true]) {
+        it(`posts spreadsheet bytes as multipart data${withExample ? " alongside an example" : " with a brief"}`, async () => {
+            const stub = stubFetch(jsonResponse(202, { design_id: "des_1", status: "running" }));
+            const pooled = new Uint8Array([99, 1, 2, 3, 99]);
+            await client().createDesign({
+                data: { filename: "report.xlsx", bytes: pooled.subarray(1, 4) },
+                brief: withExample ? undefined : "Invoice",
+                example: withExample ? { filename: "report.png", bytes: new Uint8Array([4, 5]) } : undefined,
+                name: "Report", fit_one_page: false,
+            });
+            const request = stub.calls[0]!;
+            assert.equal(request.url, "https://api.test/api/v1/designs");
+            assert.equal(request.method, "POST");
+            assert.equal(request.headers.get("authorization"), "Bearer sr_live_test");
+            assert.match(request.headers.get("content-type")!, /multipart\/form-data; boundary=/);
+            const form = await request.formData();
+            const data = form.get("data") as File;
+            assert.equal(data.name, "report.xlsx");
+            assert.deepEqual([...new Uint8Array(await data.arrayBuffer())], [1, 2, 3]);
+            assert.equal(form.get("brief"), withExample ? null : "Invoice");
+            assert.equal(form.get("name"), "Report");
+            assert.equal(form.get("fit_one_page"), "false");
+            assert.equal(form.has("rows"), false);
+            assert.equal(form.has("dataset_id"), false);
+            assert.equal(form.has("example"), withExample);
+            if (withExample) {
+                const example = form.get("example") as File;
+                assert.equal(example.name, "report.png");
+                assert.deepEqual([...new Uint8Array(await example.arrayBuffer())], [4, 5]);
+            }
+        });
+    }
+
     it("rejects non-finite inline values before serialization", async () => {
         assert.throws(() => client().createDesign({ rows: [{ value: NaN }], brief: "Report" }), /NaN/);
     });
@@ -492,6 +536,79 @@ describe("design requests", () => {
         const result = await client().waitForDesign({ design_id: "des_1", status: "running" }, 10);
         assert.equal(result.status, "running");
         assert.equal(stub.calls.length, 0);
+    });
+
+    it("retries network, rate-limit and server errors with the existing capped backoff", async (t) => {
+        mockPollingClock(t);
+        const api = client();
+        const polledAt: number[] = [];
+        const failures = [
+            new TypeError("fetch failed"), new SheetRenderError("Rate limited", 429),
+            new SheetRenderError("Unavailable", 503), new SheetRenderError("Gateway timeout", 504),
+        ];
+        t.mock.method(api, "getDesign", async (id: string) => {
+            polledAt.push(Date.now());
+            const failure = failures.shift();
+            if (failure) throw failure;
+            return { design_id: id, status: "succeeded" as const };
+        });
+        const waiting = api.waitForDesign({ design_id: "des_1", status: "running" });
+        for (const delay of [2_000, 3_000, 4_000, 5_000, 5_000]) {
+            t.mock.timers.tick(delay);
+            await new Promise<void>((resolve) => setImmediate(resolve));
+        }
+        assert.equal((await waiting).status, "succeeded");
+        assert.deepEqual(polledAt, [2_000, 5_000, 9_000, 14_000, 19_000]);
+    });
+
+    for (const status of [400, 401, 403, 404, 422]) {
+        it(`does not retry HTTP ${status}`, async (t) => {
+            mockPollingClock(t);
+            const api = client();
+            const failure = new SheetRenderError("Rejected", status);
+            const poll = t.mock.method(api, "getDesign", async () => { throw failure; });
+            const rejected = assert.rejects(
+                api.waitForDesign({ design_id: "des_1", status: "running" }),
+                (error: unknown) => error === failure,
+            );
+            t.mock.timers.tick(2_000);
+            await rejected;
+            assert.equal(poll.mock.callCount(), 1);
+        });
+    }
+
+    it("rethrows the last poll error only when retries reach the deadline", async (t) => {
+        mockPollingClock(t);
+        const api = client();
+        const failure = new SheetRenderError("Unavailable", 503);
+        const poll = t.mock.method(api, "getDesign", async () => { throw failure; });
+        const rejected = assert.rejects(
+            api.waitForDesign({ design_id: "des_1", status: "running" }, 6_000),
+            (error: unknown) => error === failure && Date.now() === 6_000,
+        );
+        for (const delay of [2_000, 3_000, 1_000]) {
+            t.mock.timers.tick(delay);
+            await new Promise<void>((resolve) => setImmediate(resolve));
+        }
+        await rejected;
+        assert.equal(poll.mock.callCount(), 2);
+    });
+
+    it("returns running at the deadline after a successful poll clears a transient error", async (t) => {
+        mockPollingClock(t);
+        const api = client();
+        let polls = 0;
+        t.mock.method(api, "getDesign", async (id: string) => {
+            if (++polls === 1) throw new SheetRenderError("Unavailable", 503);
+            return { design_id: id, status: "running" as const };
+        });
+        const waiting = api.waitForDesign({ design_id: "des_1", status: "running" }, 6_000);
+        for (const delay of [2_000, 3_000, 1_000]) {
+            t.mock.timers.tick(delay);
+            await new Promise<void>((resolve) => setImmediate(resolve));
+        }
+        assert.equal((await waiting).status, "running");
+        assert.equal(polls, 2);
     });
 
     it("does not poll a finished design", async () => {

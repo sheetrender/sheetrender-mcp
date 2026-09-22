@@ -88,7 +88,7 @@ docker run --rm -p 8080:8080 sheetrender-mcp
 
 ## Tools
 
-- `design_template`: Design from `dataset_id` or inline `rows` and an example, brief or style; waits up to 3 minutes and returns status, template details and an authenticated preview URL. Examples use `example_base64` plus `example_filename`, or stdio-only `example_path`.
+- `design_template`: Design from exactly one of `dataset_id`, inline `rows`, `data_base64` plus `data_filename`, or stdio-only `data_path`, and an example, brief or style. Data files must be CSV or XLSX, up to 10 MB. Waits up to 3 minutes and returns status, template details and an authenticated preview URL. Examples use `example_base64` plus `example_filename`, or stdio-only `example_path`.
 - `get_design`: Poll a `design_id` for its status, template id, name, column mapping and preview URL.
 
 ### `render_pdf`

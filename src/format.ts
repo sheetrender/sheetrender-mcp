@@ -142,49 +142,68 @@ export const DATASET_EXTENSIONS = [".csv", ".xlsx"];
 export const MAX_DATASET_UPLOAD_BYTES = 20 * 1024 * 1024;
 
 const EXAMPLE_EXTENSIONS = [".pdf", ".png", ".jpg", ".jpeg", ".webp", ".docx"];
-const MAX_EXAMPLE_BYTES = 10 * 1024 * 1024;
+const MAX_DESIGN_FILE_BYTES = 10 * 1024 * 1024;
 
-function validateExample(filename: string, size: number): void {
-    if (!EXAMPLE_EXTENSIONS.includes(extname(filename).toLowerCase())) {
-        throw new SheetRenderError("Example must be a PDF, PNG, JPG, WebP or DOCX file.");
+function validateDesignFile(filename: string, size: number, kind: "Example" | "Data"): void {
+    const extensions = kind === "Example" ? EXAMPLE_EXTENSIONS : DATASET_EXTENSIONS;
+    if (!extensions.includes(extname(filename).toLowerCase())) {
+        throw new SheetRenderError(kind === "Example"
+            ? "Example must be a PDF, PNG, JPG, WebP or DOCX file."
+            : "Data must be a CSV or XLSX file.");
     }
-    if (size === 0 || size > MAX_EXAMPLE_BYTES) {
-        throw new SheetRenderError("Example must contain between 1 byte and 10 MB.");
+    if (size === 0 || size > MAX_DESIGN_FILE_BYTES) {
+        throw new SheetRenderError(`${kind} must contain between 1 byte and 10 MB.`);
     }
 }
 
 export function decodeExample(base64: string, filename: string): { filename: string; bytes: Uint8Array } {
+    return decodeDesignFile(base64, filename, "Example");
+}
+
+export function decodeDesignData(base64: string, filename: string): { filename: string; bytes: Uint8Array } {
+    return decodeDesignFile(base64, filename, "Data");
+}
+
+function decodeDesignFile(base64: string, filename: string, kind: "Example" | "Data"): { filename: string; bytes: Uint8Array } {
     const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0;
-    validateExample(filename, Math.floor(base64.length * 3 / 4) - padding);
+    validateDesignFile(filename, Math.floor(base64.length * 3 / 4) - padding, kind);
     if (base64.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(base64)) {
-        throw new SheetRenderError("example_base64 must be valid padded base64 without a data URL prefix.");
+        throw new SheetRenderError(`${kind.toLowerCase()}_base64 must be valid padded base64 without a data URL prefix.`);
     }
     const bytes = Buffer.from(base64, "base64");
     if (bytes.toString("base64") !== base64) {
-        throw new SheetRenderError("example_base64 must be valid padded base64 without a data URL prefix.");
+        throw new SheetRenderError(`${kind.toLowerCase()}_base64 must be valid padded base64 without a data URL prefix.`);
     }
-    validateExample(filename, bytes.length);
+    validateDesignFile(filename, bytes.length, kind);
     return { filename: basename(filename), bytes };
 }
 
 export async function readExampleFile(filePath: string): Promise<{ filename: string; bytes: Uint8Array }> {
+    return readDesignFile(filePath, "Example");
+}
+
+export async function readDesignDataFile(filePath: string): Promise<{ filename: string; bytes: Uint8Array }> {
+    return readDesignFile(filePath, "Data");
+}
+
+async function readDesignFile(filePath: string, kind: "Example" | "Data"): Promise<{ filename: string; bytes: Uint8Array }> {
     const path = expandUserPath(filePath);
     let handle: FileHandle | undefined;
     try {
         handle = await open(path, "r");
         const info = await handle.stat();
-        if (!info.isFile()) throw new SheetRenderError("Example path must point to a regular file.");
-        validateExample(path, info.size);
+        if (!info.isFile()) throw new SheetRenderError(`${kind} path must point to a regular file.`);
+        validateDesignFile(path, info.size, kind);
         // Bound the read even if the file grows after stat().
-        const bytes = Buffer.alloc(Math.min(info.size + 1, MAX_EXAMPLE_BYTES + 1));
+        const bytes = Buffer.alloc(Math.min(info.size + 1, MAX_DESIGN_FILE_BYTES + 1));
         let bytesRead = 0;
         while (bytesRead < bytes.length) {
             const chunk = await handle.read(bytes, bytesRead, bytes.length - bytesRead, bytesRead);
             if (chunk.bytesRead === 0) break;
             bytesRead += chunk.bytesRead;
         }
-        validateExample(path, bytesRead);
-        if (bytesRead > info.size) throw new SheetRenderError("Example file changed while being read. Retry the upload.");
+        validateDesignFile(path, bytesRead, kind);
+        if (bytesRead > info.size) throw new SheetRenderError(`${kind} file changed while being read. Retry the upload.`);
         return { filename: basename(path), bytes: bytes.subarray(0, bytesRead) };
     } catch (error) {
         if (error instanceof SheetRenderError) throw error;

@@ -354,7 +354,7 @@ describe("design tools", () => {
         assert.equal(result.isError, undefined);
         assert.deepEqual(calls, [{
             dataset_id: undefined, rows: [{ customer: "Acme" }], brief: "An invoice",
-            style_id: undefined, name: "Invoice", fit_one_page: true, example: undefined,
+            style_id: undefined, name: "Invoice", fit_one_page: true, example: undefined, data: undefined,
         }]);
         assert.match(textOf(result), /Template id: tpl_1/);
         assert.match(textOf(result), /Dataset id: ds_1/);
@@ -397,6 +397,95 @@ describe("design tools", () => {
             dataset_id: "ds_1", example_path: path,
         } });
         assert.equal(result.isError, undefined);
+    });
+
+    for (const hosted of [false, true]) {
+        it(`accepts base64 spreadsheet data on ${hosted ? "HTTP" : "stdio"}`, async () => {
+            const client = await connect({
+                baseUrl: "https://api.test",
+                createDesign: async (input) => {
+                    assert.equal(input.dataset_id, undefined);
+                    assert.equal(input.rows, undefined);
+                    assert.equal(input.data?.filename, "report.csv");
+                    assert.equal(Buffer.from(input.data!.bytes).toString(), "customer\nAcme\n");
+                    assert.equal(input.brief, "Invoice");
+                    return completed;
+                },
+                waitForDesign: async (design) => design,
+            }, { hosted });
+            const tool = (await client.listTools()).tools.find((tool) => tool.name === "design_template")!;
+            assert.equal("data_path" in tool.inputSchema.properties!, !hosted);
+            assert.equal("data_base64" in tool.inputSchema.properties!, true);
+            assert.equal("data_filename" in tool.inputSchema.properties!, true);
+            const result = await client.callTool({ name: "design_template", arguments: {
+                data_base64: Buffer.from("customer\nAcme\n").toString("base64"),
+                data_filename: "report.csv", brief: "Invoice",
+            } });
+            assert.equal(result.isError, undefined);
+        });
+    }
+
+    it("reads a spreadsheet path on stdio alongside an example", async () => {
+        const path = await tempFile("report.xlsx", "workbook bytes");
+        const client = await connect({
+            baseUrl: "https://api.test",
+            createDesign: async (input) => {
+                assert.equal(input.data?.filename, "report.xlsx");
+                assert.equal(Buffer.from(input.data!.bytes).toString(), "workbook bytes");
+                assert.equal(input.example?.filename, "report.png");
+                assert.equal(Buffer.from(input.example!.bytes).toString(), "abc");
+                return completed;
+            },
+            waitForDesign: async (design) => design,
+        });
+        const result = await client.callTool({ name: "design_template", arguments: {
+            data_path: path, example_base64: "YWJj", example_filename: "report.png",
+        } });
+        assert.equal(result.isError, undefined);
+    });
+
+    it("does not read a data_path on the hosted transport", async () => {
+        const client = await connect({}, { hosted: true });
+        const result = await client.callTool({ name: "design_template", arguments: {
+            data_path: "/server/private.csv", brief: "Invoice",
+        } });
+        assert.equal(result.isError, true);
+        assert.match(textOf(result), /Provide exactly one of dataset_id, rows or data_base64/);
+    });
+
+    it("rejects every pair of data sources before reading files or calling the API", async () => {
+        const client = await connect({});
+        const sources = [
+            { dataset_id: "ds_1" }, { rows: [{ customer: "Acme" }] },
+            { data_path: "/missing.csv" }, { data_base64: "YWJj", data_filename: "report.csv" },
+        ];
+        for (let i = 0; i < sources.length; i++) {
+            for (let j = i + 1; j < sources.length; j++) {
+                const result = await client.callTool({ name: "design_template", arguments: {
+                    ...sources[i], ...sources[j], brief: "Invoice",
+                } });
+                assert.equal(result.isError, true);
+                assert.match(textOf(result), /Provide exactly one of dataset_id, rows, data_path or data_base64/);
+            }
+        }
+    });
+
+    it("rejects unpaired filenames and invalid data uploads before calling the API", async () => {
+        const client = await connect({});
+        const oversized = Buffer.alloc(10 * 1024 * 1024 + 1).toString("base64");
+        for (const args of [
+            { data_base64: "YWJj" },
+            { dataset_id: "ds_1", data_filename: "report.csv" },
+            { data_base64: "!@#$", data_filename: "report.csv" },
+            { data_base64: "YWJj", data_filename: "report.pdf" },
+            { data_base64: oversized, data_filename: "report.xlsx" },
+            { data_path: await tempFile("report.txt", "data") },
+            { data_path: await tempFile("empty.csv", "") },
+        ]) {
+            const result = await client.callTool({ name: "design_template", arguments: { ...args, brief: "Invoice" } });
+            assert.equal(result.isError, true);
+            assert.doesNotMatch(textOf(result), /Unexpected error/);
+        }
     });
 
     it("rejects missing, conflicting and malformed sources before calling the API", async () => {
