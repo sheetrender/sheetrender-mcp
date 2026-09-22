@@ -11,6 +11,8 @@ import {
 } from "../src/client.js";
 import {
     buildPdfResult,
+    decodeExample,
+    readExampleFile,
     formatBytes,
     formatDataset,
     formatDatasets,
@@ -426,5 +428,33 @@ describe("readDatasetFile", () => {
             readDatasetFile("~/sheetrender-does-not-exist-1234.csv"),
             (error: Error) => error.message.includes(homedir()),
         );
+    });
+});
+
+describe("design examples", () => {
+    it("decodes base64 bytes and keeps only the filename", () => {
+        const example = decodeExample("AAEC/w==", "/tmp/report.png");
+        assert.equal(example.filename, "report.png");
+        assert.deepEqual([...example.bytes], [0, 1, 2, 255]);
+    });
+
+    it("rejects empty, oversized, malformed and unsupported examples", () => {
+        assert.throws(() => decodeExample("", "report.png"), /between 1 byte/);
+        assert.throws(() => decodeExample("a".repeat(14 * 1024 * 1024), "report.png"), /10 MB/);
+        assert.throws(() => decodeExample("ab=c", "report.png"), /valid padded base64/);
+        assert.throws(() => decodeExample("AB==", "report.png"), /valid padded base64/);
+        assert.throws(() => decodeExample("YWJj", "report.html"), /PDF, PNG/);
+    });
+
+    it("reads local example bytes and rejects oversized files and directories", async () => {
+        const dir = await mkdtemp(join(tmpdir(), "sheetrender-example-test-"));
+        const path = join(dir, "report.docx");
+        await writeFile(path, "example bytes");
+        const example = await readExampleFile(path);
+        assert.equal(example.filename, "report.docx");
+        assert.equal(Buffer.from(example.bytes).toString(), "example bytes");
+        await truncate(path, 10 * 1024 * 1024 + 1);
+        await assert.rejects(readExampleFile(path), /10 MB/);
+        await assert.rejects(readExampleFile(dir), /regular file/);
     });
 });

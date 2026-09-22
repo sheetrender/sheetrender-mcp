@@ -445,3 +445,67 @@ function pdfResponse(): Response {
         headers: { "content-type": "application/pdf" },
     });
 }
+
+describe("design requests", () => {
+    it("posts JSON rows with a brief", async () => {
+        const stub = stubFetch(jsonResponse(202, { design_id: "des_1", status: "running" }));
+        const design = await client().createDesign({ rows: [{ customer: "Acme" }], brief: "Invoice" });
+        assert.equal(design.design_id, "des_1");
+        assert.equal(stub.calls[0]!.url, "https://api.test/api/v1/designs");
+        assert.deepEqual(await stub.calls[0]!.json(), { rows: [{ customer: "Acme" }], brief: "Invoice" });
+    });
+
+    it("posts example bytes and rows as multipart", async () => {
+        const stub = stubFetch(jsonResponse(202, { design_id: "des_1", status: "running" }));
+        await client().createDesign({ rows: [{ amount: 4 }], fit_one_page: false,
+            example: { filename: "report.png", bytes: new Uint8Array([1, 2, 3]) } });
+        const request = stub.calls[0]!;
+        assert.match(request.headers.get("content-type")!, /multipart\/form-data; boundary=/);
+        const form = await request.formData();
+        assert.equal(form.get("rows"), '[{"amount":4}]');
+        assert.equal(form.get("fit_one_page"), "false");
+        const example = form.get("example") as File;
+        assert.equal(example.name, "report.png");
+        assert.deepEqual([...new Uint8Array(await example.arrayBuffer())], [1, 2, 3]);
+        assert.equal(request.headers.get("authorization"), "Bearer sr_live_test");
+    });
+
+    it("encodes the design id when polling", async () => {
+        const stub = stubFetch(jsonResponse(200, { design_id: "a/b", status: "running" }));
+        await client().getDesign("a/b");
+        assert.equal(stub.calls[0]!.url, "https://api.test/api/v1/designs/a%2Fb");
+    });
+
+    it("rejects non-finite inline values before serialization", async () => {
+        assert.throws(() => client().createDesign({ rows: [{ value: NaN }], brief: "Report" }), /NaN/);
+    });
+
+    it("polls a running design until it succeeds", async () => {
+        const stub = stubFetch(jsonResponse(200, { design_id: "des_1", status: "succeeded", template_id: "tpl_1" }));
+        const result = await client().waitForDesign({ design_id: "des_1", status: "running" });
+        assert.equal(result.status, "succeeded");
+        assert.equal(stub.calls.length, 1);
+    });
+
+    it("returns the running design at its polling deadline", async () => {
+        const stub = stubFetch(jsonResponse(200, {}));
+        const result = await client().waitForDesign({ design_id: "des_1", status: "running" }, 10);
+        assert.equal(result.status, "running");
+        assert.equal(stub.calls.length, 0);
+    });
+
+    it("does not poll a finished design", async () => {
+        const stub = stubFetch(jsonResponse(200, {}));
+        const result = await client().waitForDesign({ design_id: "des_1", status: "failed" });
+        assert.equal(result.status, "failed");
+        assert.equal(stub.calls.length, 0);
+    });
+
+    it("aborts a polling wait when the HTTP caller disconnects", async () => {
+        const controller = new AbortController();
+        const api = new SheetRenderClient({ baseUrl: "https://api.test", apiKey: "test", signal: controller.signal });
+        const waiting = api.waitForDesign({ design_id: "des_1", status: "running" });
+        controller.abort();
+        await assert.rejects(waiting, /abort/i);
+    });
+});

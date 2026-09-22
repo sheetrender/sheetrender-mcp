@@ -183,6 +183,8 @@ describe("MCP over HTTP", () => {
         assert.deepEqual(tools.map((tool) => tool.name).sort(), [
             "create_batch_job",
             "create_dataset",
+            "design_template",
+            "get_design",
             "get_document",
             "get_job",
             "list_datasets",

@@ -14,7 +14,7 @@ import {
 } from "../src/client.js";
 // Importing the server module is safe: it only takes over stdio and reads the
 // environment when it is the process entrypoint, which node --test is not.
-import { createServer } from "../src/index.js";
+import { createServer, type ServerOptions } from "../src/index.js";
 
 /**
  * A stand-in for the HTTP client. Only the methods a test needs are present, so
@@ -31,8 +31,8 @@ afterEach(async () => {
 });
 
 /** Drives the real server in-process over a linked in-memory transport. */
-async function connect(fake: FakeClient): Promise<Client> {
-    const server = createServer(fake as unknown as SheetRenderClient);
+async function connect(fake: FakeClient, options: ServerOptions = {}): Promise<Client> {
+    const server = createServer(fake as unknown as SheetRenderClient, options);
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     const client = new Client({ name: "test", version: "0" });
     await Promise.all([
@@ -82,6 +82,8 @@ describe("tool registration", () => {
         assert.deepEqual(tools.map((tool) => tool.name).sort(), [
             "create_batch_job",
             "create_dataset",
+            "design_template",
+            "get_design",
             "get_document",
             "get_job",
             "list_datasets",
@@ -323,5 +325,128 @@ describe("create_batch_job", () => {
         const text = textOf(result);
         assert.match(text, /Job id: job_1/);
         assert.match(text, /Poll get_job with job_id "job_1"/);
+    });
+});
+
+describe("design tools", () => {
+    const completed = {
+        design_id: "des_1", status: "succeeded" as const, template_id: "tpl_1",
+        dataset_id: "ds_1", name: "Invoice", mapping: { customer: "customer" },
+        preview_url: "/api/v1/templates/tpl_1/preview.pdf",
+    };
+
+    it("designs from inline rows and a brief, then returns the mapped template", async () => {
+        const calls: unknown[] = [];
+        const client = await connect({
+            baseUrl: "https://api.test",
+            createDesign: async (input) => {
+                calls.push(input);
+                return { design_id: "des_1", status: "running" };
+            },
+            waitForDesign: async (design) => {
+                assert.equal(design.design_id, "des_1");
+                return completed;
+            },
+        });
+        const result = await client.callTool({ name: "design_template", arguments: {
+            rows: [{ customer: "Acme" }], brief: "An invoice", name: "Invoice", fit_one_page: true,
+        } });
+        assert.equal(result.isError, undefined);
+        assert.deepEqual(calls, [{
+            dataset_id: undefined, rows: [{ customer: "Acme" }], brief: "An invoice",
+            style_id: undefined, name: "Invoice", fit_one_page: true, example: undefined,
+        }]);
+        assert.match(textOf(result), /Template id: tpl_1/);
+        assert.match(textOf(result), /Dataset id: ds_1/);
+        assert.match(textOf(result), /Mapping: \{"customer":"customer"\}/);
+        assert.match(textOf(result), /https:\/\/api.test\/api\/v1\/templates\/tpl_1\/preview.pdf/);
+    });
+
+    it("uploads base64 examples on the hosted transport", async () => {
+        const client = await connect({
+            baseUrl: "https://api.test",
+            createDesign: async (input) => {
+                assert.equal(input.dataset_id, "ds_1");
+                assert.equal(input.example?.filename, "report.png");
+                assert.equal(Buffer.from(input.example!.bytes).toString(), "png bytes");
+                return completed;
+            },
+            waitForDesign: async (design) => design,
+        }, { hosted: true });
+        const tool = (await client.listTools()).tools.find((tool) => tool.name === "design_template")!;
+        assert.equal("example_path" in tool.inputSchema.properties!, false);
+        const result = await client.callTool({ name: "design_template", arguments: {
+            dataset_id: "ds_1", example_base64: Buffer.from("png bytes").toString("base64"),
+            example_filename: "report.png",
+        } });
+        assert.equal(result.isError, undefined);
+    });
+
+    it("reads an example path only on stdio", async () => {
+        const path = await tempFile("report.pdf", "%PDF-example");
+        const client = await connect({
+            baseUrl: "https://api.test",
+            createDesign: async (input) => {
+                assert.equal(input.example?.filename, "report.pdf");
+                assert.equal(Buffer.from(input.example!.bytes).toString(), "%PDF-example");
+                return completed;
+            },
+            waitForDesign: async (design) => design,
+        });
+        const result = await client.callTool({ name: "design_template", arguments: {
+            dataset_id: "ds_1", example_path: path,
+        } });
+        assert.equal(result.isError, undefined);
+    });
+
+    it("rejects missing, conflicting and malformed sources before calling the API", async () => {
+        const client = await connect({});
+        for (const args of [
+            { dataset_id: "ds_1" },
+            { brief: "Invoice" },
+            { dataset_id: "ds_1", rows: [{}], brief: "Invoice" },
+            { dataset_id: "ds_1", example_base64: "YWJj" },
+            { dataset_id: "ds_1", example_base64: "!@#$", example_filename: "a.png" },
+            { dataset_id: "ds_1", example_base64: "YWJj", example_filename: "a.png", brief: "Invoice" },
+        ]) {
+            const result = await client.callTool({ name: "design_template", arguments: args });
+            assert.equal(result.isError, true);
+            assert.doesNotMatch(textOf(result), /Unexpected error/);
+        }
+    });
+
+    it("returns running status with the id for later polling", async () => {
+        const client = await connect({
+            baseUrl: "https://api.test",
+            createDesign: async () => ({ design_id: "des_1", status: "running" }),
+            waitForDesign: async (design) => design,
+        });
+        const result = await client.callTool({ name: "design_template", arguments: {
+            dataset_id: "ds_1", style_id: "modern",
+        } });
+        assert.equal(result.isError, undefined);
+        assert.match(textOf(result), /Poll get_design with design_id "des_1"/);
+    });
+
+    it("reports design failures and quota errors", async () => {
+        const client = await connect({
+            baseUrl: "https://api.test",
+            getDesign: async (id) => ({ design_id: id, status: "failed", error: "Generation failed" }),
+            createDesign: async () => { throw new SheetRenderError("Design limit reached (HTTP 403).", 403); },
+        });
+        const failed = await client.callTool({ name: "get_design", arguments: { design_id: "des_1" } });
+        assert.equal(failed.isError, true);
+        assert.match(textOf(failed), /Generation failed/);
+        const quota = await client.callTool({ name: "design_template", arguments: { dataset_id: "ds_1", brief: "Invoice" } });
+        assert.equal(quota.isError, true);
+        assert.match(textOf(quota), /HTTP 403/);
+    });
+
+    it("get_design returns completed template details", async () => {
+        const client = await connect({ baseUrl: "https://api.test", getDesign: async () => completed });
+        const result = await client.callTool({ name: "get_design", arguments: { design_id: "des_1" } });
+        assert.equal(result.isError, undefined);
+        assert.match(textOf(result), /Status: succeeded/);
+        assert.match(textOf(result), /Name: Invoice/);
     });
 });

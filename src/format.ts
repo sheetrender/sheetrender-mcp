@@ -17,6 +17,7 @@ import {
     SheetRenderError,
     TERMINAL_JOB_STATUSES,
     type DatasetSummary,
+    type DesignStatus,
     type JobStatus,
     type TemplateSummary,
 } from "./client.js";
@@ -139,6 +140,73 @@ export const DATASET_EXTENSIONS = [".csv", ".xlsx"];
 
 /** The server's upload cap. Checked here so 100 MB is refused before it is sent. */
 export const MAX_DATASET_UPLOAD_BYTES = 20 * 1024 * 1024;
+
+const EXAMPLE_EXTENSIONS = [".pdf", ".png", ".jpg", ".jpeg", ".webp", ".docx"];
+const MAX_EXAMPLE_BYTES = 10 * 1024 * 1024;
+
+function validateExample(filename: string, size: number): void {
+    if (!EXAMPLE_EXTENSIONS.includes(extname(filename).toLowerCase())) {
+        throw new SheetRenderError("Example must be a PDF, PNG, JPG, WebP or DOCX file.");
+    }
+    if (size === 0 || size > MAX_EXAMPLE_BYTES) {
+        throw new SheetRenderError("Example must contain between 1 byte and 10 MB.");
+    }
+}
+
+export function decodeExample(base64: string, filename: string): { filename: string; bytes: Uint8Array } {
+    const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0;
+    validateExample(filename, Math.floor(base64.length * 3 / 4) - padding);
+    if (base64.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(base64)) {
+        throw new SheetRenderError("example_base64 must be valid padded base64 without a data URL prefix.");
+    }
+    const bytes = Buffer.from(base64, "base64");
+    if (bytes.toString("base64") !== base64) {
+        throw new SheetRenderError("example_base64 must be valid padded base64 without a data URL prefix.");
+    }
+    validateExample(filename, bytes.length);
+    return { filename: basename(filename), bytes };
+}
+
+export async function readExampleFile(filePath: string): Promise<{ filename: string; bytes: Uint8Array }> {
+    const path = expandUserPath(filePath);
+    let handle: FileHandle | undefined;
+    try {
+        handle = await open(path, "r");
+        const info = await handle.stat();
+        if (!info.isFile()) throw new SheetRenderError("Example path must point to a regular file.");
+        validateExample(path, info.size);
+        // Bound the read even if the file grows after stat().
+        const bytes = Buffer.alloc(Math.min(info.size + 1, MAX_EXAMPLE_BYTES + 1));
+        let bytesRead = 0;
+        while (bytesRead < bytes.length) {
+            const chunk = await handle.read(bytes, bytesRead, bytes.length - bytesRead, bytesRead);
+            if (chunk.bytesRead === 0) break;
+            bytesRead += chunk.bytesRead;
+        }
+        validateExample(path, bytesRead);
+        if (bytesRead > info.size) throw new SheetRenderError("Example file changed while being read. Retry the upload.");
+        return { filename: basename(path), bytes: bytes.subarray(0, bytesRead) };
+    } catch (error) {
+        if (error instanceof SheetRenderError) throw error;
+        throw new SheetRenderError(`Could not read ${path}: ${describeFsError(error)}`);
+    } finally {
+        await handle?.close();
+    }
+}
+
+export function formatDesign(design: DesignStatus, baseUrl: string): string {
+    const lines = [`Design ${design.design_id}`, `Status: ${design.status}`];
+    if (design.template_id) lines.push(`Template id: ${design.template_id}`);
+    if (design.dataset_id) lines.push(`Dataset id: ${design.dataset_id}`);
+    if (design.name) lines.push(`Name: ${design.name}`);
+    if (design.mapping !== undefined) lines.push(`Mapping: ${JSON.stringify(design.mapping)}`);
+    if (design.preview_url) {
+        lines.push(`Preview URL: ${new URL(design.preview_url, baseUrl).href} (requires API-key authentication)`);
+    }
+    if (design.error) lines.push(`Error: ${design.error}`);
+    if (design.status === "running") lines.push(`Poll get_design with design_id "${design.design_id}".`);
+    return lines.join("\n");
+}
 
 /**
  * Reads a local spreadsheet for upload, refusing what the server would refuse.

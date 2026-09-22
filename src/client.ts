@@ -8,6 +8,8 @@
  * can branch on it.
  */
 
+import { setTimeout as sleep } from "node:timers/promises";
+
 export const DEFAULT_API_URL = "https://sheetrender.com";
 
 /** JSON request timeout. Template listings and job polls are quick. */
@@ -78,6 +80,27 @@ export interface JobStatus {
 
 export interface CreatedJob {
     job_id: string;
+}
+
+export interface DesignStatus {
+    design_id: string;
+    status: "running" | "succeeded" | "failed";
+    template_id?: string;
+    dataset_id?: string;
+    name?: string;
+    mapping?: unknown;
+    preview_url?: string;
+    error?: string;
+}
+
+export interface DesignInput {
+    dataset_id?: string;
+    rows?: Record<string, unknown>[];
+    brief?: string;
+    style_id?: string;
+    name?: string;
+    fit_one_page?: boolean;
+    example?: { filename: string; bytes: Uint8Array };
 }
 
 export interface Margins {
@@ -519,6 +542,60 @@ export class SheetRenderClient {
             accept: "json",
             advice: DATASET_ADVICE,
         });
+    }
+
+    createDesign(input: DesignInput): Promise<DesignStatus> {
+        const { example, ...fields } = input;
+        if (fields.rows) assertSerialisableRows(fields.rows);
+        let body: unknown = fields;
+        if (example) {
+            const form = new FormData();
+            for (const [key, value] of Object.entries(fields)) {
+                if (value !== undefined) {
+                    form.append(key, key === "rows" ? JSON.stringify(value) : String(value));
+                }
+            }
+            form.append("example", new Blob([new Uint8Array(example.bytes)]), example.filename);
+            body = form;
+        }
+        return this.#json<DesignStatus>({
+            method: "POST",
+            path: "/api/v1/designs",
+            what: "Designing a template",
+            body,
+            accept: "json",
+            timeoutMs: DATASET_TIMEOUT_MS,
+        });
+    }
+
+    getDesign(designId: string, timeoutMs = JSON_TIMEOUT_MS): Promise<DesignStatus> {
+        return this.#json<DesignStatus>({
+            method: "GET",
+            path: `/api/v1/designs/${encodeURIComponent(designId)}`,
+            what: `Fetching design ${designId}`,
+            accept: "json",
+            timeoutMs,
+        });
+    }
+
+    async waitForDesign(design: DesignStatus, timeoutMs = 180_000): Promise<DesignStatus> {
+        const deadline = Date.now() + timeoutMs;
+        let delay = 2_000;
+        while (design.status === "running" && Date.now() < deadline) {
+            try {
+                await sleep(Math.min(delay, deadline - Date.now()), undefined, {
+                    signal: this.#signal,
+                });
+                const remaining = deadline - Date.now();
+                if (remaining <= 0) break;
+                design = await this.getDesign(design.design_id, Math.min(JSON_TIMEOUT_MS, remaining));
+            } catch (error) {
+                if (!this.#signal?.aborted && Date.now() >= deadline) break;
+                throw toNetworkError(error, `Waiting for design ${design.design_id}`, this.baseUrl);
+            }
+            delay = Math.min(delay + 1_000, 5_000);
+        }
+        return design;
     }
 
     /** POST /api/v1/jobs — queue a batch render over a dataset. */

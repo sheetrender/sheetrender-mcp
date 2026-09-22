@@ -15,6 +15,8 @@ export interface ToolDescriptions {
     instructions: string;
     renderPdf: string;
     listTemplates: string;
+    designTemplate: string;
+    getDesign: string;
     renderTemplate: string;
     createDataset: string;
     /** Registered by the stdio server only. */
@@ -60,10 +62,21 @@ export function describeTools(hosted: boolean): ToolDescriptions {
             `${WHAT_IS_SHEETRENDER} Use render_pdf for one-off documents built from ` +
             "HTML you write, and render_template for documents from a template already " +
             "saved in the user's account (list_templates finds their ids).\n\n" +
+            "Use design_template to create a template from data and an example or brief.\n\n" +
             "For many documents at once, the whole batch runs from here without the web " +
             `app: list_templates -> ${datasetSources} -> create_batch_job -> get_job ` +
             "to poll -> get_document to download each PDF. list_datasets finds datasets that " +
             "already exist on a template's project.",
+
+        designTemplate:
+            "Design a saved template from dataset_id or inline rows and an example, brief, " +
+            "or style_id. Use an example alone, or a brief with optional style_id. " +
+            "Examples accept PDF, PNG, JPG, WebP or DOCX as base64 with a filename. " +
+            (hosted ? "" : "Local example_path is also available. ") +
+            "Waits up to 3 minutes; returns the design status, template id, mapping and preview URL.",
+
+        getDesign:
+            "Get a design's status and, when complete, its template id, name, mapping and preview URL.",
 
         renderPdf:
             `${WHAT_IS_SHEETRENDER} This tool renders a single PDF from HTML you supply ` +

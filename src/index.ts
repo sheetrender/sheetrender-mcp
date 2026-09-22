@@ -25,12 +25,15 @@ import { describeTools } from "./descriptions.js";
 import {
     buildInlinePdfResult,
     buildPdfResult,
+    decodeExample,
     formatDataset,
     formatDatasets,
+    formatDesign,
     formatJob,
     formatTemplates,
     looksLikeMissingRoute,
     readDatasetFile,
+    readExampleFile,
     tempPdfPath,
 } from "./format.js";
 
@@ -215,6 +218,81 @@ export function createServer(
         async () => {
             try {
                 return textResult(formatTemplates(await client.listTemplates()));
+            } catch (error) {
+                return toToolError(error);
+            }
+        },
+    );
+
+    server.registerTool(
+        "design_template",
+        {
+            title: "Design a template",
+            description: text.designTemplate,
+            inputSchema: {
+                dataset_id: z.string().min(1).describe("Existing dataset id; omit when passing rows.").optional(),
+                rows: z.array(z.record(z.string(), z.unknown())).min(1)
+                    .describe("Flat data rows; omit when passing dataset_id.").optional(),
+                brief: z.string().trim().min(1).describe("Written design instructions.").optional(),
+                example_base64: z.string().min(1).describe("Base64 example file contents.").optional(),
+                example_filename: z.string().min(1).describe("Example filename including its extension.").optional(),
+                ...(!hosted ? {
+                    example_path: z.string().min(1).describe("Local example file path; ~ is expanded.").optional(),
+                } : {}),
+                style_id: z.string().min(1).describe("Saved style id.").optional(),
+                name: z.string().trim().min(1).describe("Template name.").optional(),
+                fit_one_page: z.boolean().describe("Fit the design onto one page.").optional(),
+            },
+        },
+        async ({ dataset_id, rows, brief, example_base64, example_filename, example_path, style_id, name, fit_one_page }) => {
+            try {
+                if (Boolean(dataset_id) === Boolean(rows)) {
+                    throw new SheetRenderError("Provide exactly one of dataset_id or rows.");
+                }
+                if (Boolean(example_base64) !== Boolean(example_filename)) {
+                    throw new SheetRenderError("Provide example_base64 and example_filename together.");
+                }
+                if (example_path && (hosted || example_base64)) {
+                    throw new SheetRenderError("example_path is stdio-only and cannot be combined with example_base64.");
+                }
+                const hasExample = Boolean(example_path || example_base64);
+                if (!hasExample && !brief && !style_id) {
+                    throw new SheetRenderError("Provide an example, brief or style_id.");
+                }
+                if (hasExample && (brief || style_id)) {
+                    throw new SheetRenderError("Use an example alone, or a brief and optional style_id.");
+                }
+                const example = example_path
+                    ? await readExampleFile(example_path)
+                    : example_base64 && example_filename
+                    ? decodeExample(example_base64, example_filename)
+                    : undefined;
+                const created = await client.createDesign({
+                    dataset_id, rows, brief, style_id, name, fit_one_page, example,
+                });
+                const design = await client.waitForDesign(created);
+                const result = formatDesign(design, client.baseUrl);
+                return design.status === "failed" ? errorResult(result) : textResult(result);
+            } catch (error) {
+                return toToolError(error);
+            }
+        },
+    );
+
+    server.registerTool(
+        "get_design",
+        {
+            title: "Check a template design",
+            description: text.getDesign,
+            inputSchema: {
+                design_id: z.string().min(1).describe("Design id returned by design_template."),
+            },
+        },
+        async ({ design_id }) => {
+            try {
+                const design = await client.getDesign(design_id);
+                const result = formatDesign(design, client.baseUrl);
+                return design.status === "failed" ? errorResult(result) : textResult(result);
             } catch (error) {
                 return toToolError(error);
             }
