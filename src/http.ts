@@ -34,6 +34,7 @@ import {
     createAnonServer,
     DEFAULT_CALLS_PER_HOUR,
     DEFAULT_CLAUDE_CALLS_PER_HOUR,
+    DEFAULT_NETWORK_CALLS_PER_HOUR,
     MAX_ANON_BODY_BYTES,
     OPENAI_EGRESS_CIDRS,
     openaiSubject,
@@ -44,6 +45,7 @@ import {
 } from "./anon.js";
 import { DEFAULT_API_URL, parseApiUrl, SheetRenderClient, SheetRenderError } from "./client.js";
 import { createServer, runningAsExecutable, SERVER_VERSION } from "./index.js";
+import { startOpenaiEgressRefresh } from "./openai-egress.js";
 import { loadWidgetBundle } from "./widget-resource.js";
 
 const DEFAULT_PORT = 8080;
@@ -79,8 +81,15 @@ export interface HttpServerOptions {
     anonCallsPerHour?: number;
     /** Shared hourly budget for all traffic from 160.79.104.0/21. */
     claudeCallsPerHour?: number;
+    /** Anonymous flood guard for callers counted by IP: calls per IPv4 /24 or IPv6 /48 per hour. */
+    anonNetworkCallsPerHour?: number;
     /** Ranges whose `openai/subject` is believed; OpenAI's published list by default. */
     openaiEgressCidrs?: readonly string[];
+    /**
+     * The set itself, when something else keeps it current (main() refreshes
+     * it from OpenAI's live list). Takes precedence over `openaiEgressCidrs`.
+     */
+    openaiEgress?: CidrSet;
     /** Clock for the flood guard and catalogue cache; tests replace it. */
     now?: () => number;
 }
@@ -98,7 +107,10 @@ export interface HttpConfig {
     openaiAppsChallenge?: string;
     anonCallsPerHour: number;
     claudeCallsPerHour: number;
+    anonNetworkCallsPerHour: number;
     openaiEgressCidrs: readonly string[];
+    /** True when OPENAI_EGRESS_CIDRS set the list; the live refresh is then off. */
+    openaiEgressFromEnv: boolean;
 }
 
 /** Reads the hosted server's configuration from the environment. */
@@ -116,7 +128,9 @@ export function loadHttpConfig(env: NodeJS.ProcessEnv = process.env): HttpConfig
         openaiAppsChallenge: env.OPENAI_APPS_CHALLENGE?.trim() || undefined,
         anonCallsPerHour: readInteger(env, "ANON_CALLS_PER_HOUR", DEFAULT_CALLS_PER_HOUR, 1),
         claudeCallsPerHour: readInteger(env, "CLAUDE_CALLS_PER_HOUR", DEFAULT_CLAUDE_CALLS_PER_HOUR, 1),
+        anonNetworkCallsPerHour: readInteger(env, "ANON_NETWORK_CALLS_PER_HOUR", DEFAULT_NETWORK_CALLS_PER_HOUR, 1),
         openaiEgressCidrs: readCidrs(env, "OPENAI_EGRESS_CIDRS", OPENAI_EGRESS_CIDRS),
+        openaiEgressFromEnv: Boolean(env.OPENAI_EGRESS_CIDRS?.trim()),
     };
 }
 
@@ -297,6 +311,45 @@ function describeAnonCall(
     return fields;
 }
 
+const HOUR_MS = 60 * 60 * 1000;
+
+/**
+ * Counts anonymous calls that carried an `openai/subject` from outside the
+ * trusted OpenAI ranges, and logs the count at most once an hour. A steady
+ * count is the sign of a stale list: ChatGPT traffic from a new egress
+ * address, counted by IP. The first one after a quiet hour logs at once.
+ */
+export class UntrustedSubjectTally {
+    readonly #log: (entry: LogEntry) => void;
+    readonly #now: () => number;
+    #count = 0;
+    #loggedAt = -Infinity;
+
+    constructor(log: (entry: LogEntry) => void, now: () => number = Date.now) {
+        this.#log = log;
+        this.#now = now;
+    }
+
+    note(): void {
+        this.#count++;
+        this.flush();
+    }
+
+    /** Logs the count if there is one and the last summary is an hour old. */
+    flush(): void {
+        const now = this.#now();
+        if (this.#count === 0 || now - this.#loggedAt < HOUR_MS) return;
+        this.#log({
+            level: "warn",
+            msg: "openai/subject from outside the OpenAI ranges",
+            count: this.#count,
+            hint: "if steady, OpenAI's egress list may be stale; those calls are counted by IP",
+        });
+        this.#count = 0;
+        this.#loggedAt = now;
+    }
+}
+
 /**
  * A fresh `Mcp-Session-Id`: 256 random bits. Nothing is stored against it, so
  * any instance can serve the conversation it names.
@@ -383,8 +436,17 @@ export function createHttpServer(options: HttpServerOptions): Server {
         options.now,
         1,
     );
+    const networkLimiter = new SlidingWindowLimiter(
+        options.anonNetworkCallsPerHour ?? DEFAULT_NETWORK_CALLS_PER_HOUR,
+        60 * 60 * 1000,
+        options.now,
+    );
     const catalogue = new CatalogueCache(undefined, options.now);
-    const openaiEgress = new CidrSet(options.openaiEgressCidrs ?? OPENAI_EGRESS_CIDRS);
+    const openaiEgress = options.openaiEgress ?? new CidrSet(options.openaiEgressCidrs ?? OPENAI_EGRESS_CIDRS);
+    const untrusted = new UntrustedSubjectTally(log, options.now);
+    // Flushes a count left over when the calls stop; it still logs at most hourly.
+    const untrustedTimer = setInterval(() => untrusted.flush(), 5 * 60 * 1000);
+    untrustedTimer.unref();
 
     const server = createNodeServer((req, res) => {
         const started = process.hrtime.bigint();
@@ -512,7 +574,10 @@ export function createHttpServer(options: HttpServerOptions): Server {
         Object.assign(fields, describeRpc(parsedBody));
         const userAgent = req.headers["user-agent"];
         const ip = clientIp(req);
-        if (anonymous) Object.assign(fields, describeAnonCall(parsedBody, userAgent, ip, openaiEgress));
+        if (anonymous) {
+            Object.assign(fields, describeAnonCall(parsedBody, userAgent, ip, openaiEgress));
+            if (fields.subject_untrusted) untrusted.note();
+        }
 
         // Aborted when the response closes, so a caller that disconnects mid
         // render does not leave the upstream request running to its timeout.
@@ -527,6 +592,7 @@ export function createHttpServer(options: HttpServerOptions): Server {
                 client,
                 limiter,
                 claudeLimiter,
+                networkLimiter,
                 catalogue,
                 clientIp: ip,
                 openaiEgress,
@@ -556,6 +622,8 @@ export function createHttpServer(options: HttpServerOptions): Server {
         await mcp.connect(transport);
         await transport.handleRequest(req, res, parsedBody);
     }
+
+    server.on("close", () => clearInterval(untrustedTimer));
 
     // Idle sockets are dropped after `idleTimeoutMs`; an SSE response in
     // flight is kept alive by the transport's periodic keep-alive comments.
@@ -592,7 +660,13 @@ async function main(): Promise<void> {
         }
     }
 
-    const server = createHttpServer(config);
+    // OpenAI's list is fetched now and daily unless OPENAI_EGRESS_CIDRS pins
+    // it. Until the first fetch lands, and whenever one fails, the set keeps
+    // what it has: the built-in copy, then the last good fetch.
+    const openaiEgress = new CidrSet(config.openaiEgressCidrs);
+    if (config.demoApiKey && !config.openaiEgressFromEnv) startOpenaiEgressRefresh(openaiEgress, { log: logJson });
+
+    const server = createHttpServer({ ...config, openaiEgress });
 
     let closing = false;
     const shutdown = (signal: NodeJS.Signals) => {
@@ -629,7 +703,9 @@ async function main(): Promise<void> {
         openai_apps_challenge: config.openaiAppsChallenge !== undefined,
         anon_calls_per_hour: config.anonCallsPerHour,
         claude_calls_per_hour: config.claudeCallsPerHour,
+        anon_network_calls_per_hour: config.anonNetworkCallsPerHour,
         openai_egress_cidrs: config.openaiEgressCidrs.length,
+        openai_egress_source: config.openaiEgressFromEnv ? "env" : config.demoApiKey ? "live" : "built-in",
     });
 }
 

@@ -326,6 +326,8 @@
     "rows_per_render": 25,
     "documents_per_month": 50,
     "claude_pool_per_month": 1000,
+    "web_pool_per_month": 2000,
+    "unverified_pool_per_month": 1000,
     "rows_per_handoff": 100,
     "handoffs_per_day": 10,
     "cell_max_chars": 2000,

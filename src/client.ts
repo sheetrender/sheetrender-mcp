@@ -116,6 +116,8 @@ export interface BuiltinTemplateField {
     max_chars?: number;
     /** Longest text value, in UTF-8 bytes after trimming; absent means the catalogue default. */
     max_bytes?: number;
+    /** Most lines a text value may have, after the backend folds line breaks; absent means no limit. */
+    max_lines?: number;
 }
 
 /** One built-in template from the public catalogue. Fields past these are ignored. */
@@ -156,6 +158,12 @@ export interface DocumentVolume {
     used: number;
     limit: number;
     resets_at: string | null;
+    /**
+     * "subject": the caller's own month. "pool": a limit shared with other
+     * users (a channel pool or the rendering account's cap), sent when that
+     * limit refused or cut the call. Absent from older backends: "subject".
+     */
+    scope?: "subject" | "pool";
 }
 
 /**

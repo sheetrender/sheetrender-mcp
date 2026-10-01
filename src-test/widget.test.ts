@@ -259,6 +259,27 @@ describe("widget resource", () => {
         }
     });
 
+    it("says a shared limit is shared and never shows its numbers as the user's", async () => {
+        const h = await view();
+        const pool = { used: 1000, limit: 1000, resets_at: "2026-11-01T00:00:00Z", scope: "pool" };
+        const doc = { row_index: 0, label: "A", preview_png_url: null, pdf_url: null };
+        h.app.ontoolresult({ structuredContent: {
+            template: "letter", documents: [doc], missing_fields: [], expires_at: null, volume: pool,
+            status: "volume_short", message: "1 of the 3 rows were rendered. 2 did not fit in this month's volume, which is shared with other users. The count resets on 2026-11-01.",
+        } });
+        let text = h.root.all().map((node) => node.textContent).join(" ");
+        assert.match(text, /This month's document limit is shared with other users; the count resets on /);
+        assert.doesNotMatch(text, /\d+ of \d+ documents left/);
+        // No backend message: the refusal is worded without the pool's numbers too.
+        h.app.ontoolresult({ structuredContent: {
+            template: "letter", documents: [], missing_fields: [], expires_at: null, volume: pool,
+        } });
+        text = h.root.all().map((node) => node.textContent).join(" ");
+        assert.match(text, /This month's documents are used\. The limit is shared with other users and resets on /);
+        assert.doesNotMatch(text, /1000/);
+        assert.doesNotMatch(text, BANNED_WORDS);
+    });
+
     it("shows a partial-render notice above the documents and retains their PDF links", async () => {
         const h = await view();
         const message = "  1 of the 3 rows was rendered. The remaining rows were not rendered.\n";

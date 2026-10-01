@@ -81,6 +81,11 @@ export const MAX_HANDOFF_BYTES = 256 * 1024;
 export const MAX_ANON_BODY_BYTES = 2 * 1024 * 1024;
 /** Default flood guard: tool calls per subject per hour. */
 export const DEFAULT_CALLS_PER_HOUR = 30;
+/**
+ * Second, coarser bucket for callers counted by IP: calls per IPv4 /24 or
+ * IPv6 /48 per hour, so a block of cheap addresses is one caller here.
+ */
+export const DEFAULT_NETWORK_CALLS_PER_HOUR = 300;
 /** Traffic from Claude's network shares one larger, isolated flood bucket. */
 export const DEFAULT_CLAUDE_CALLS_PER_HOUR = 3000;
 const HOUR_MS = 60 * 60 * 1000;
@@ -114,8 +119,12 @@ function sha256(value: string): string {
 }
 
 /**
- * Anthropic's published outbound range for MCP tool calls, IPv4 only:
- * https://platform.claude.com/docs/en/api/ip-addresses
+ * Anthropic's published outbound range for MCP tool calls, checked on
+ * 2026-10-01 at https://platform.claude.com/docs/en/api/ip-addresses. The
+ * outbound list is IPv4 only; the IPv6 range on that page (2607:6bc0::/48) is
+ * inbound, and the 34.162.x.x addresses it lists are phased out. The page also
+ * says the MCP connector of the Claude API leaves from this range, so any API
+ * key holder reaches this server from it too.
  */
 export const CLAUDE_EGRESS_CIDRS: readonly string[] = ["160.79.104.0/21"];
 
@@ -236,6 +245,18 @@ export function clientNetwork(address: string): string {
     return `${hex.slice(0, start).join(":")}::${hex.slice(start + length).join(":")}/64`;
 }
 
+/**
+ * The coarser network an address is flood-guarded by: an IPv4 /24 or an IPv6
+ * /48 (one tunnel-broker allocation), with mapped IPv4 unwrapped first.
+ */
+export function floodNetwork(address: string): string {
+    const plain = unmapV4(address);
+    const family = isIP(plain);
+    if (family === 4) return `${plain.split(".").slice(0, 3).join(".")}.0/24`;
+    if (family === 6) return `${ipv6Words(plain).slice(0, 3).map((word) => word.toString(16)).join(":")}::/48`;
+    return plain || "unknown";
+}
+
 /** A CIDR as `address/prefix`, validated; throws on anything else. */
 export function parseCidr(cidr: string): { address: string; prefix: number; family: "ipv4" | "ipv6" } {
     const match = /^([^/\s]+)\/(\d{1,3})$/.exec(cidr.trim());
@@ -247,15 +268,38 @@ export function parseCidr(cidr: string): { address: string; prefix: number; fami
     return { address: match[1]!, prefix, family: family === 4 ? "ipv4" : "ipv6" };
 }
 
-/** A set of IPv4 and IPv6 ranges; an IPv4-mapped IPv6 address matches as IPv4. */
+/**
+ * A set of IPv4 and IPv6 ranges; an IPv4-mapped IPv6 address matches as IPv4.
+ * `replace` swaps the whole set at once (the live OpenAI list), after every
+ * range in the new one has parsed.
+ */
 export class CidrSet {
-    readonly #list = new BlockList();
+    #list: BlockList;
+    #size: number;
 
     constructor(cidrs: readonly string[]) {
+        this.#list = CidrSet.#build(cidrs);
+        this.#size = cidrs.length;
+    }
+
+    static #build(cidrs: readonly string[]): BlockList {
+        const list = new BlockList();
         for (const cidr of cidrs) {
             const { address, prefix, family } = parseCidr(cidr);
-            this.#list.addSubnet(address, prefix, family);
+            list.addSubnet(address, prefix, family);
         }
+        return list;
+    }
+
+    /** Replaces every range; throws, leaving the set unchanged, if one does not parse. */
+    replace(cidrs: readonly string[]): void {
+        this.#list = CidrSet.#build(cidrs);
+        this.#size = cidrs.length;
+    }
+
+    /** How many ranges the set was built from. */
+    get size(): number {
+        return this.#size;
     }
 
     has(address: string): boolean {
@@ -358,6 +402,15 @@ export class SlidingWindowLimiter {
         this.#maxKeys = maxKeys;
     }
 
+    /** The decision `take` would make, without counting a call. */
+    check(key: string): LimitDecision {
+        const now = this.#now();
+        const hits = (this.#hits.get(key) ?? []).filter((at) => at > now - this.#windowMs);
+        return hits.length >= this.#limit
+            ? { allowed: false, retryAfterMs: Math.max(0, hits[0]! + this.#windowMs - now) }
+            : { allowed: true, retryAfterMs: 0 };
+    }
+
     take(key: string): LimitDecision {
         const now = this.#now();
         const since = now - this.#windowMs;
@@ -403,6 +456,8 @@ export interface CatalogueField {
     max_chars: number;
     /** Longest text value, in UTF-8 bytes, after trimming. */
     max_bytes: number;
+    /** Most lines, after line breaks are folded as the backend folds them; absent: no limit. */
+    max_lines?: number;
 }
 
 export interface CatalogueTemplate {
@@ -441,6 +496,19 @@ function catalogueText(value: unknown, fallback = ""): string {
 }
 
 /**
+ * The catalogue's prose: what a directory reviewer reads as our copy. Example
+ * values are sample data (a person's name, a sentence of a letter) and are
+ * left out, so an example such as "Jane Freeman" cannot fail the check.
+ */
+function catalogueProse(templates: CatalogueTemplate[]): string[] {
+    return templates.flatMap((template) => [
+        template.name,
+        template.description,
+        ...template.fields.flatMap((field) => [field.label, field.description]),
+    ]);
+}
+
+/**
  * The backend catalogue, reduced to the four keys render_documents accepts,
  * in a fixed order, with the guide link built from the API's origin so
  * staging links point at staging.
@@ -471,12 +539,13 @@ export function normaliseCatalogue(raw: BuiltinTemplate[], apiUrl: string): Cata
                     description: catalogueText(field.description),
                     max_chars: capOf(field.max_chars, MAX_CELL_CHARS),
                     max_bytes: capOf(field.max_bytes, MAX_CELL_BYTES),
+                    ...(capOf(field.max_lines, 0) > 0 ? { max_lines: capOf(field.max_lines, 0) } : {}),
                 })),
         });
     }
     // Catalogue prose is authored by the backend, unlike the user's row data.
     // Reject a policy regression before it reaches either the model or view.
-    if (BANNED_WORDS.test(JSON.stringify(templates))) {
+    if (catalogueProse(templates).some((text) => BANNED_WORDS.test(text))) {
         throw new SheetRenderError("Listing document templates failed: the catalogue could not be used.");
     }
     return templates;
@@ -558,6 +627,7 @@ const fieldOutput = z.object({
     description: z.string(),
     max_chars: z.number(),
     max_bytes: z.number(),
+    max_lines: z.number().optional(),
 });
 
 const listOutputShape = {
@@ -576,6 +646,7 @@ const volumeOutput = z.object({
     used: z.number(),
     limit: z.number(),
     resets_at: z.string().nullable(),
+    scope: z.enum(["subject", "pool"]).optional(),
 });
 
 const renderOutputShape = {
@@ -659,10 +730,28 @@ export function pythonLength(text: string): number {
     return count;
 }
 
+/** The backend's _LINE_BREAK_RE: every line break a browser honours. */
+const LINE_BREAK = /\r\n?|[\v\f\x85\u2028\u2029]/g;
+/** The backend's _BLANK_RUN_RE: three or more breaks, blank or space-only lines between. */
+const BLANK_RUN = /\n(?:[ \t]*\n){2,}/g;
+
+/**
+ * Lines in a stripped text value as the backend counts them for `max_lines`:
+ * every line break folded to "\n", runs of blank lines folded to one, then
+ * one more than the number of breaks.
+ */
+export function pythonLineCount(text: string): number {
+    const folded = text.replace(LINE_BREAK, "\n").replace(BLANK_RUN, "\n\n");
+    let breaks = 0;
+    for (let at = folded.indexOf("\n"); at !== -1; at = folded.indexOf("\n", at + 1)) breaks++;
+    return breaks + 1;
+}
+
 /**
  * The first field value over its cap, as a message for the model, or
  * undefined. Mirrors the backend's _clean_value: only the value it picks per
- * field is checked, after Python's strip(), in code points and UTF-8 bytes.
+ * field is checked, after Python's strip(), in code points and UTF-8 bytes,
+ * then in lines for a field with `max_lines`.
  */
 export function checkRows(template: CatalogueTemplate, rows: Record<string, Cell>[]): string | undefined {
     for (const [index, row] of rows.entries()) {
@@ -678,6 +767,12 @@ export function checkRows(template: CatalogueTemplate, rows: Record<string, Cell
                     .replace("{chars}", String(field.max_chars))
                     .replace("{bytes}", String(field.max_bytes));
             }
+            if (field.max_lines !== undefined && pythonLineCount(text) > field.max_lines) {
+                return ANON_TEXT.cellTooManyLines
+                    .replace("{row}", String(index + 1))
+                    .replace("{field}", () => key.slice(0, 100))
+                    .replace("{lines}", String(field.max_lines));
+            }
         }
     }
     return undefined;
@@ -691,9 +786,29 @@ function errorResult(text: string): CallToolResult {
     return { content: [{ type: "text", text }], isError: true };
 }
 
+/** Longest backend 422 message passed through to the model. */
+export const MAX_DETAIL_CHARS = 300;
+
 /**
- * Backend failures use local wording only. Upstream bodies and network causes
- * can contain credentials, row values or account copy, even on a 400/422.
+ * A backend 422 `detail` the model may read, or undefined. Only a plain
+ * string qualifies: the anonymous routes' own refusals (AnonRenderError and
+ * HandoffError in the backend) name a row number, a template field key and
+ * the rule, never a value. FastAPI's validation errors are a list, which can
+ * name the caller's column keys, and are never passed on. Neither is a string
+ * that looks like markup or a credential, should the backend ever reflect
+ * one. Control characters are dropped and the text is cut to MAX_DETAIL_CHARS.
+ */
+function rowRefusal(detail: unknown): string | undefined {
+    if (typeof detail !== "string") return undefined;
+    const text = detail.replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ").replace(/ {2,}/g, " ").trim();
+    if (!text || /[<>]|\bsr_|bearer|authori[sz]ation|api[ _-]?key|token|secret/i.test(text)) return undefined;
+    return text.length > MAX_DETAIL_CHARS ? `${text.slice(0, MAX_DETAIL_CHARS - 1)}…` : text;
+}
+
+/**
+ * Backend failures use local wording, except a 422's own refusal text (see
+ * rowRefusal). Upstream bodies and network causes can contain credentials, row
+ * values or account copy.
  */
 export function anonToolError(error: unknown, what: string): CallToolResult {
     if (error instanceof SheetRenderError) {
@@ -703,6 +818,8 @@ export function anonToolError(error: unknown, what: string): CallToolResult {
         if (error.status === 429 || accountCapacity) {
             return errorResult(what === "Creating the continue link" ? ANON_TEXT.continueBusy : ANON_TEXT.busy);
         }
+        const refusal = error.status === 422 ? rowRefusal(detail) : undefined;
+        if (refusal) return errorResult(`${what} failed: ${refusal}`);
         if (error.status === 400 || error.status === 422) {
             return errorResult(`${what} failed: the rows were not accepted. Check them against the template's fields.`);
         }
@@ -744,7 +861,12 @@ function safeContinueUrl(raw: unknown, apiOrigin: string, key: TemplateKey): str
 function readVolume(result: BuiltinRenderResult): DocumentVolume | null {
     const raw = result.volume ?? result.monthly_volume ?? result.daily_volume;
     if (!raw || typeof raw.used !== "number" || typeof raw.limit !== "number") return null;
-    return { used: raw.used, limit: raw.limit, resets_at: typeof raw.resets_at === "string" ? raw.resets_at : null };
+    return {
+        used: raw.used,
+        limit: raw.limit,
+        resets_at: typeof raw.resets_at === "string" ? raw.resets_at : null,
+        ...(raw.scope === "pool" || raw.scope === "subject" ? { scope: raw.scope } : {}),
+    };
 }
 
 function isoDate(value: string | null): string | undefined {
@@ -799,10 +921,15 @@ export function buildRenderResult(
     }
 
     const resets = isoDate(volume?.resets_at ?? null);
+    // A shared limit's numbers are not the user's: never "X of 1000 left".
+    const shared = volume?.scope === "pool";
     if (documents.length === 0 && volume && volume.used >= volume.limit) {
         return structuredResult(
-            `No documents were rendered: this month's ${volume.limit} documents are used.` +
-                (resets ? ` The count resets on ${resets}.` : ""),
+            shared
+                ? "No documents were rendered: this month's documents are used. The limit is shared " +
+                    `with other users${resets ? ` and resets on ${resets}` : ""}.`
+                : `No documents were rendered: this month's ${volume.limit} documents are used.` +
+                    (resets ? ` The count resets on ${resets}.` : ""),
             structured,
         );
     }
@@ -820,7 +947,9 @@ export function buildRenderResult(
     }
     if (volume) {
         lines.push(
-            `${Math.max(0, volume.limit - volume.used)} of ${volume.limit} documents left this month` +
+            (shared
+                ? ANON_TEXT.sharedVolume
+                : `${Math.max(0, volume.limit - volume.used)} of ${volume.limit} documents left this month`) +
                 (resets ? `; the count resets on ${resets}.` : "."),
         );
     }
@@ -830,7 +959,6 @@ export function buildRenderResult(
             lines.push(`- Row ${doc.row_index + 1}${doc.label ? `, ${doc.label}` : ""}: ${doc.pdf_url ?? "(no link)"}`);
         }
     }
-    lines.push(ANON_TEXT.continueHow);
     return { ...structuredResult(lines.join("\n"), structured), ...(message !== undefined ? { isError: false } : {}) };
 }
 
@@ -845,6 +973,11 @@ export interface AnonServerOptions {
     limiter: SlidingWindowLimiter;
     /** Separate shared bucket for all requests from Claude's network. */
     claudeLimiter?: SlidingWindowLimiter;
+    /**
+     * Coarser bucket for callers counted by IP (`ip:` subjects outside
+     * Claude's network), keyed by IPv4 /24 or IPv6 /48.
+     */
+    networkLimiter?: SlidingWindowLimiter;
     /** Shared across requests: the catalogue cache. */
     catalogue: CatalogueCache;
     /** The caller's IP, the limiter key when there is no subject. */
@@ -874,6 +1007,18 @@ function userAgentOf(extra: RequestExtra): string | undefined {
     return Array.isArray(value) ? value[0] : value;
 }
 
+/**
+ * Which host is reading the view resource, by network address alone.
+ * `resources/read` carries no `openai/subject` (OpenAI's Apps SDK reference
+ * lists it for tool calls only), so the tool calls' rule would never see
+ * ChatGPT here and ChatGPT would never get `ui.domain`. Only the format of
+ * `ui.domain` depends on this; a wrong guess changes no identity or count.
+ */
+export function resourceHost(clientIp: string, openaiEgress: CidrSet = DEFAULT_OPENAI_EGRESS): Source {
+    if (isClaudeIp(clientIp)) return "claude";
+    return openaiEgress.has(clientIp) ? "chatgpt" : "other";
+}
+
 /** The handoff page parameter that records where a signup came from. */
 function refFor(source: Source): string {
     return source === "other" ? "mcp" : source;
@@ -883,7 +1028,7 @@ function refFor(source: Source): string {
  * Builds the anonymous MCP server for one HTTP request.
  */
 export function createAnonServer(options: AnonServerOptions): McpServer {
-    const { client, limiter, claudeLimiter, catalogue, clientIp, publicUrl, sessionId } = options;
+    const { client, limiter, claudeLimiter, networkLimiter, catalogue, clientIp, publicUrl, sessionId } = options;
     const openaiEgress = options.openaiEgress ?? DEFAULT_OPENAI_EGRESS;
     const claudeCaller = isClaudeIp(clientIp);
     const apiUrl = client.baseUrl;
@@ -905,6 +1050,16 @@ export function createAnonServer(options: AnonServerOptions): McpServer {
         return result;
     }
 
+    /** anonToolError, with the same check against a reflected credential. */
+    function failure(error: unknown, what: string): CallToolResult {
+        const result = anonToolError(error, what);
+        const secret = options.demoApiKey;
+        const body = JSON.stringify(result);
+        return secret && (body.includes(secret) || body.includes(encodeURIComponent(secret)))
+            ? errorResult(`${what} failed on the SheetRender side. Try again shortly.`)
+            : result;
+    }
+
     /**
      * The text-length message for rows over their field's cap. With the
      * catalogue unavailable it is skipped and the backend, which enforces the
@@ -919,17 +1074,34 @@ export function createAnonServer(options: AnonServerOptions): McpServer {
         }
     }
 
-    /** The flood guard, or the result to return when the caller is over it. */
+    /**
+     * The flood guard, or the result to return when the caller is over it.
+     * Every bucket that applies must have room; a call is then counted in
+     * all of them, and a refused call in none.
+     *
+     *   Claude's network: one shared bucket for all of it, plus the
+     *     per-subject bucket for a caller with a session (`mcps:`). Without a
+     *     session, Claude callers share addresses, so the shared bucket alone.
+     *   Everyone else: the per-subject bucket, plus, for a caller counted by
+     *     IP (`ip:`), the per-network bucket (IPv4 /24, IPv6 /48).
+     */
     function guard(extra: RequestExtra): CallToolResult | undefined {
-        // Claude's network never carries a trusted subject, so all of it shares one bucket.
+        const subject = subjectKey(extra._meta, clientIp, sessionId, openaiEgress);
         const shared = claudeCaller && claudeLimiter !== undefined;
-        const decision = shared
-            ? claudeLimiter.take("claude:160.79.104.0/21")
-            : limiter.take(subjectKey(extra._meta, clientIp, undefined, openaiEgress));
-        if (decision.allowed) return undefined;
-        const minutes = Math.max(1, Math.ceil(decision.retryAfterMs / 60_000));
-        const message = shared ? ANON_TEXT.tooManySharedCalls : ANON_TEXT.tooManyCalls;
-        return errorResult(message.replace("{minutes}", String(minutes)));
+        const buckets: Array<[SlidingWindowLimiter, string, string]> = [];
+        if (shared) buckets.push([claudeLimiter, "claude:160.79.104.0/21", ANON_TEXT.tooManySharedCalls]);
+        if (!shared || subject.startsWith("mcps:")) buckets.push([limiter, subject, ANON_TEXT.tooManyCalls]);
+        if (!claudeCaller && networkLimiter && subject.startsWith("ip:")) {
+            buckets.push([networkLimiter, `net:${sha256(floodNetwork(clientIp))}`, ANON_TEXT.tooManyNetworkCalls]);
+        }
+        for (const [bucket, key, message] of buckets) {
+            const decision = bucket.check(key);
+            if (decision.allowed) continue;
+            const minutes = Math.max(1, Math.ceil(decision.retryAfterMs / 60_000));
+            return errorResult(message.replace("{minutes}", String(minutes)));
+        }
+        for (const [bucket, key] of buckets) bucket.take(key);
+        return undefined;
     }
 
     server.registerTool(
@@ -956,6 +1128,7 @@ export function createAnonServer(options: AnonServerOptions): McpServer {
                         const notes = [
                             ...(field.required ? ["required"] : []),
                             ...(field.max_chars !== MAX_CELL_CHARS ? [`up to ${field.max_chars} characters`] : []),
+                            ...(field.max_lines !== undefined ? [`up to ${field.max_lines} lines`] : []),
                         ];
                         return `  - ${field.key}${notes.length ? ` (${notes.join(", ")})` : ""}` +
                             (field.description ? `: ${field.description}` : "");
@@ -972,7 +1145,7 @@ export function createAnonServer(options: AnonServerOptions): McpServer {
                     { templates },
                 ));
             } catch (error) {
-                return anonToolError(error, "Listing document templates");
+                return failure(error, "Listing document templates");
             }
         },
     );
@@ -992,9 +1165,16 @@ export function createAnonServer(options: AnonServerOptions): McpServer {
                 title: titleSchema,
             },
             outputSchema: renderOutputShape,
+            // OpenAI's annotation rules (developers.openai.com/apps-sdk/app-submission-guidelines):
+            // not read-only, since it stores the PDFs and previews for an hour
+            // and counts against the month's volume; not destructive, since it
+            // only adds files and deletes or overwrites nothing; not idempotent,
+            // since a repeat makes new files and counts again; closed world,
+            // since it fills four built-in templates into SheetRender's own
+            // storage and reaches no arbitrary destination.
             annotations: {
                 title: ANON_TEXT.renderTitle,
-                readOnlyHint: true,
+                readOnlyHint: false,
                 destructiveHint: false,
                 idempotentHint: false,
                 openWorldHint: false,
@@ -1025,7 +1205,7 @@ export function createAnonServer(options: AnonServerOptions): McpServer {
                 });
                 return safeResult(buildRenderResult(template, rows.length, result, apiUrl));
             } catch (error) {
-                return anonToolError(error, "Rendering documents");
+                return failure(error, "Rendering documents");
             }
         },
     );
@@ -1100,7 +1280,7 @@ export function createAnonServer(options: AnonServerOptions): McpServer {
                     { continue_url: url, expires_at: expiresAt, rows_saved: rowsSaved },
                 ));
             } catch (error) {
-                return anonToolError(error, "Creating the continue link");
+                return failure(error, "Creating the continue link");
             }
         },
     );
@@ -1114,8 +1294,8 @@ export function createAnonServer(options: AnonServerOptions): McpServer {
             mimeType: RESOURCE_MIME_TYPE,
             _meta: widgetResourceMeta({ apiOrigin, publicUrl, host: "other" }),
         },
-        async (uri, extra) => {
-            const host = callerSource(extra._meta as Meta, userAgentOf(extra as RequestExtra), clientIp, openaiEgress);
+        async (uri) => {
+            const host = resourceHost(clientIp, openaiEgress);
             return {
                 contents: [{
                     uri: uri.href,

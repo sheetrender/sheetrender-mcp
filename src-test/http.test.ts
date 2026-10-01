@@ -9,8 +9,18 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { ClientRequestSchema, JSONRPCRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 
-import { MAX_ANON_BODY_BYTES, OPENAI_EGRESS_CIDRS } from "../src/anon.js";
-import { bearerToken, clientIp, createHttpServer, keyFingerprint, loadHttpConfig, newSessionId, type LogEntry } from "../src/http.js";
+import { CidrSet, MAX_ANON_BODY_BYTES, OPENAI_EGRESS_CIDRS } from "../src/anon.js";
+import { ANON_TEXT } from "../src/anon-descriptions.js";
+import {
+    bearerToken,
+    clientIp,
+    createHttpServer,
+    keyFingerprint,
+    loadHttpConfig,
+    newSessionId,
+    UntrustedSubjectTally,
+    type LogEntry,
+} from "../src/http.js";
 
 const closers: Array<() => Promise<void>> = [];
 
@@ -788,6 +798,66 @@ describe("anonymous mode", () => {
         assert.equal(JSON.stringify(logs).includes("fresh-1"), false);
     });
 
+    it("caps IP-counted callers per /24 over HTTP, and not callers with a trusted subject", async () => {
+        const backend = await fakeBuiltinBackend();
+        const { url } = await startAnon(backend.url, { anonNetworkCallsPerHour: 2 });
+        const call = (ip: string, meta?: Record<string, unknown>) => rawRpc(url, {
+            jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+                name: "render_documents", arguments: { template: "letter", rows: [{ body: "x" }] }, _meta: meta,
+            },
+        }, { "X-Forwarded-For": ip });
+        type Result = { result: { isError?: boolean; content: { text: string }[] } };
+        assert.equal(((await call("198.51.100.1")).json as Result).result.isError, undefined);
+        assert.equal(((await call("198.51.100.2")).json as Result).result.isError, undefined);
+        const refused = ((await call("198.51.100.3")).json as Result).result;
+        assert.equal(refused.isError, true);
+        assert.equal(refused.content[0]!.text, ANON_TEXT.tooManyNetworkCalls.replace("{minutes}", "60"));
+        assert.equal(((await call("198.51.101.3")).json as Result).result.isError, undefined);
+        for (const subject of ["a", "b", "c"]) {
+            const result = ((await call("203.0.113.5", { "openai/subject": subject })).json as Result).result;
+            assert.equal(result.isError, undefined, subject);
+        }
+    });
+
+    it("uses a live OpenAI set when one is passed in", async () => {
+        const backend = await fakeBuiltinBackend();
+        const openaiEgress = new CidrSet(["192.0.2.0/24"]);
+        const { url } = await startAnon(backend.url, { openaiEgress });
+        const call = () => rawRpc(url, {
+            jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+                name: "render_documents", arguments: { template: "letter", rows: [{ body: "x" }] },
+                _meta: { "openai/subject": "user-1" },
+            },
+        }, { "X-Forwarded-For": "198.51.100.40" });
+        await call();
+        openaiEgress.replace(["198.51.100.0/24"]);
+        await call();
+        const renders = backend.calls.filter((c) => c.path.endsWith("/render"));
+        assert.deepEqual(renders.map((c) => (c.body as { source: string }).source), ["other", "chatgpt"]);
+    });
+
+    it("logs a summary of ignored openai/subject calls at most once an hour", async () => {
+        const backend = await fakeBuiltinBackend();
+        let now = 1_000_000;
+        const { url, logs } = await startAnon(backend.url, { now: () => now });
+        const call = () => rawRpc(url, {
+            jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+                name: "render_documents", arguments: { template: "letter", rows: [{ body: "x" }] },
+                _meta: { "openai/subject": "someone" },
+            },
+        }, { "X-Forwarded-For": "198.51.100.77" });
+        const summaries = () => logs.filter((entry) => entry.msg === "openai/subject from outside the OpenAI ranges");
+        await call();
+        await call();
+        await call();
+        assert.deepEqual(summaries().map((entry) => entry.count), [1]);
+        now += 60 * 60 * 1000;
+        await call();
+        assert.deepEqual(summaries().map((entry) => entry.count), [1, 3]);
+        assert.equal(summaries()[0]!.level, "warn");
+        assert.equal(JSON.stringify(logs).includes("someone"), false);
+    });
+
     it("logs source other when configured OpenAI ranges do not trust a published OpenAI IP", async () => {
         const backend = await fakeBuiltinBackend();
         const { url, logs } = await startAnon(backend.url, { openaiEgressCidrs: [] });
@@ -905,9 +975,12 @@ describe("loadHttpConfig", () => {
         assert.equal(config.openaiAppsChallenge, "tok");
         assert.equal(config.anonCallsPerHour, 30);
         assert.equal(config.claudeCallsPerHour, 3000);
+        assert.equal(config.anonNetworkCallsPerHour, 300);
         assert.equal(loadHttpConfig({ CLAUDE_CALLS_PER_HOUR: "6000" }).claudeCallsPerHour, 6000);
+        assert.equal(loadHttpConfig({ ANON_NETWORK_CALLS_PER_HOUR: "120" }).anonNetworkCallsPerHour, 120);
         for (const value of ["0", "-1", "1.5", "not a number"]) {
             assert.throws(() => loadHttpConfig({ CLAUDE_CALLS_PER_HOUR: value }), /CLAUDE_CALLS_PER_HOUR/);
+            assert.throws(() => loadHttpConfig({ ANON_NETWORK_CALLS_PER_HOUR: value }), /ANON_NETWORK_CALLS_PER_HOUR/);
         }
         const off = loadHttpConfig({} as NodeJS.ProcessEnv);
         assert.equal(off.demoApiKey, undefined);
@@ -923,8 +996,35 @@ describe("loadHttpConfig", () => {
             ["192.0.2.0/24", "198.51.100.7/32", "2001:db8::/32"],
         );
         assert.deepEqual(loadHttpConfig({ OPENAI_EGRESS_CIDRS: "none" }).openaiEgressCidrs, []);
+        // Set at all (even to none), the env list wins and the live refresh stays off.
+        assert.equal(loadHttpConfig({}).openaiEgressFromEnv, false);
+        assert.equal(loadHttpConfig({ OPENAI_EGRESS_CIDRS: "  " }).openaiEgressFromEnv, false);
+        assert.equal(loadHttpConfig({ OPENAI_EGRESS_CIDRS: "none" }).openaiEgressFromEnv, true);
+        assert.equal(loadHttpConfig({ OPENAI_EGRESS_CIDRS: "192.0.2.0/24" }).openaiEgressFromEnv, true);
         for (const value of ["192.0.2.1", "192.0.2.0/24, nope/8", "10.0.0.0/33"]) {
             assert.throws(() => loadHttpConfig({ OPENAI_EGRESS_CIDRS: value }), /OPENAI_EGRESS_CIDRS/, value);
         }
+    });
+});
+
+describe("UntrustedSubjectTally", () => {
+    it("logs the first one at once, then a count at most hourly, and nothing for a quiet hour", () => {
+        const logs: LogEntry[] = [];
+        let now = 0;
+        const tally = new UntrustedSubjectTally((entry) => logs.push(entry), () => now);
+        tally.flush();
+        assert.equal(logs.length, 0);
+        tally.note();
+        tally.note();
+        assert.deepEqual(logs.map((entry) => entry.count), [1]);
+        now += 30 * 60 * 1000;
+        tally.flush();
+        assert.equal(logs.length, 1);
+        now += 30 * 60 * 1000;
+        tally.flush();
+        assert.deepEqual(logs.map((entry) => entry.count), [1, 1]);
+        now += 2 * 60 * 60 * 1000;
+        tally.flush();
+        assert.equal(logs.length, 2);
     });
 });

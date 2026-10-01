@@ -10,8 +10,13 @@
  * over every string in this file, the widget and the tools' output.
  */
 
-/** The directory-policy word check, as the listing's release step runs it. */
-export const BANNED_WORDS = /free|pricing|price|plan|trial|upgrade|subscri|discount/i;
+/**
+ * The directory-policy word check, as the listing's release step runs it.
+ * Whole words only, so a name such as "Freeman" or a word such as
+ * "explanation" or "planned" passes; "free-form" still matches.
+ */
+export const BANNED_WORDS =
+    /\b(?:free|freely|pric(?:e|es|ed|ing)|plans?|trials?|upgrad(?:e|es|ed|ing)|subscri\w*|discounts?)\b/i;
 
 /** The four built-in templates, in catalogue order. */
 export const TEMPLATE_KEYS = ["certificate", "letter", "donation_receipt", "job_offer_letter"] as const;
@@ -70,7 +75,8 @@ export const ANON_TEXT = {
         "characters unless list_document_templates gives a different limit for that field. " +
         "Renders up to 25 rows per call and up to " +
         "50 documents per month for each user; the response says how many documents remain " +
-        "this month and when the count resets. Rows missing a required field are reported in " +
+        "this month (or that the month's limit is shared with other users) and when the count " +
+        "resets. Rows missing a required field are reported in " +
         "missing_fields. Preview and PDF links expire after one hour. This tool only fills the " +
         "built-in templates; it does not accept HTML or custom designs.",
 
@@ -85,10 +91,11 @@ export const ANON_TEXT = {
         "loaded into a project or for 7 days, whichever comes first, and the link expires " +
         "after 7 days.",
 
-    /** The `continue.how` sentence in render_documents output. */
-    continueHow:
-        "On the template page the same rows can be kept as a project, connected to a Google " +
-        "Sheet, rendered on a schedule, and delivered as a zip, merged PDF or email.",
+    /**
+     * The `continue.how` field in render_documents' structured output. Plain
+     * fact only: the model text carries no sentence about the website.
+     */
+    continueHow: "create_continue_link loads these rows on the template page at guide_url.",
 
     /** Describes a text cell in the tools' input schema. */
     cellText:
@@ -98,6 +105,9 @@ export const ANON_TEXT = {
     cellTooLong:
         "Row {row}, field {field}: the text is longer than the limit of {chars} characters " +
         "or {bytes} UTF-8 bytes. Shorten it and try again.",
+    /** A text value with more lines than its field allows. `{row}` counts from 1. */
+    cellTooManyLines:
+        "Row {row}, field {field}: the text has more than {lines} lines. Shorten it and try again.",
 
     invoking: "Rendering documents",
     invoked: "Documents ready",
@@ -109,6 +119,11 @@ export const ANON_TEXT = {
         "Too many requests from this user in the last hour. Try again in {minutes} minutes.",
     tooManySharedCalls:
         "The document service is receiving too many requests. Try again in {minutes} minutes.",
+    /** The coarser per-network flood guard (IPv4 /24, IPv6 /48). */
+    tooManyNetworkCalls:
+        "Too many requests from this network in the last hour. Try again in {minutes} minutes.",
+    /** The volume line when the month's limit that applies is shared with other users. */
+    sharedVolume: "This month's document limit is shared with other users",
     /** The backend refused for capacity reasons (HTTP 429 without a volume body). */
     busy: "SheetRender cannot render more documents right now. Try again later.",
     /** The same for create_continue_link. */

@@ -4,7 +4,8 @@
  * imported by the server.
  *
  * It shows the PNG previews with a PDF link each, the rows that missed a
- * required field, the documents left this month, and one secondary button that
+ * required field, the documents left this month (or that the month's limit is
+ * shared with other users), and one secondary button that
  * calls create_continue_link with the rows from the tool input and opens the
  * returned link. Every string is set with textContent, never as HTML, and
  * images and links are only used when they point at the API origin the server
@@ -34,7 +35,8 @@ interface RenderOutput {
     documents: DocumentItem[];
     expires_at: string | null;
     missing_fields: { row_index: number; fields: string[] }[];
-    volume: { used: number; limit: number; resets_at: string | null } | null;
+    /** scope "pool": the numbers are a limit shared with other users, not this user's own. */
+    volume: { used: number; limit: number; resets_at: string | null; scope?: "subject" | "pool" } | null;
     /** The server's own notice, with either a refusal or a partial render. */
     message?: string;
 }
@@ -124,12 +126,16 @@ function render(): void {
 
     const volume = output.volume;
     const resets = formatDate(volume?.resets_at);
+    // A shared limit's numbers are not this user's: never "X of 1000 left".
+    const shared = volume?.scope === "pool";
     if (message) {
         root.append(el("p", message, "warn"));
     } else if (documents.length === 0 && volume && volume.used >= volume.limit) {
         root.append(el(
             "p",
-            `This month's ${volume.limit} documents are used.${resets ? ` The count resets on ${resets}.` : ""}`,
+            shared
+                ? `This month's documents are used. The limit is shared with other users${resets ? ` and resets on ${resets}` : ""}.`
+                : `This month's ${volume.limit} documents are used.${resets ? ` The count resets on ${resets}.` : ""}`,
             "warn",
         ));
     }
@@ -191,7 +197,8 @@ function render(): void {
         const left = Math.max(0, volume.limit - volume.used);
         root.append(el(
             "p",
-            `${left} of ${volume.limit} documents left this month${resets ? `; the count resets on ${resets}` : ""}.`,
+            (shared ? "This month's document limit is shared with other users" : `${left} of ${volume.limit} documents left this month`) +
+                `${resets ? `; the count resets on ${resets}` : ""}.`,
             "muted",
         ));
     }

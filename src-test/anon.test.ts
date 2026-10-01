@@ -16,7 +16,9 @@ import {
     clientNetwork,
     createAnonServer,
     detectSource,
+    floodNetwork,
     isClaudeIp,
+    MAX_DETAIL_CHARS,
     MAX_CELL_CHARS,
     MAX_CELL_BYTES,
     MAX_HANDOFF_BYTES,
@@ -25,7 +27,9 @@ import {
     OPENAI_EGRESS_CIDRS,
     parseCidr,
     pythonLength,
+    pythonLineCount,
     pythonStrip,
+    resourceHost,
     SlidingWindowLimiter,
     subjectKey,
     trustedOpenaiSubject,
@@ -110,6 +114,7 @@ interface ConnectOptions {
     client?: SheetRenderClient;
     limiter?: SlidingWindowLimiter;
     claudeLimiter?: SlidingWindowLimiter;
+    networkLimiter?: SlidingWindowLimiter;
     catalogue?: CatalogueCache;
     clientIp?: string;
     openaiEgress?: CidrSet;
@@ -131,6 +136,7 @@ async function connect(options: ConnectOptions = {}): Promise<{ client: Client; 
         client: fake.client,
         limiter: options.limiter ?? new SlidingWindowLimiter(30, 3_600_000),
         claudeLimiter: options.claudeLimiter,
+        networkLimiter: options.networkLimiter,
         catalogue: options.catalogue ?? new CatalogueCache(),
         clientIp: options.clientIp ?? "203.0.113.9",
         openaiEgress: options.openaiEgress ?? TEST_OPENAI_EGRESS,
@@ -184,9 +190,15 @@ describe("anonymous tool list", () => {
         }
         const byName = new Map(tools.map((tool) => [tool.name, tool]));
         assert.equal(byName.get("list_document_templates")!.annotations!.readOnlyHint, true);
-        assert.equal(byName.get("render_documents")!.annotations!.readOnlyHint, true);
+        // render_documents stores files and counts against the month: not read-only.
+        assert.equal(byName.get("render_documents")!.annotations!.readOnlyHint, false);
         assert.equal(byName.get("create_continue_link")!.annotations!.readOnlyHint, false);
-        assert.equal(byName.get("create_continue_link")!.annotations!.destructiveHint, false);
+        for (const tool of tools) {
+            assert.equal(tool.annotations!.destructiveHint, false, tool.name);
+            assert.equal(tool.annotations!.openWorldHint, false, tool.name);
+        }
+        assert.equal(byName.get("render_documents")!.annotations!.idempotentHint, false);
+        assert.equal(byName.get("create_continue_link")!.annotations!.idempotentHint, false);
     });
 
     it("links render_documents to the view and lets the view call create_continue_link", async () => {
@@ -226,8 +238,12 @@ describe("anonymous tool list", () => {
             assert.doesNotMatch(value, BANNED_WORDS, name);
         }
         // The check itself catches what it must.
-        for (const word of ["Free", "pricing", "price", "plan", "trial", "upgrade", "subscription", "discount", "free-form"]) {
+        for (const word of ["Free", "pricing", "price", "plan", "plans", "trial", "upgrade", "subscription", "discount", "free-form"]) {
             assert.match(word, BANNED_WORDS);
+        }
+        // Whole words only: names and ordinary words that contain one pass.
+        for (const word of ["Jane Freeman", "explanation", "planned", "carefree", "planet", "priceless"]) {
+            assert.doesNotMatch(word, BANNED_WORDS);
         }
     });
 });
@@ -321,13 +337,18 @@ describe("list_document_templates", () => {
         assert.equal(fields.at(-1)!.max_bytes, 12288);
     });
 
-    it("mentions the longer character cap only on the letter body in the list text", async () => {
+    it("lists the longer character cap and every line cap in the list text", async () => {
         const { client } = await connect();
         const result = await client.callTool({ name: "list_document_templates", arguments: {} });
         const capped = textOf(result).split("\n").filter((line) => line.includes("up to"));
-        assert.equal(capped.length, 1);
-        assert.match(capped[0]!, /^  - body \(required, up to 5000 characters\):/);
+        assert.equal(capped.length, 3);
+        assert.match(capped[0]!, /^  - body \(required, up to 5000 characters, up to 150 lines\):/);
+        assert.match(capped[1]!, /^  - address \(up to 150 lines\):/);
+        assert.match(capped[2]!, /^  - notes \(up to 150 lines\):/);
         assert.doesNotMatch(textOf(result), /up to 2000 characters/);
+        const templates = (result.structuredContent as { templates: { key: string; fields: { key: string; max_lines?: number }[] }[] }).templates;
+        const lined = templates.flatMap((t) => t.fields.filter((f) => f.max_lines !== undefined).map((f) => `${t.key}.${f.key}=${f.max_lines}`));
+        assert.deepEqual(lined, ["letter.body=150", "donation_receipt.address=150", "donation_receipt.notes=150"]);
     });
 
     it("accepts the catalogue as a bare array or under `templates`, and fills in missing names", () => {
@@ -378,16 +399,32 @@ describe("list_document_templates", () => {
         assert.equal((templates[0]!.fields[0]!.example as string).length, MAX_CELL_CHARS);
     });
 
-    it("rejects backend-authored promotional catalogue strings", async () => {
-        for (const field of ["name", "description", "example", "label"]) {
+    it("rejects backend-authored promotional catalogue prose", async () => {
+        for (const field of ["name", "description", "label", "field description"]) {
             const bad = field === "name" || field === "description"
                 ? { key: "letter", [field]: "Upgrade your plan" }
-                : { key: "letter", fields: [{ key: "body", [field]: "Upgrade your plan" }] };
+                : { key: "letter", fields: [{ key: "body", [field === "label" ? "label" : "description"]: "Upgrade your plan" }] };
             const { client } = await connect({ client: fakeClient({ listBuiltinTemplates: async () => [bad] }).client });
             const result = await client.callTool({ name: "list_document_templates", arguments: {} });
-            assert.equal(result.isError, true);
+            assert.equal(result.isError, true, field);
             assert.doesNotMatch(JSON.stringify(result), BANNED_WORDS);
         }
+    });
+
+    it("never checks example values, and checks prose by whole words", async () => {
+        const catalogue = [{
+            key: "letter",
+            description: "A letter with an explanation of the planned changes.",
+            fields: [
+                { key: "recipient_name", label: "Recipient", example: "Jane Freeman" },
+                { key: "body", description: "The body, printed carefree.", example: "Our free trial ends soon." },
+            ],
+        }] as BuiltinTemplate[];
+        const { client } = await connect({ client: fakeClient({ listBuiltinTemplates: async () => catalogue }).client });
+        const result = await client.callTool({ name: "list_document_templates", arguments: {} });
+        assert.equal(result.isError, undefined, textOf(result));
+        const fields = (result.structuredContent as { templates: { fields: { example: unknown }[] }[] }).templates[0]!.fields;
+        assert.deepEqual(fields.map((field) => field.example), ["Jane Freeman", "Our free trial ends soon."]);
     });
 });
 
@@ -527,7 +564,10 @@ describe("render_documents", () => {
         assert.match(text, /row 3 \(course\)/);
         assert.match(text, /38 of 50 documents left this month; the count resets on 2026-11-01\./);
         assert.match(text, /Row 1, Ada Lovelace: https:\/\/staging\.sheetrender\.test\/api\/previews\/r_1\/0\.pdf/);
-        assert.ok(text.endsWith(ANON_TEXT.continueHow));
+        // No sentence about the website's features: the text ends with the links.
+        assert.ok(text.endsWith("Row 2, Grace Hopper: https://staging.sheetrender.test/api/previews/r_1/1.pdf"));
+        assert.ok(!text.includes(ANON_TEXT.continueHow));
+        assert.doesNotMatch(text, /Google Sheet|schedule|project|zip|email/i);
         assert.doesNotMatch(text, BANNED_WORDS);
         assert.doesNotMatch(text, /daily/i);
     });
@@ -1274,5 +1314,260 @@ describe("caller identity", () => {
             result.structuredContent.continue_url,
             `${API_URL}/templates/donation-receipt?ref=claude#handoff=tok_abc-123&rows=1`,
         );
+    });
+});
+
+describe("coarser flood buckets", () => {
+    const render = (client: Client, meta?: Record<string, unknown>) => client.callTool({
+        name: "render_documents", arguments: { template: "letter", rows: [{ body: "x" }] },
+        ...(meta ? { _meta: meta } : {}),
+    });
+
+    it("groups addresses by IPv4 /24 and IPv6 /48, unwrapping mapped IPv4", () => {
+        assert.equal(floodNetwork("198.51.100.7"), "198.51.100.0/24");
+        assert.equal(floodNetwork("::ffff:198.51.100.200"), "198.51.100.0/24");
+        assert.equal(floodNetwork("::ffff:c633:6407"), "198.51.100.0/24");
+        assert.equal(floodNetwork("2001:db8:1:2::1"), "2001:db8:1::/48");
+        assert.equal(floodNetwork("2001:0DB8:0001:ffff:ffff:ffff:ffff:ffff"), "2001:db8:1::/48");
+        assert.equal(floodNetwork("2001:db8:2::1"), "2001:db8:2::/48");
+        assert.equal(floodNetwork("::1"), "0:0:0::/48");
+        assert.equal(floodNetwork(""), "unknown");
+    });
+
+    it("caps IP-counted callers per network as well as per address", async () => {
+        const limiter = new SlidingWindowLimiter(30, 3_600_000);
+        const networkLimiter = new SlidingWindowLimiter(2, 3_600_000);
+        const a = await connect({ limiter, networkLimiter, clientIp: "198.51.100.1" });
+        const b = await connect({ limiter, networkLimiter, clientIp: "198.51.100.2" });
+        const c = await connect({ limiter, networkLimiter, clientIp: "198.51.100.3" });
+        const elsewhere = await connect({ limiter, networkLimiter, clientIp: "198.51.101.1" });
+        assert.equal((await render(a.client)).isError, undefined);
+        assert.equal((await render(b.client)).isError, undefined);
+        const refused = await render(c.client);
+        assert.equal(refused.isError, true);
+        assert.equal(textOf(refused), ANON_TEXT.tooManyNetworkCalls.replace("{minutes}", "60"));
+        assert.equal(c.calls.renders.length, 0);
+        // A refused call is counted in no bucket, so c's own address bucket is untouched.
+        assert.equal(limiter.size, 2);
+        assert.equal((await render(elsewhere.client)).isError, undefined);
+        // IPv6: two /64s inside one /48 share the network bucket.
+        const v6a = await connect({ limiter, networkLimiter, clientIp: "2001:db8:1:2::1" });
+        const v6b = await connect({ limiter, networkLimiter, clientIp: "2001:db8:1:3::1" });
+        const v6c = await connect({ limiter, networkLimiter, clientIp: "2001:db8:1:4::1" });
+        assert.equal((await render(v6a.client)).isError, undefined);
+        assert.equal((await render(v6b.client)).isError, undefined);
+        assert.equal((await render(v6c.client)).isError, true);
+    });
+
+    it("does not apply the network bucket to trusted ChatGPT subjects or Claude's network", async () => {
+        const limiter = new SlidingWindowLimiter(30, 3_600_000);
+        const networkLimiter = new SlidingWindowLimiter(1, 3_600_000);
+        const claudeLimiter = new SlidingWindowLimiter(100, 3_600_000, Date.now, 1);
+        const chatgpt = await connect({ limiter, networkLimiter, clientIp: "203.0.113.9" });
+        for (const subject of ["u1", "u2", "u3"]) {
+            assert.equal((await render(chatgpt.client, { "openai/subject": subject })).isError, undefined);
+        }
+        const claude = await connect({ limiter, networkLimiter, claudeLimiter, clientIp: "160.79.104.1" });
+        for (let i = 0; i < 3; i++) assert.equal((await render(claude.client)).isError, undefined);
+        assert.equal(networkLimiter.size, 0);
+    });
+
+    it("gives each Claude session its own hourly bucket inside the shared Claude one", async () => {
+        const limiter = new SlidingWindowLimiter(2, 3_600_000);
+        const claudeLimiter = new SlidingWindowLimiter(3, 3_600_000, Date.now, 1);
+        const one = await connect({ limiter, claudeLimiter, clientIp: "160.79.104.1", sessionId: "session-one" });
+        const two = await connect({ limiter, claudeLimiter, clientIp: "160.79.104.2", sessionId: "session-two" });
+        assert.equal((await render(one.client)).isError, undefined);
+        assert.equal((await render(one.client)).isError, undefined);
+        const own = await render(one.client);
+        assert.equal(own.isError, true);
+        assert.equal(textOf(own), ANON_TEXT.tooManyCalls.replace("{minutes}", "60"));
+        // The refusal took nothing from the shared bucket: one more call fits.
+        assert.equal((await render(two.client)).isError, undefined);
+        const shared = await render(two.client);
+        assert.equal(shared.isError, true);
+        assert.equal(textOf(shared), ANON_TEXT.tooManySharedCalls.replace("{minutes}", "60"));
+        assert.equal(limiter.size, 2);
+        assert.ok(one.calls.renders.every(([, input]) => input.subject === `mcps:${sha256("session-one")}`));
+    });
+});
+
+describe("line caps", () => {
+    const letter = () => normaliseCatalogue(CATALOGUE, API_URL).find((t) => t.key === "letter")!;
+    const lines = (count: number, separator = "\n") => Array.from({ length: count }, (_, i) => `line ${i}`).join(separator);
+
+    it("counts lines as the backend folds them", () => {
+        assert.equal(pythonLineCount(""), 1);
+        assert.equal(pythonLineCount("a"), 1);
+        assert.equal(pythonLineCount("a\nb"), 2);
+        assert.equal(pythonLineCount("a\r\nb\rc"), 3);
+        assert.equal(pythonLineCount("a b c\x85d\ve\ff"), 6);
+        // Runs of blank or space-only lines fold to one blank line.
+        assert.equal(pythonLineCount("a\n\n\n\nb"), 3);
+        assert.equal(pythonLineCount("a\n \t\n\t\n  \nb"), 3);
+        assert.equal(pythonLineCount("a\r\n\r\n\r\nb"), 3);
+        // A line with other text in it is not blank.
+        assert.equal(pythonLineCount("a\n.\n.\nb"), 4);
+    });
+
+    it("refuses a value over its line cap before rendering or continuing, and accepts one at it", async () => {
+        const { client, calls } = await connect();
+        for (const name of ["render_documents", "create_continue_link"]) {
+            const over = await client.callTool({ name, arguments: { template: "letter", rows: [{ recipient_name: "A", body: lines(151) }] } });
+            assert.equal(over.isError, true, name);
+            assert.equal(textOf(over), "Row 1, field body: the text has more than 150 lines. Shorten it and try again.");
+            // At the cap: plain, CRLF, and 75 paragraphs padded with blank
+            // lines (296 raw breaks, 149 lines once folded).
+            for (const body of [lines(150), lines(150, "\r\n"), lines(75, "\n\n\n\n")]) {
+                const result = await client.callTool({ name, arguments: { template: "letter", rows: [{ recipient_name: "A", body }] } });
+                assert.equal(result.isError, undefined, `${name}: ${textOf(result)}`);
+            }
+        }
+        assert.equal(calls.renders.length, 3);
+        assert.equal(calls.handoffs.length, 3);
+    });
+
+    it("folds blank-line padding away before counting, as the backend does", () => {
+        const padded = Array.from({ length: 75 }, (_, i) => `p${i}`).join("\n \n\t\n\n");
+        assert.equal(pythonLineCount(padded), 149);
+        assert.equal(checkRows(letter(), [{ recipient_name: "A", body: padded }]), undefined);
+        assert.match(checkRows(letter(), [{ recipient_name: "A", body: `${padded}\nx\ny` }])!, /more than 150 lines/);
+    });
+
+    it("keeps only positive integer line caps from the catalogue", () => {
+        const templates = normaliseCatalogue([{
+            key: "letter",
+            fields: [{ key: "a", max_lines: 3 }, { key: "b", max_lines: 0 }, { key: "c", max_lines: "3" }, { key: "d" }],
+        }] as unknown as BuiltinTemplate[], API_URL);
+        assert.deepEqual(templates[0]!.fields.map((field) => field.max_lines), [3, undefined, undefined, undefined]);
+        assert.equal("max_lines" in templates[0]!.fields[1]!, false);
+        assert.equal(checkRows(templates[0]!, [{ a: "1\n2\n3" }]), undefined);
+        assert.match(checkRows(templates[0]!, [{ d: "x", a: "1\n2\n3\n4" }])!, /^Row 1, field a: the text has more than 3 lines/);
+    });
+});
+
+describe("backend refusals the model can act on", () => {
+    const refusal = (detail: unknown, what = "Rendering documents") =>
+        textOf(anonToolError(new SheetRenderError(`${what} failed (HTTP 422).`, 422, detail), what) as ToolResult);
+
+    it("passes a 422's own message through", () => {
+        assert.equal(refusal("Row 3, field 'body' has more than 150 lines"),
+            "Rendering documents failed: Row 3, field 'body' has more than 150 lines");
+        assert.equal(refusal("Field 'amount' has a number too large; send it as text", "Creating the continue link"),
+            "Creating the continue link failed: Field 'amount' has a number too large; send it as text");
+        assert.equal(refusal("None of the rows has a value for this template's fields: recipient_name, body"),
+            "Rendering documents failed: None of the rows has a value for this template's fields: recipient_name, body");
+    });
+
+    it("cuts long messages, drops control characters and keeps validation lists generic", () => {
+        const long = refusal(`Row 1, field 'body' ${"x".repeat(1000)}`);
+        assert.equal(long.length, "Rendering documents failed: ".length + MAX_DETAIL_CHARS);
+        assert.ok(long.endsWith("…"));
+        assert.equal(refusal("Row 1,\n\tfield 'body'\u0000 is bad"), "Rendering documents failed: Row 1, field 'body' is bad");
+        const generic = "Rendering documents failed: the rows were not accepted. Check them against the template's fields.";
+        // FastAPI's validation list can name the caller's own column keys.
+        assert.equal(refusal([{ loc: ["body", "rows", 0, "Ada Private"], msg: "bad" }]), generic);
+        assert.equal(refusal(undefined), generic);
+        assert.equal(refusal("   "), generic);
+        assert.equal(refusal("<html>proxy error</html>"), generic);
+        for (const leak of ["Authorization: Bearer x", "key sr_live_abc", "bad api_key", "token expired"]) {
+            assert.equal(refusal(leak), generic, leak);
+        }
+        // Other statuses keep their fixed wording.
+        const bad400 = anonToolError(new SheetRenderError("x", 400, "Invalid Content-Length"), "Rendering documents");
+        assert.equal(textOf(bad400 as ToolResult), generic);
+    });
+
+    it("refuses to pass on a message that reflects the hosted credential", async () => {
+        const { client } = await connect({
+            demoApiKey: "xyzzy-demo-value",
+            client: fakeClient({
+                renderBuiltin: async () => {
+                    throw new SheetRenderError("x", 422, "Row 1, field 'body' xyzzy-demo-value");
+                },
+            }).client,
+        });
+        const result = await client.callTool({ name: "render_documents", arguments: { template: "letter", rows: [{ body: "x" }] } });
+        assert.equal(result.isError, true);
+        assert.doesNotMatch(JSON.stringify(result), /xyzzy-demo-value/);
+        assert.match(textOf(result), /failed on the SheetRender side/);
+    });
+
+    it("passes a 422 through the MCP client from both write tools", async () => {
+        const { client } = await connect({
+            client: fakeClient({
+                renderBuiltin: async () => {
+                    throw new SheetRenderError("x", 422, "Row 2, field 'date' is longer than 2000 characters");
+                },
+                createHandoff: async () => {
+                    throw new SheetRenderError("x", 422, "At most 100 rows can be handed over");
+                },
+            }).client,
+        });
+        const rendered = await client.callTool({ name: "render_documents", arguments: { template: "letter", rows: [{ body: "x" }] } });
+        assert.equal(textOf(rendered), "Rendering documents failed: Row 2, field 'date' is longer than 2000 characters");
+        const linked = await client.callTool({ name: "create_continue_link", arguments: { template: "letter", rows: [{ body: "x" }] } });
+        assert.equal(textOf(linked), "Creating the continue link failed: At most 100 rows can be handed over");
+    });
+});
+
+describe("shared-limit volume", () => {
+    const pool = (used: number, limit: number) => ({ used, limit, resets_at: "2026-11-01T00:00:00Z", scope: "pool" as const });
+
+    it("never shows X of the pool's limit left, and says the limit is shared", () => {
+        const message = "2 of the 3 rows were rendered. 1 did not fit in this month's volume, which is shared with other users. The count resets on 2026-11-01.";
+        const result = buildRenderResult("certificate", 3, { ...RENDERED, status: "volume_short", message, volume: pool(10000, 10000) }, API_URL);
+        const text = textOf(result as ToolResult);
+        assert.ok(text.startsWith(`${message}\n`));
+        assert.match(text, /This month's document limit is shared with other users; the count resets on 2026-11-01\./);
+        assert.doesNotMatch(text, /\d+ of \d+ documents left/);
+        assert.doesNotMatch(text, /10000|1000\b/);
+        assert.deepEqual((result.structuredContent as { volume: unknown }).volume, pool(10000, 10000));
+        assert.equal(result.isError, false);
+    });
+
+    it("words a shared refusal with no backend message without the pool's numbers", () => {
+        const result = buildRenderResult("letter", 3, { documents: [], volume: pool(1000, 1000) }, API_URL);
+        assert.equal(textOf(result as ToolResult),
+            "No documents were rendered: this month's documents are used. The limit is shared with other users and resets on 2026-11-01.");
+    });
+
+    it("passes the backend's shared refusal through verbatim", async () => {
+        const message = "This month's documents are used. The limit is shared with other users and resets on 2026-11-01.";
+        const body: BuiltinRenderResult = { documents: [], status: "volume_used", message, volume: pool(1000, 1000) };
+        const { client } = await connect({ client: fakeClient({ renderBuiltin: async () => body }).client });
+        await client.listTools();
+        const result = await client.callTool({ name: "render_documents", arguments: { template: "letter", rows: [{ body: "x" }] } });
+        assert.ok(!result.isError);
+        assert.equal(textOf(result), message);
+        assert.deepEqual((result.structuredContent as { volume: unknown }).volume, pool(1000, 1000));
+        assert.doesNotMatch(JSON.stringify(result), BANNED_WORDS);
+    });
+
+    it("keeps the per-user line for scope subject and for older backends", () => {
+        for (const volume of [{ used: 12, limit: 50, resets_at: null, scope: "subject" as const }, { used: 12, limit: 50, resets_at: null }]) {
+            const result = buildRenderResult("certificate", 3, { ...RENDERED, volume }, API_URL);
+            assert.match(textOf(result as ToolResult), /38 of 50 documents left this month\./);
+        }
+    });
+});
+
+describe("view resource host", () => {
+    it("decides the host by network address alone, since resources/read carries no subject", async () => {
+        assert.equal(resourceHost("203.0.113.9", TEST_OPENAI_EGRESS), "chatgpt");
+        assert.equal(resourceHost("160.79.104.1", new CidrSet(["160.79.0.0/16"])), "claude");
+        assert.equal(resourceHost("198.51.100.7", TEST_OPENAI_EGRESS), "other");
+        const publicUrl = "https://mcp.sheetrender.test/mcp";
+        for (const [clientIp, domain] of [
+            ["203.0.113.9", "https://mcp.sheetrender.test"],
+            ["160.79.104.1", `${sha256(publicUrl).slice(0, 32)}.claudemcpcontent.com`],
+            ["198.51.100.7", undefined],
+        ] as const) {
+            const { client } = await connect({ clientIp, publicUrl });
+            const read = await client.readResource({ uri: "ui://sheetrender/documents.html" });
+            const meta = (read.contents[0] as unknown as { _meta: { ui: { domain?: string }; "openai/widgetDomain"?: string } })._meta;
+            assert.equal(meta.ui.domain, domain, clientIp);
+            assert.equal(meta["openai/widgetDomain"], "https://mcp.sheetrender.test", clientIp);
+        }
     });
 });

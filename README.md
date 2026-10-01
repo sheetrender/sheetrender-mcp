@@ -81,11 +81,16 @@ instead of a 401. These tools fill SheetRender's built-in templates
 rows in the chat, through a dedicated rendering account:
 
 - `list_document_templates`: the templates, their fields (key, label,
-  required, example) and each one's page on the website.
+  required, example, character and line limits) and each one's page on the
+  website.
 - `render_documents`: up to 25 rows per call, one PDF per row; returns a PNG
   preview and a PDF link per document (both expire after an hour), the rows
   that missed a required field, and how many of the month's 50 documents per
-  user remain.
+  user remain. When a limit shared with other users is what cut or refused the
+  call, it says the limit is shared instead of showing a count. A value over
+  its field's character or line limit is refused before the API is called, and
+  the API's own reason for refusing rows (row number, field and rule, never the
+  value) is passed on.
 - `create_continue_link`: up to 100 rows, stored for 7 days, and a link to the
   template's page on the website with those rows loaded. Called only when the
   user wants to continue there.
@@ -101,12 +106,21 @@ Calls are counted per user: ChatGPT's anonymised `openai/subject`, else the
 client IP. Any caller can send `openai/subject`, so it is believed only from
 OpenAI's published egress ranges ([chatgpt-connectors.json](https://openai.com/chatgpt-connectors.json),
 overridable with `OPENAI_EGRESS_CIDRS`); from anywhere else the call is
-counted by IP. The server allows 30 render or continue calls per subject or IP
-per hour (`ANON_CALLS_PER_HOUR`). All traffic from Claude's
-`160.79.104.0/21` network shares a separate 3,000-call hourly bucket
-(`CLAUDE_CALLS_PER_HOUR`), so its shared addresses do not exhaust an
-individual user's flood guard. Neither User-Agent text nor `_meta` can claim
-or leave this bucket.
+counted by IP. The hosted server fetches that list at startup and every 24
+hours, keeping the built-in copy (then the last good fetch) whenever a fetch
+fails or returns anything malformed or empty; it logs one line per refresh. It
+also logs, at most once an hour, how many calls sent an `openai/subject` from
+outside the list, so a stale list shows up.
+
+The server allows 30 render or continue calls per subject or IP per hour
+(`ANON_CALLS_PER_HOUR`). Callers counted by IP also share a second bucket per
+IPv4 /24 or IPv6 /48, 300 calls an hour (`ANON_NETWORK_CALLS_PER_HOUR`), so a
+block of cheap addresses counts as one caller. All traffic from Claude's
+`160.79.104.0/21` network (Anthropic's published outbound range, which the
+Claude API's MCP connector also uses) shares a separate 3,000-call hourly
+bucket (`CLAUDE_CALLS_PER_HOUR`); each Claude conversation that sends its
+`Mcp-Session-Id` also gets the 30-call per-subject bucket inside it. Neither
+User-Agent text nor `_meta` can claim or leave these buckets.
 The SheetRender API still applies the monthly document volume against the
 hashed subject or IP. The subject and IP are sent to the API only as SHA-256
 hashes, and the request log carries a fingerprint, the detected client (`chatgpt`,
@@ -138,8 +152,9 @@ For the anonymous tools it also reads:
 | `MCP_PUBLIC_URL` | The URL users paste, byte for byte, e.g. `https://mcp.sheetrender.com/mcp`. Sets the view's sandbox origin (Claude hashes this exact string). |
 | `OPENAI_APPS_CHALLENGE` | OpenAI's domain-verification token, served as plain text at `GET /.well-known/openai-apps-challenge` (404 when unset). |
 | `ANON_CALLS_PER_HOUR` | Render and continue calls per subject or IP per hour, default 30. |
+| `ANON_NETWORK_CALLS_PER_HOUR` | Render and continue calls per hour per IPv4 /24 or IPv6 /48, for callers counted by IP, default 300. |
 | `CLAUDE_CALLS_PER_HOUR` | Shared render and continue calls per hour for all traffic from `160.79.104.0/21`, default 3000. |
-| `OPENAI_EGRESS_CIDRS` | Comma- or space-separated CIDRs whose `openai/subject` is believed, replacing the built-in copy of [chatgpt-connectors.json](https://openai.com/chatgpt-connectors.json); `none` believes no subject. |
+| `OPENAI_EGRESS_CIDRS` | Comma- or space-separated CIDRs whose `openai/subject` is believed, replacing both the built-in copy and the live fetch of [chatgpt-connectors.json](https://openai.com/chatgpt-connectors.json); `none` believes no subject. |
 
 With `SHEETRENDER_DEMO_API_KEY` set, the server refuses to start if the view
 bundle (`dist/widget/documents.js`) is missing. The `Dockerfile` in this repo
