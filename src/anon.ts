@@ -88,6 +88,24 @@ export const DEFAULT_CALLS_PER_HOUR = 30;
 export const DEFAULT_NETWORK_CALLS_PER_HOUR = 300;
 /** Traffic from Claude's network shares one larger, isolated flood bucket. */
 export const DEFAULT_CLAUDE_CALLS_PER_HOUR = 3000;
+/**
+ * Most messages an anonymous JSON-RPC batch may carry. MCP removed batching in
+ * protocol version 2025-06-18, and ChatGPT and Claude send one message per
+ * request; four leaves room for an older client while bounding what one small
+ * request can make the server generate (a view read answers ~200 KB).
+ */
+export const MAX_ANON_BATCH = 4;
+/**
+ * Anonymous messages other than tool calls (initialize, tools/list,
+ * resources/read, ...) per IPv4 /24 or IPv6 /48 per hour. A session sends a
+ * handful; tool calls have their own buckets (guard() below). Not applied to
+ * ChatGPT's or Claude's egress, where one address carries many users.
+ */
+export const DEFAULT_RPC_PER_HOUR = 600;
+/** Anonymous requests being answered at once, all callers together. */
+export const DEFAULT_MAX_IN_FLIGHT = 64;
+/** Anonymous requests being answered at once per IPv4 /24 or IPv6 /48, outside the platforms' egress. */
+export const DEFAULT_NETWORK_MAX_IN_FLIGHT = 8;
 const HOUR_MS = 60 * 60 * 1000;
 const CATALOGUE_TTL_MS = HOUR_MS;
 
@@ -402,13 +420,19 @@ export class SlidingWindowLimiter {
         this.#maxKeys = maxKeys;
     }
 
-    /** The decision `take` would make, without counting a call. */
-    check(key: string): LimitDecision {
+    /** Whether `count` more calls would fit (what `take` decides for one), without counting any. */
+    check(key: string, count = 1): LimitDecision {
         const now = this.#now();
         const hits = (this.#hits.get(key) ?? []).filter((at) => at > now - this.#windowMs);
-        return hits.length >= this.#limit
-            ? { allowed: false, retryAfterMs: Math.max(0, hits[0]! + this.#windowMs - now) }
-            : { allowed: true, retryAfterMs: 0 };
+        if (hits.length + count <= this.#limit) return { allowed: true, retryAfterMs: 0 };
+        // Room for `count` once enough of the oldest calls have left the window.
+        const freeing = hits[hits.length + count - this.#limit - 1];
+        return { allowed: false, retryAfterMs: freeing === undefined ? this.#windowMs : Math.max(0, freeing + this.#windowMs - now) };
+    }
+
+    /** Counts `count` calls, after a check() that said they fit. */
+    takeMany(key: string, count: number): void {
+        for (let i = 0; i < count; i++) this.take(key);
     }
 
     take(key: string): LimitDecision {
@@ -439,6 +463,45 @@ export class SlidingWindowLimiter {
             if (this.#hits.size <= this.#maxKeys) break;
             this.#hits.delete(key);
         }
+    }
+}
+
+/**
+ * Requests being answered right now, in memory, per process: at most `limit`
+ * overall and `perKeyLimit` per key. `enter` returns the release function, or
+ * the reason it refused.
+ */
+export class InFlightLimiter {
+    readonly #limit: number;
+    readonly #perKeyLimit: number;
+    readonly #byKey = new Map<string, number>();
+    #total = 0;
+
+    constructor(limit: number, perKeyLimit: number) {
+        this.#limit = limit;
+        this.#perKeyLimit = perKeyLimit;
+    }
+
+    /** `key` undefined: counted overall only. */
+    enter(key: string | undefined): (() => void) | "busy" | "key" {
+        if (key !== undefined && (this.#byKey.get(key) ?? 0) >= this.#perKeyLimit) return "key";
+        if (this.#total >= this.#limit) return "busy";
+        this.#total++;
+        if (key !== undefined) this.#byKey.set(key, (this.#byKey.get(key) ?? 0) + 1);
+        let released = false;
+        return () => {
+            if (released) return;
+            released = true;
+            this.#total--;
+            if (key === undefined) return;
+            const left = (this.#byKey.get(key) ?? 1) - 1;
+            if (left > 0) this.#byKey.set(key, left);
+            else this.#byKey.delete(key);
+        };
+    }
+
+    get total(): number {
+        return this.#total;
     }
 }
 

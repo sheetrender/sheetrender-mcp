@@ -132,6 +132,19 @@ treated as a proxy and only the final valid IP in `X-Forwarded-For` is
 trusted. Keep this listener behind Caddy, with no publicly exposed container
 port, as in the deployment's Compose topology.
 
+Anonymous requests have three more bounds, so a small request cannot make
+the server generate a lot of output. A JSON-RPC batch may carry at most 4
+messages (MCP dropped batching in protocol version 2025-06-18, and ChatGPT
+and Claude send one message per request); a larger one gets a 400 before
+anything in it runs. Messages other than tool calls (`initialize`,
+`tools/list`, `resources/read`, ...) count 600 an hour per IPv4 /24 or IPv6
+/48 (`ANON_RPC_PER_HOUR`); traffic from OpenAI's and Claude's egress ranges
+is not counted there, since each of those addresses carries many users. And
+at most 64 anonymous requests are answered at once (`ANON_MAX_IN_FLIGHT`),
+8 per network outside those ranges (`ANON_NETWORK_MAX_IN_FLIGHT`); past
+either, the answer is a 503 or 429 with `Retry-After: 5`. Requests with an
+API key keep their batches and are not counted.
+
 A request carrying a SheetRender bearer key uses the API-key tools above.
 A malformed `Authorization` header is rejected. The stdio server never
 offers the anonymous tools.
@@ -154,6 +167,9 @@ For the anonymous tools it also reads:
 | `ANON_CALLS_PER_HOUR` | Render and continue calls per subject or IP per hour, default 30. |
 | `ANON_NETWORK_CALLS_PER_HOUR` | Render and continue calls per hour per IPv4 /24 or IPv6 /48, for callers counted by IP, default 300. |
 | `CLAUDE_CALLS_PER_HOUR` | Shared render and continue calls per hour for all traffic from `160.79.104.0/21`, default 3000. |
+| `ANON_RPC_PER_HOUR` | Anonymous messages other than tool calls per hour per IPv4 /24 or IPv6 /48, outside the OpenAI and Claude ranges, default 600. |
+| `ANON_MAX_IN_FLIGHT` | Anonymous requests answered at once, default 64. |
+| `ANON_NETWORK_MAX_IN_FLIGHT` | Anonymous requests answered at once per IPv4 /24 or IPv6 /48, outside the OpenAI and Claude ranges, default 8. |
 | `OPENAI_EGRESS_CIDRS` | Comma- or space-separated CIDRs whose `openai/subject` is believed, replacing both the built-in copy and the live fetch of [chatgpt-connectors.json](https://openai.com/chatgpt-connectors.json); `none` believes no subject. |
 
 With `SHEETRENDER_DEMO_API_KEY` set, the server refuses to start if the view

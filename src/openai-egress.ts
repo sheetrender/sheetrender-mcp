@@ -63,6 +63,40 @@ export function parseOpenaiEgress(body: unknown): string[] {
     });
 }
 
+/**
+ * The body as UTF-8, read a chunk at a time: past `limit` bytes the download
+ * is cancelled and EgressListError thrown, so an oversized answer never sits
+ * in memory whole. A declared Content-Length past `limit` is refused unread.
+ */
+async function readCapped(response: Response, limit: number): Promise<string> {
+    const body = response.body;
+    if (!body) return "";
+    const declared = Number(response.headers.get("content-length") ?? "");
+    if (Number.isFinite(declared) && declared > limit) {
+        await body.cancel().catch(() => undefined);
+        throw new EgressListError("body too large");
+    }
+    const reader = body.getReader();
+    const chunks: Uint8Array[] = [];
+    let received = 0;
+    for (;;) {
+        let chunk: ReadableStreamReadResult<Uint8Array>;
+        try {
+            chunk = await reader.read();
+        } catch {
+            throw new EgressListError("fetch failed");
+        }
+        if (chunk.done) break;
+        received += chunk.value.byteLength;
+        if (received > limit) {
+            await reader.cancel().catch(() => undefined);
+            throw new EgressListError("body too large");
+        }
+        chunks.push(chunk.value);
+    }
+    return Buffer.concat(chunks).toString("utf8");
+}
+
 /** Fetches and parses the published list. Throws EgressListError on any failure. */
 export async function fetchOpenaiEgress(fetchImpl: Fetch = fetch, timeoutMs = FETCH_TIMEOUT_MS): Promise<string[]> {
     let response: Response;
@@ -74,14 +108,11 @@ export async function fetchOpenaiEgress(fetchImpl: Fetch = fetch, timeoutMs = FE
     } catch {
         throw new EgressListError("fetch failed");
     }
-    if (!response.ok) throw new EgressListError(`HTTP ${response.status}`);
-    let text: string;
-    try {
-        text = await response.text();
-    } catch {
-        throw new EgressListError("fetch failed");
+    if (!response.ok) {
+        await response.body?.cancel().catch(() => undefined);
+        throw new EgressListError(`HTTP ${response.status}`);
     }
-    if (Buffer.byteLength(text) > MAX_BODY_BYTES) throw new EgressListError("body too large");
+    const text = await readCapped(response, MAX_BODY_BYTES);
     let body: unknown;
     try {
         body = JSON.parse(text);

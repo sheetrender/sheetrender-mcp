@@ -442,6 +442,19 @@ async function rawRpc(mcpUrl: string, body: unknown, headers: Record<string, str
     return { status: response.status, json: JSON.parse(data), headers: response.headers };
 }
 
+/** A POST of any body, batches included, with no fixture validation. */
+function postRaw(mcpUrl: string, body: unknown, headers: Record<string, string> = {}): Promise<Response> {
+    return fetch(`${mcpUrl}/mcp`, { method: "POST", headers: { ...MCP_HEADERS, ...headers }, body: JSON.stringify(body) });
+}
+
+async function waitUntil(predicate: () => boolean | Promise<boolean>, timeoutMs = 5000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (!(await predicate())) {
+        if (Date.now() > deadline) throw new Error("timed out waiting");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+}
+
 describe("anonymous mode", () => {
     it("generates distinct session ids with 64 hexadecimal characters", () => {
         const first = newSessionId();
@@ -904,6 +917,118 @@ describe("anonymous mode", () => {
         assert.ok(!names.includes("render_documents"));
     });
 
+    it("refuses an anonymous batch past 4 messages before dispatching any of it", async () => {
+        const { url } = await startAnon("http://127.0.0.1:1");
+        const widgetReads = (count: number) => Array.from({ length: count }, (_, index) => ({
+            jsonrpc: "2.0", id: index + 1, method: "resources/read", params: { uri: "ui://sheetrender/documents.html" },
+        }));
+        const events = (text: string) => text.split("\n").filter((line) => line.startsWith("data: {")).length;
+        // 50 widget reads fit in a few KB but would answer with ~50 copies of the bundle.
+        const big = await postRaw(url, widgetReads(50));
+        const text = await big.text();
+        assert.equal(big.status, 400, `answered with ${events(text)} messages`);
+        assert.equal((JSON.parse(text) as { error: { code: number } }).error.code, -32600);
+        const small = await postRaw(url, widgetReads(4));
+        assert.equal(small.status, 200);
+        assert.equal(events(await small.text()), 4);
+        // API-key callers keep the SDK's batching as before.
+        const listTools = Array.from({ length: 50 }, (_, index) => ({ jsonrpc: "2.0", id: index + 1, method: "tools/list" }));
+        const keyed = await postRaw(url, listTools, { Authorization: "Bearer sr_test_key" });
+        assert.equal(keyed.status, 200);
+        assert.equal(events(await keyed.text()), 50);
+    });
+
+    it("counts resources/read and other non-tool messages per network, but not the platforms' traffic", async () => {
+        const backend = await fakeBuiltinBackend();
+        const { url } = await startAnon(backend.url, { anonRpcPerHour: 3, anonCallsPerHour: 100 });
+        const read = (ip: string) => postRaw(url, {
+            jsonrpc: "2.0", id: 1, method: "resources/read", params: { uri: "ui://sheetrender/documents.html" },
+        }, { "X-Forwarded-For": ip });
+        for (let i = 0; i < 3; i++) assert.equal((await read("198.51.100.1")).status, 200);
+        const refused = await read("198.51.100.1");
+        assert.equal(refused.status, 429);
+        assert.equal(refused.headers.get("retry-after"), "3600");
+        assert.equal(
+            (await refused.json() as { error: { message: string } }).error.message,
+            ANON_TEXT.tooManyNetworkCalls.replace("{minutes}", "60"),
+        );
+        // The same /24 is the same caller; a batch needs room for every message.
+        assert.equal((await read("198.51.100.2")).status, 429);
+        assert.equal((await read("198.51.101.2")).status, 200);
+        const batch = await postRaw(url, [
+            { jsonrpc: "2.0", id: 1, method: "tools/list" },
+            { jsonrpc: "2.0", id: 2, method: "tools/list" },
+            { jsonrpc: "2.0", id: 3, method: "tools/list" },
+        ], { "X-Forwarded-For": "198.51.101.3" });
+        assert.equal(batch.status, 429);
+        // Tool calls keep their own per-user guard and do not use this bucket up.
+        const render = await rawRpc(url, {
+            jsonrpc: "2.0", id: 1, method: "tools/call",
+            params: { name: "render_documents", arguments: { template: "letter", rows: [{ body: "x" }] } },
+        }, { "X-Forwarded-For": "198.51.100.9" });
+        assert.equal((render.json as { result: { isError?: boolean } }).result.isError, undefined);
+        // ChatGPT's and Claude's egress carry many users each; their tool calls are guarded per user.
+        for (let i = 0; i < 5; i++) {
+            assert.equal((await read("203.0.113.7")).status, 200, "OpenAI egress");
+            assert.equal((await read("160.79.104.7")).status, 200, "Claude egress");
+        }
+    });
+
+    it("bounds anonymous requests in flight, overall and per network, and frees the slot when one ends", async () => {
+        let release!: () => void;
+        const held = new Promise<void>((resolve) => { release = resolve; });
+        let received = 0;
+        const backend = createNodeServer((req, res) => {
+            req.resume();
+            const answer = (body: string) => {
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(body);
+            };
+            if (!req.url?.endsWith("/render")) {
+                answer(CATALOGUE_JSON);
+                return;
+            }
+            // Renders are held until release(), so their requests stay in flight.
+            received++;
+            void held.then(() => answer(JSON.stringify({
+                documents: [{ row_index: 0, label: "A", preview_png_url: "/api/previews/x/0.png", pdf_url: "/api/previews/x/0.pdf" }],
+                missing_fields: [],
+                volume: { used: 1, limit: 50, resets_at: "2026-11-01T00:00:00Z" },
+                expires_at: "2026-10-01T14:00:00Z",
+            })));
+        });
+        const apiUrl = await listen(backend);
+        closers.push(() => closeServer(backend));
+        const { url } = await startAnon(apiUrl, { anonMaxInFlight: 2, anonNetworkMaxInFlight: 1 });
+        const render = (ip: string) => postRaw(url, {
+            jsonrpc: "2.0", id: 1, method: "tools/call",
+            params: { name: "render_documents", arguments: { template: "letter", rows: [{ body: "x" }] } },
+        }, { "X-Forwarded-For": ip });
+        const first = render("198.51.100.1");
+        await waitUntil(() => received === 1);
+        // One in flight per /24 network.
+        const sameNetwork = await render("198.51.100.2");
+        assert.equal(sameNetwork.status, 429);
+        assert.equal(sameNetwork.headers.get("retry-after"), "5");
+        const second = render("198.51.101.1");
+        await waitUntil(() => received === 2);
+        // Two in flight overall.
+        const busy = await render("198.51.102.1");
+        assert.equal(busy.status, 503);
+        assert.equal(busy.headers.get("retry-after"), "5");
+        assert.equal(received, 2, "a refused request never reaches the backend");
+        // API-key callers are not counted.
+        assert.equal((await postRaw(url, { jsonrpc: "2.0", id: 1, method: "tools/list" },
+            { Authorization: "Bearer sr_test_key" })).status, 200);
+        release();
+        for (const pending of [first, second]) {
+            const response = await pending;
+            assert.equal(response.status, 200);
+            assert.match(await response.text(), /row_index|documents/i);
+        }
+        await waitUntil(async () => (await render("198.51.102.1")).status === 200);
+    });
+
     it("keeps reflected credentials out of errors, logs, tool replies and widget HTML", async () => {
         const backend = createNodeServer((_req, res) => {
             res.writeHead(422, { "Content-Type": "application/json" });
@@ -978,9 +1103,16 @@ describe("loadHttpConfig", () => {
         assert.equal(config.anonNetworkCallsPerHour, 300);
         assert.equal(loadHttpConfig({ CLAUDE_CALLS_PER_HOUR: "6000" }).claudeCallsPerHour, 6000);
         assert.equal(loadHttpConfig({ ANON_NETWORK_CALLS_PER_HOUR: "120" }).anonNetworkCallsPerHour, 120);
+        assert.equal(config.anonRpcPerHour, 600);
+        assert.equal(config.anonMaxInFlight, 64);
+        assert.equal(config.anonNetworkMaxInFlight, 8);
+        assert.equal(loadHttpConfig({ ANON_RPC_PER_HOUR: "50" }).anonRpcPerHour, 50);
+        assert.equal(loadHttpConfig({ ANON_MAX_IN_FLIGHT: "16" }).anonMaxInFlight, 16);
+        assert.equal(loadHttpConfig({ ANON_NETWORK_MAX_IN_FLIGHT: "2" }).anonNetworkMaxInFlight, 2);
         for (const value of ["0", "-1", "1.5", "not a number"]) {
             assert.throws(() => loadHttpConfig({ CLAUDE_CALLS_PER_HOUR: value }), /CLAUDE_CALLS_PER_HOUR/);
             assert.throws(() => loadHttpConfig({ ANON_NETWORK_CALLS_PER_HOUR: value }), /ANON_NETWORK_CALLS_PER_HOUR/);
+            assert.throws(() => loadHttpConfig({ ANON_MAX_IN_FLIGHT: value }), /ANON_MAX_IN_FLIGHT/);
         }
         const off = loadHttpConfig({} as NodeJS.ProcessEnv);
         assert.equal(off.demoApiKey, undefined);

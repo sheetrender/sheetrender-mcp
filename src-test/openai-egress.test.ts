@@ -64,6 +64,36 @@ describe("OpenAI egress list", () => {
         await assert.rejects(fetchOpenaiEgress((async () => { throw new TypeError("network down"); }) as unknown as typeof fetch), /fetch failed/);
     });
 
+    it("stops reading an oversized answer at the cap instead of buffering all of it", async () => {
+        const chunk = new Uint8Array(64 * 1024).fill(0x78);
+        let pulled = 0;
+        let cancelled = false;
+        // 8 MiB on offer, with no Content-Length to refuse it up front.
+        const huge = (async () => new Response(new ReadableStream<Uint8Array>({
+            pull(controller) {
+                if (pulled >= 8 * 1024 * 1024) {
+                    controller.close();
+                    return;
+                }
+                pulled += chunk.byteLength;
+                controller.enqueue(chunk);
+            },
+            cancel() {
+                cancelled = true;
+            },
+        }, { highWaterMark: 0 }), { status: 200 })) as unknown as typeof fetch;
+        await assert.rejects(fetchOpenaiEgress(huge), /body too large/);
+        assert.ok(pulled <= 1024 * 1024 + 2 * chunk.byteLength, `read ${pulled} bytes`);
+        assert.equal(cancelled, true);
+        // A declared length past the cap is refused before any of the body is read.
+        let read = false;
+        const declared = (async () => new Response(new ReadableStream({ pull() { read = true; } }, { highWaterMark: 0 }), {
+            status: 200, headers: { "Content-Length": String(1024 * 1024 + 1) },
+        })) as unknown as typeof fetch;
+        await assert.rejects(fetchOpenaiEgress(declared), /body too large/);
+        assert.equal(read, false);
+    });
+
     it("replaces the set on a good fetch and keeps what it has on a bad one, logging each refresh", async () => {
         const logs: Entry[] = [];
         const set = new CidrSet(OPENAI_EGRESS_CIDRS);

@@ -122,6 +122,9 @@ export const ANON_TEXT = {
     /** The coarser per-network flood guard (IPv4 /24, IPv6 /48). */
     tooManyNetworkCalls:
         "Too many requests from this network in the last hour. Try again in {minutes} minutes.",
+    /** Too many requests being answered at once (http.ts), from one network or overall. */
+    tooManyNetworkInFlight: "Too many requests from this network at once. Try again in a few seconds.",
+    serverBusy: "The document service is busy. Try again in a few seconds.",
     /** The volume line when the month's limit that applies is shared with other users. */
     sharedVolume: "This month's document limit is shared with other users",
     /** The backend refused for capacity reasons (HTTP 429 without a volume body). */

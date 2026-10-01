@@ -17,6 +17,7 @@ import {
     createAnonServer,
     detectSource,
     floodNetwork,
+    InFlightLimiter,
     isClaudeIp,
     MAX_DETAIL_CHARS,
     MAX_CELL_CHARS,
@@ -1569,5 +1570,33 @@ describe("view resource host", () => {
             assert.equal(meta.ui.domain, domain, clientIp);
             assert.equal(meta["openai/widgetDomain"], "https://mcp.sheetrender.test", clientIp);
         }
+    });
+});
+
+describe("admission limiters", () => {
+    it("checks room for several calls at once and says when it frees", () => {
+        let now = 0;
+        const limiter = new SlidingWindowLimiter(3, 1000, () => now);
+        assert.equal(limiter.check("k", 3).allowed, true);
+        limiter.takeMany("k", 2);
+        now = 100;
+        assert.deepEqual(limiter.check("k", 2), { allowed: false, retryAfterMs: 900 });
+        assert.equal(limiter.check("k", 1).allowed, true);
+        // More than the limit never fits: a whole window, never NaN.
+        assert.deepEqual(new SlidingWindowLimiter(3, 1000, () => 0).check("x", 4), { allowed: false, retryAfterMs: 1000 });
+    });
+
+    it("counts requests in flight overall and per key, and releases each once", () => {
+        const inFlight = new InFlightLimiter(2, 1);
+        const first = inFlight.enter("a");
+        assert.equal(typeof first, "function");
+        assert.equal(inFlight.enter("a"), "key");
+        const platform = inFlight.enter(undefined);
+        assert.equal(typeof platform, "function");
+        assert.equal(inFlight.enter("b"), "busy");
+        (first as () => void)();
+        (first as () => void)();
+        assert.equal(inFlight.total, 1);
+        assert.equal(typeof inFlight.enter("a"), "function");
     });
 });

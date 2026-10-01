@@ -34,7 +34,14 @@ import {
     createAnonServer,
     DEFAULT_CALLS_PER_HOUR,
     DEFAULT_CLAUDE_CALLS_PER_HOUR,
+    DEFAULT_MAX_IN_FLIGHT,
     DEFAULT_NETWORK_CALLS_PER_HOUR,
+    DEFAULT_NETWORK_MAX_IN_FLIGHT,
+    DEFAULT_RPC_PER_HOUR,
+    floodNetwork,
+    InFlightLimiter,
+    isClaudeIp,
+    MAX_ANON_BATCH,
     MAX_ANON_BODY_BYTES,
     OPENAI_EGRESS_CIDRS,
     openaiSubject,
@@ -43,6 +50,7 @@ import {
     subjectFingerprint,
     trustedOpenaiSubject,
 } from "./anon.js";
+import { ANON_TEXT } from "./anon-descriptions.js";
 import { DEFAULT_API_URL, parseApiUrl, SheetRenderClient, SheetRenderError } from "./client.js";
 import { createServer, runningAsExecutable, SERVER_VERSION } from "./index.js";
 import { startOpenaiEgressRefresh } from "./openai-egress.js";
@@ -83,6 +91,16 @@ export interface HttpServerOptions {
     claudeCallsPerHour?: number;
     /** Anonymous flood guard for callers counted by IP: calls per IPv4 /24 or IPv6 /48 per hour. */
     anonNetworkCallsPerHour?: number;
+    /**
+     * Anonymous JSON-RPC messages other than tool calls (initialize,
+     * tools/list, resources/read, ...) per IPv4 /24 or IPv6 /48 per hour.
+     * ChatGPT's and Claude's egress addresses are not counted here.
+     */
+    anonRpcPerHour?: number;
+    /** Anonymous requests being answered at once, across all callers. */
+    anonMaxInFlight?: number;
+    /** Anonymous requests being answered at once per IPv4 /24 or IPv6 /48. */
+    anonNetworkMaxInFlight?: number;
     /** Ranges whose `openai/subject` is believed; OpenAI's published list by default. */
     openaiEgressCidrs?: readonly string[];
     /**
@@ -108,6 +126,9 @@ export interface HttpConfig {
     anonCallsPerHour: number;
     claudeCallsPerHour: number;
     anonNetworkCallsPerHour: number;
+    anonRpcPerHour: number;
+    anonMaxInFlight: number;
+    anonNetworkMaxInFlight: number;
     openaiEgressCidrs: readonly string[];
     /** True when OPENAI_EGRESS_CIDRS set the list; the live refresh is then off. */
     openaiEgressFromEnv: boolean;
@@ -129,6 +150,9 @@ export function loadHttpConfig(env: NodeJS.ProcessEnv = process.env): HttpConfig
         anonCallsPerHour: readInteger(env, "ANON_CALLS_PER_HOUR", DEFAULT_CALLS_PER_HOUR, 1),
         claudeCallsPerHour: readInteger(env, "CLAUDE_CALLS_PER_HOUR", DEFAULT_CLAUDE_CALLS_PER_HOUR, 1),
         anonNetworkCallsPerHour: readInteger(env, "ANON_NETWORK_CALLS_PER_HOUR", DEFAULT_NETWORK_CALLS_PER_HOUR, 1),
+        anonRpcPerHour: readInteger(env, "ANON_RPC_PER_HOUR", DEFAULT_RPC_PER_HOUR, 1),
+        anonMaxInFlight: readInteger(env, "ANON_MAX_IN_FLIGHT", DEFAULT_MAX_IN_FLIGHT, 1),
+        anonNetworkMaxInFlight: readInteger(env, "ANON_NETWORK_MAX_IN_FLIGHT", DEFAULT_NETWORK_MAX_IN_FLIGHT, 1),
         openaiEgressCidrs: readCidrs(env, "OPENAI_EGRESS_CIDRS", OPENAI_EGRESS_CIDRS),
         openaiEgressFromEnv: Boolean(env.OPENAI_EGRESS_CIDRS?.trim()),
     };
@@ -441,6 +465,19 @@ export function createHttpServer(options: HttpServerOptions): Server {
         60 * 60 * 1000,
         options.now,
     );
+    // Every anonymous message that is not a tool call (those have guard() in
+    // anon.ts), per network, outside ChatGPT's and Claude's egress.
+    const rpcLimiter = new SlidingWindowLimiter(
+        options.anonRpcPerHour ?? DEFAULT_RPC_PER_HOUR,
+        60 * 60 * 1000,
+        options.now,
+    );
+    // Bounds the responses being generated at once, so no burst of cheap
+    // requests can queue an unbounded amount of output in memory.
+    const inFlight = new InFlightLimiter(
+        options.anonMaxInFlight ?? DEFAULT_MAX_IN_FLIGHT,
+        options.anonNetworkMaxInFlight ?? DEFAULT_NETWORK_MAX_IN_FLIGHT,
+    );
     const catalogue = new CatalogueCache(undefined, options.now);
     const openaiEgress = options.openaiEgress ?? new CidrSet(options.openaiEgressCidrs ?? OPENAI_EGRESS_CIDRS);
     const untrusted = new UntrustedSubjectTally(log, options.now);
@@ -547,6 +584,30 @@ export function createHttpServer(options: HttpServerOptions): Server {
         if (anonymous) fields.anonymous = true;
         else fields.key_fp = keyFingerprint(apiKey);
 
+        const ip = clientIp(req);
+        // ChatGPT's and Claude's egress addresses each carry many users: they
+        // count only toward the overall bounds. Everyone else is counted by
+        // network (IPv4 /24, IPv6 /48), as the tool calls' network bucket is.
+        const networkKey = anonymous && !isClaudeIp(ip) && !openaiEgress.has(ip)
+            ? `net:${floodNetwork(ip)}`
+            : undefined;
+        if (anonymous) {
+            const slot = inFlight.enter(networkKey);
+            if (typeof slot === "string") {
+                fields.refused = slot === "key" ? "network_in_flight" : "in_flight";
+                // `Connection: close`: the body is never read.
+                sendRpcError(
+                    res,
+                    slot === "key" ? 429 : 503,
+                    -32000,
+                    slot === "key" ? ANON_TEXT.tooManyNetworkInFlight : ANON_TEXT.serverBusy,
+                    { "Retry-After": "5", Connection: "close" },
+                );
+                return;
+            }
+            res.on("close", slot);
+        }
+
         // Anonymous calls get the backend's render body cap: 25 rows at their
         // field caps. create_continue_link checks the handoff cap itself.
         const limit = anonymous ? Math.min(maxBodyBytes, MAX_ANON_BODY_BYTES) : maxBodyBytes;
@@ -572,8 +633,31 @@ export function createHttpServer(options: HttpServerOptions): Server {
             return;
         }
         Object.assign(fields, describeRpc(parsedBody));
+        if (anonymous) {
+            const messages: unknown[] = Array.isArray(parsedBody) ? parsedBody : [parsedBody];
+            // The SDK would dispatch every entry at once and queue every answer.
+            if (messages.length > MAX_ANON_BATCH) {
+                fields.refused = "batch";
+                sendRpcError(res, 400, -32600, `Invalid Request: at most ${MAX_ANON_BATCH} messages per batch`);
+                return;
+            }
+            const counted = messages.filter((message) =>
+                !(message && typeof message === "object" && (message as { method?: unknown }).method === "tools/call")
+            ).length;
+            if (networkKey !== undefined && counted > 0) {
+                const decision = rpcLimiter.check(networkKey, counted);
+                if (!decision.allowed) {
+                    fields.refused = "network_rpc";
+                    const minutes = Math.max(1, Math.ceil(decision.retryAfterMs / 60_000));
+                    sendRpcError(res, 429, -32000, ANON_TEXT.tooManyNetworkCalls.replace("{minutes}", String(minutes)), {
+                        "Retry-After": String(Math.max(1, Math.ceil(decision.retryAfterMs / 1000))),
+                    });
+                    return;
+                }
+                rpcLimiter.takeMany(networkKey, counted);
+            }
+        }
         const userAgent = req.headers["user-agent"];
-        const ip = clientIp(req);
         if (anonymous) {
             Object.assign(fields, describeAnonCall(parsedBody, userAgent, ip, openaiEgress));
             if (fields.subject_untrusted) untrusted.note();
@@ -704,6 +788,9 @@ async function main(): Promise<void> {
         anon_calls_per_hour: config.anonCallsPerHour,
         claude_calls_per_hour: config.claudeCallsPerHour,
         anon_network_calls_per_hour: config.anonNetworkCallsPerHour,
+        anon_rpc_per_hour: config.anonRpcPerHour,
+        anon_max_in_flight: config.anonMaxInFlight,
+        anon_network_max_in_flight: config.anonNetworkMaxInFlight,
         openai_egress_cidrs: config.openaiEgressCidrs.length,
         openai_egress_source: config.openaiEgressFromEnv ? "env" : config.demoApiKey ? "live" : "built-in",
     });
