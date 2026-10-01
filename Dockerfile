@@ -15,9 +15,14 @@ COPY --from=denoland/deno:bin-2.9.4@sha256:25675bd2a125b59bdcfbb6592ec5c332a2bc5
 WORKDIR /app
 COPY package.json deno.lock ./
 RUN deno install --frozen
-COPY tsconfig.json ./
+COPY tsconfig.json tsconfig.widget.json tsconfig.test.json ./
+COPY scripts/build-widget.mjs ./scripts/
 COPY src ./src
-RUN node node_modules/.bin/tsc -p tsconfig.json
+COPY src-test ./src-test
+# The same build CI runs: the server, the MCP Apps view bundle
+# (dist/widget/documents.js, inlined into the view at runtime) and, as a
+# by-product, the unit-test build, which this stage discards.
+RUN deno task build
 
 # Production dependencies only. The manifest is rewritten without
 # devDependencies; every remaining specifier is an exact version and the

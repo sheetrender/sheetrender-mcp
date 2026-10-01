@@ -531,9 +531,12 @@ describe("design requests", () => {
         assert.equal(stub.calls.length, 1);
     });
 
-    it("returns the running design at its polling deadline", async () => {
+    it("returns the running design at its polling deadline", async (t) => {
+        mockPollingClock(t);
         const stub = stubFetch(jsonResponse(200, {}));
-        const result = await client().waitForDesign({ design_id: "des_1", status: "running" }, 10);
+        const waiting = client().waitForDesign({ design_id: "des_1", status: "running" }, 10);
+        t.mock.timers.tick(10);
+        const result = await waiting;
         assert.equal(result.status, "running");
         assert.equal(stub.calls.length, 0);
     });

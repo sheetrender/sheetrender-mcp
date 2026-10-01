@@ -14,5 +14,8 @@
     "sourceMap": false,
     "skipLibCheck": true
   },
-  "include": ["src"]
+  "include": ["src"],
+  // Browser code for the MCP Apps view: type-checked by tsconfig.widget.json
+  // and bundled by scripts/build-widget.mjs, never emitted by this project.
+  "exclude": ["src/widget"]
 }

@@ -72,14 +72,72 @@ local file to read — send rows with `create_dataset` instead.
 `GET /healthz` answers 200 without credentials. Request bodies are capped at
 25 MB; anything larger is a 413.
 
+### Without a key (ChatGPT and Claude directory listings)
+
+When the server runs with `SHEETRENDER_DEMO_API_KEY` set, a request that
+sends **no** `Authorization` header gets a different, smaller tool set
+instead of a 401. These tools fill SheetRender's built-in templates
+(certificate of completion, letter, donation receipt, job offer letter) from
+rows in the chat, through a dedicated rendering account:
+
+- `list_document_templates`: the templates, their fields (key, label,
+  required, example) and each one's page on the website.
+- `render_documents`: up to 25 rows per call, one PDF per row; returns a PNG
+  preview and a PDF link per document (both expire after an hour), the rows
+  that missed a required field, and how many of the month's 50 documents per
+  user remain.
+- `create_continue_link`: up to 100 rows, stored for 7 days, and a link to the
+  template's page on the website with those rows loaded. Called only when the
+  user wants to continue there.
+
+`render_documents` comes with an [MCP Apps](https://apps.extensions.modelcontextprotocol.io/)
+view, `ui://sheetrender/documents.html` (`text/html;profile=mcp-app`): a strip
+of previews with PDF links and a "Continue in SheetRender with these rows"
+button. Its script, `src/widget/documents.ts`, is bundled by esbuild into
+`dist/widget/documents.js` during `deno task build` and inlined into the page
+when the resource is read.
+
+Calls are counted per user: ChatGPT's anonymised `openai/subject`, else the
+client IP. The server allows 30 render or continue calls per subject or IP
+per hour (`ANON_CALLS_PER_HOUR`). Subjectless traffic from Claude's
+`160.79.104.0/21` network shares a separate 3,000-call hourly bucket
+(`CLAUDE_CALLS_PER_HOUR`), so its shared addresses do not exhaust an
+individual user's flood guard. User-Agent text cannot claim this bucket.
+The SheetRender API still applies the monthly document volume against the
+hashed subject or IP. The subject and IP are sent to the API only as SHA-256
+hashes, and the request log carries a fingerprint, the detected client (`chatgpt`,
+`claude` or `other`) and the row count, never the rows.
+
+Anonymous HTTP bodies are capped at 256 KB. A private socket peer is
+treated as a proxy and only the final valid IP in `X-Forwarded-For` is
+trusted. Keep this listener behind Caddy, with no publicly exposed container
+port, as in the deployment's Compose topology.
+
+A request carrying a SheetRender bearer key uses the API-key tools above.
+A malformed `Authorization` header is rejected. The stdio server never
+offers the anonymous tools.
+
 ### Running it yourself
 
 `sheetrender-mcp-http` is a second bin in the package. It reads `PORT`
 (default 8080), `HOST` (default `0.0.0.0`), `SHEETRENDER_API_URL`,
 `MAX_BODY_BYTES` and `IDLE_TIMEOUT_MS` (default 60000), and logs one JSON
 line per request to stdout — method, path, status, duration, the JSON-RPC
-method and tool name, and a fingerprint of the key, never the key. The
-`Dockerfile` in this repo builds a non-root runtime image for it:
+method and tool name, and a fingerprint of the key, never the key.
+
+For the anonymous tools it also reads:
+
+| Variable | |
+| --- | --- |
+| `SHEETRENDER_DEMO_API_KEY` | The dedicated rendering account's `sr_` key. Unset: no anonymous tools, keyless requests get a 401. |
+| `MCP_PUBLIC_URL` | The URL users paste, byte for byte, e.g. `https://mcp.sheetrender.com/mcp`. Sets the view's sandbox origin (Claude hashes this exact string). |
+| `OPENAI_APPS_CHALLENGE` | OpenAI's domain-verification token, served as plain text at `GET /.well-known/openai-apps-challenge` (404 when unset). |
+| `ANON_CALLS_PER_HOUR` | Render and continue calls per subject or IP per hour, default 30. |
+| `CLAUDE_CALLS_PER_HOUR` | Shared render and continue calls per hour for subjectless traffic from `160.79.104.0/21`, default 3000. |
+
+With `SHEETRENDER_DEMO_API_KEY` set, the server refuses to start if the view
+bundle (`dist/widget/documents.js`) is missing. The `Dockerfile` in this repo
+builds a non-root runtime image for it:
 
 ```sh
 docker build -t sheetrender-mcp .
@@ -105,12 +163,12 @@ Returns the path of the saved PDF and its size. Under 512 KB it's also attached
 inline as a base64 resource, so clients that display attachments show the
 document itself.
 
-Two server limits apply. HTML over 2 MB is rejected, and that's measured both on
+HTML over 2 MB is rejected, and that's measured both on
 what you send and on the document after `data` is substituted in, so a template
 that expands a long dataset can cross the line even when the markup you wrote
-doesn't. The other is the free plan, where every rendered PDF carries a "Made
-with SheetRender" footer. That applies to `render_pdf` and `render_template`
-alike. Paid plans don't get it.
+doesn't. A "Made with SheetRender" footer is added when required by the
+rendering account's settings. That applies to `render_pdf` and
+`render_template` alike.
 
 ### `list_templates`
 
@@ -152,7 +210,7 @@ That key is what template placeholders, `filename_template` and `group_by`
 address, and it's often not the header verbatim — `Invoice No` becomes
 `invoice_no`. Read it off this result instead of guessing.
 
-Creating a dataset is free; only rendering counts against the plan.
+Creating a dataset does not consume document volume; only rendering does.
 
 ### `upload_dataset`
 

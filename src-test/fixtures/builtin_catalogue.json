@@ -1,0 +1,272 @@
+{
+  "templates": [
+    {
+      "key": "certificate",
+      "name": "Certificate of completion",
+      "description": "A landscape certificate with a gold seal: the recipient's name set large, the course they completed, the completion date and an optional signature block.",
+      "page": "A4",
+      "orientation": "landscape",
+      "slug": "certificate-of-completion",
+      "guide_url": "https://sheetrender.com/templates/certificate-of-completion",
+      "preview_url": "https://sheetrender.com/api/v1/builtin-templates/certificate/preview.png",
+      "fields": [
+        {
+          "key": "recipient_name",
+          "label": "Recipient name",
+          "required": true,
+          "example": "Marisol Echeverria",
+          "description": "The person receiving the certificate, printed as the largest line."
+        },
+        {
+          "key": "course",
+          "label": "Course",
+          "required": true,
+          "example": "Workplace First Aid",
+          "description": "What the person completed."
+        },
+        {
+          "key": "date",
+          "label": "Completion date",
+          "required": true,
+          "example": "2026-03-12",
+          "description": "When the course was completed. A YYYY-MM-DD date is written out in full (12 March 2026); any other text prints as given."
+        },
+        {
+          "key": "issuer",
+          "label": "Issued by",
+          "required": false,
+          "example": "Northfield Training Institute",
+          "description": "The organisation awarding the certificate, printed across the top."
+        },
+        {
+          "key": "signer_name",
+          "label": "Signer name",
+          "required": false,
+          "example": "Dr Selina Adebayo",
+          "description": "Printed under the signature line."
+        },
+        {
+          "key": "signer_title",
+          "label": "Signer title",
+          "required": false,
+          "example": "Course Director",
+          "description": "The signer's role, printed under their name."
+        }
+      ]
+    },
+    {
+      "key": "letter",
+      "name": "Letter",
+      "description": "A plain, well-set letter: sender and date at the top, the recipient's address, an optional subject line, the body text and a signed close.",
+      "page": "A4",
+      "orientation": "portrait",
+      "slug": "mail-merge-letter",
+      "guide_url": "https://sheetrender.com/templates/mail-merge-letter",
+      "preview_url": "https://sheetrender.com/api/v1/builtin-templates/letter/preview.png",
+      "fields": [
+        {
+          "key": "recipient_name",
+          "label": "Recipient name",
+          "required": true,
+          "example": "Adaeze Nwachukwu",
+          "description": "Who the letter is to. Used in the address block and in the greeting (\"Dear Adaeze Nwachukwu,\")."
+        },
+        {
+          "key": "body",
+          "label": "Letter text",
+          "required": true,
+          "example": "Thank you for another year with the club.\n\nYour membership renews on 1 May.",
+          "description": "The text of the letter, without the greeting or the sign-off, which the template adds. A blank line starts a new paragraph. If it starts with \"Dear\", the template leaves out its own greeting."
+        },
+        {
+          "key": "date",
+          "label": "Date",
+          "required": false,
+          "example": "2026-03-18",
+          "description": "The letter's date, top right. A YYYY-MM-DD date is written out in full (18 March 2026); any other text prints as given."
+        },
+        {
+          "key": "sender_name",
+          "label": "Sender name",
+          "required": false,
+          "example": "Harriet Mbeki",
+          "description": "Who the letter is from, printed at the top and under the sign-off."
+        },
+        {
+          "key": "sender_title",
+          "label": "Sender title",
+          "required": false,
+          "example": "Membership Secretary",
+          "description": "The sender's role or organisation, printed under their name."
+        },
+        {
+          "key": "address_line_1",
+          "label": "Address line 1",
+          "required": false,
+          "example": "14 Pentridge Row",
+          "description": "First line of the recipient's address."
+        },
+        {
+          "key": "address_line_2",
+          "label": "Address line 2",
+          "required": false,
+          "example": "Bristol BS7 4CV",
+          "description": "Second line of the recipient's address, such as town and postcode."
+        },
+        {
+          "key": "subject",
+          "label": "Subject",
+          "required": false,
+          "example": "Your membership renewal",
+          "description": "A one-line subject, printed in bold above the greeting."
+        }
+      ]
+    },
+    {
+      "key": "donation_receipt",
+      "name": "Donation receipt",
+      "description": "A one-page receipt that thanks the donor and records the gift: amount, date received, receipt number, and the organisation's name, address and tax ID.",
+      "page": "letter",
+      "orientation": "portrait",
+      "slug": "donation-receipt",
+      "guide_url": "https://sheetrender.com/templates/donation-receipt",
+      "preview_url": "https://sheetrender.com/api/v1/builtin-templates/donation_receipt/preview.png",
+      "fields": [
+        {
+          "key": "donor_name",
+          "label": "Donor name",
+          "required": true,
+          "example": "Anneke Vandermolen",
+          "description": "The person or organisation who gave."
+        },
+        {
+          "key": "amount",
+          "label": "Amount",
+          "required": true,
+          "example": "$1,250.00",
+          "description": "The amount received, with its currency symbol (\"$1,250.00\"). A bare number prints with two decimals and no symbol."
+        },
+        {
+          "key": "date",
+          "label": "Date received",
+          "required": true,
+          "example": "2025-11-14",
+          "description": "When the gift was received. A YYYY-MM-DD date is written out in full (November 14, 2025); any other text prints as given."
+        },
+        {
+          "key": "receipt_number",
+          "label": "Receipt number",
+          "required": false,
+          "example": "2025-1041",
+          "description": "Your reference for this receipt."
+        },
+        {
+          "key": "organisation",
+          "label": "Organisation",
+          "required": false,
+          "example": "Rowan Field Trust",
+          "description": "The organisation that received the gift, printed at the top."
+        },
+        {
+          "key": "address",
+          "label": "Organisation address",
+          "required": false,
+          "example": "112 Calder Lane, Corvallis OR 97330",
+          "description": "The organisation's address, under its name. Line breaks are kept."
+        },
+        {
+          "key": "tax_id",
+          "label": "Tax ID",
+          "required": false,
+          "example": "12-3456789",
+          "description": "The organisation's tax ID or charity registration number."
+        },
+        {
+          "key": "notes",
+          "label": "Notes",
+          "required": false,
+          "example": "No goods or services were provided in exchange for this gift.",
+          "description": "A statement printed under the gift, such as whether anything was given in return."
+        }
+      ]
+    },
+    {
+      "key": "job_offer_letter",
+      "name": "Job offer letter",
+      "description": "A one-page offer letter: the role, start date, salary, manager and reply-by date set out as a short list of terms, with an acceptance block for the candidate to sign.",
+      "page": "letter",
+      "orientation": "portrait",
+      "slug": "job-offer-letter",
+      "guide_url": "https://sheetrender.com/templates/job-offer-letter",
+      "preview_url": "https://sheetrender.com/api/v1/builtin-templates/job_offer_letter/preview.png",
+      "fields": [
+        {
+          "key": "candidate_name",
+          "label": "Candidate name",
+          "required": true,
+          "example": "Mariam Sadeghi",
+          "description": "The person being offered the job. Used in the address block, the greeting and the acceptance signature line."
+        },
+        {
+          "key": "role",
+          "label": "Role",
+          "required": true,
+          "example": "Firmware Engineer",
+          "description": "The job title being offered."
+        },
+        {
+          "key": "start_date",
+          "label": "Start date",
+          "required": true,
+          "example": "2026-09-14",
+          "description": "The first day of work. A YYYY-MM-DD date is written out in full (September 14, 2026); any other text prints as given."
+        },
+        {
+          "key": "salary",
+          "label": "Salary",
+          "required": false,
+          "example": "$118,000 per year",
+          "description": "The pay, as it should read (\"$118,000 per year\"). A bare number prints with thousands separators and no symbol."
+        },
+        {
+          "key": "manager_name",
+          "label": "Manager name",
+          "required": false,
+          "example": "Farida Okpara",
+          "description": "Who the candidate will report to. Also signs the letter."
+        },
+        {
+          "key": "company",
+          "label": "Company",
+          "required": false,
+          "example": "Larkfield Instruments",
+          "description": "The employer, printed at the top and in the offer sentence."
+        },
+        {
+          "key": "address_line_1",
+          "label": "Candidate address",
+          "required": false,
+          "example": "118 Alder Court, Portland, OR 97214",
+          "description": "The candidate's address, on one line under their name."
+        },
+        {
+          "key": "reply_by",
+          "label": "Reply by",
+          "required": false,
+          "example": "2026-08-28",
+          "description": "The date the candidate should accept by. A YYYY-MM-DD date is written out in full; any other text prints as given."
+        }
+      ]
+    }
+  ],
+  "limits": {
+    "rows_per_render": 25,
+    "documents_per_month": 50,
+    "rows_per_handoff": 100,
+    "handoffs_per_day": 10,
+    "cell_max_chars": 2000,
+    "cell_max_bytes": 2048,
+    "title_max_chars": 120,
+    "handoff_payload_max_bytes": 262144
+  }
+}

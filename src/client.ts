@@ -104,6 +104,84 @@ export interface DesignInput {
     data?: { filename: string; bytes: Uint8Array };
 }
 
+/** One field of a built-in template, from `GET /api/v1/builtin-templates`. */
+export interface BuiltinTemplateField {
+    key: string;
+    label?: string;
+    required?: boolean;
+    example?: string | number | boolean | null;
+    /** How the template prints the value, written for whoever fills it in. */
+    description?: string;
+}
+
+/** One built-in template from the public catalogue. Fields past these are ignored. */
+export interface BuiltinTemplate {
+    key: string;
+    name?: string;
+    description?: string;
+    page?: string;
+    orientation?: string;
+    /** The public template page's slug, e.g. `certificate-of-completion`. */
+    slug?: string;
+    guide_url?: string;
+    fields?: BuiltinTemplateField[];
+}
+
+/** A scalar spreadsheet cell, the only value the anonymous routes accept. */
+export type Cell = string | number | boolean | null;
+
+export interface BuiltinRenderInput {
+    rows: Record<string, Cell>[];
+    title?: string;
+    /** `sub:<sha256>` or `ip:<sha256>`: who the monthly document volume is counted against. */
+    subject: string;
+    /** `chatgpt`, `claude` or `other`, for the backend's usage counters. */
+    source: string;
+}
+
+export interface BuiltinRenderDocument {
+    row_index: number;
+    label?: string | null;
+    preview_png_url?: string | null;
+    pdf_url?: string | null;
+}
+
+export interface DocumentVolume {
+    used: number;
+    limit: number;
+    resets_at: string | null;
+}
+
+/**
+ * Body of `POST /api/v1/builtin-templates/{key}/render`. The volume object is
+ * read from whichever of `volume`, `monthly_volume` or `daily_volume` the
+ * backend sends: the plan named it `daily_volume` before the window became a
+ * month, and the server here should not break over the rename.
+ */
+export interface BuiltinRenderResult {
+    render_id?: string;
+    documents?: BuiltinRenderDocument[];
+    missing_fields?: { row_index: number; fields: string[] }[];
+    volume?: DocumentVolume;
+    monthly_volume?: DocumentVolume;
+    daily_volume?: DocumentVolume;
+    expires_at?: string | null;
+}
+
+export interface HandoffInput {
+    template: string;
+    rows: Record<string, Cell>[];
+    title?: string;
+    subject: string;
+    source: string;
+}
+
+export interface HandoffResult {
+    token: string;
+    continue_url?: string;
+    expires_at?: string | null;
+}
+
 export interface Margins {
     top?: number;
     right?: number;
@@ -605,6 +683,66 @@ export class SheetRenderClient {
         }
         if (pollError) throw pollError;
         return design;
+    }
+
+    /**
+     * GET /api/v1/builtin-templates — the public catalogue of built-in
+     * templates. Accepts either a bare array or `{templates: [...]}`.
+     */
+    async listBuiltinTemplates(): Promise<BuiltinTemplate[]> {
+        const body = await this.#json<unknown>({
+            method: "GET",
+            path: "/api/v1/builtin-templates",
+            what: "Listing document templates",
+            accept: "json",
+        });
+        const list = Array.isArray(body)
+            ? body
+            : body && typeof body === "object" && Array.isArray((body as { templates?: unknown }).templates)
+            ? (body as { templates: unknown[] }).templates
+            : undefined;
+        if (!list) {
+            throw new SheetRenderError("Listing document templates failed: the server returned an unexpected body.");
+        }
+        return list.filter((item): item is BuiltinTemplate =>
+            Boolean(item) && typeof item === "object" && typeof (item as { key?: unknown }).key === "string"
+        );
+    }
+
+    /** POST /api/v1/builtin-templates/{key}/render — rows in, previews and PDF links out. */
+    renderBuiltin(key: string, input: BuiltinRenderInput): Promise<BuiltinRenderResult> {
+        const body: Record<string, unknown> = {
+            rows: input.rows,
+            subject: input.subject,
+            source: input.source,
+        };
+        if (input.title !== undefined) body.title = input.title;
+        return this.#json<BuiltinRenderResult>({
+            method: "POST",
+            path: `/api/v1/builtin-templates/${encodeURIComponent(key)}/render`,
+            what: "Rendering documents",
+            body,
+            accept: "json",
+            timeoutMs: RENDER_TIMEOUT_MS,
+        });
+    }
+
+    /** POST /api/v1/handoffs — store rows for the template page, 7 days. */
+    createHandoff(input: HandoffInput): Promise<HandoffResult> {
+        const body: Record<string, unknown> = {
+            template: input.template,
+            rows: input.rows,
+            subject: input.subject,
+            source: input.source,
+        };
+        if (input.title !== undefined) body.title = input.title;
+        return this.#json<HandoffResult>({
+            method: "POST",
+            path: "/api/v1/handoffs",
+            what: "Creating the continue link",
+            body,
+            accept: "json",
+        });
     }
 
     /** POST /api/v1/jobs — queue a batch render over a dataset. */

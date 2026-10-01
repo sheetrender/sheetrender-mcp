@@ -116,6 +116,27 @@ export function buildInlinePdfResult(label: string, bytes: Uint8Array): CallTool
     };
 }
 
+/**
+ * A tool result carrying `structuredContent` alongside its text.
+ *
+ * The text is what a model reads; the structured object is what an MCP Apps
+ * view (and a host that renders structured output) reads. `_meta` on a result
+ * reaches the view only, never the model, so nothing the model needs goes
+ * there.
+ */
+export function structuredResult(
+    text: string,
+    structured: Record<string, unknown>,
+    meta?: Record<string, unknown>,
+): CallToolResult {
+    const result: CallToolResult = {
+        content: [{ type: "text", text }],
+        structuredContent: structured,
+    };
+    if (meta) result._meta = meta;
+    return result;
+}
+
 export function formatBytes(byteLength: number): string {
     if (byteLength < 1024) return `${byteLength} bytes`;
     if (byteLength < 1024 * 1024) return `${(byteLength / 1024).toFixed(1)} KB`;

@@ -1,0 +1,16 @@
+{
+  // The MCP Apps view (src/widget/), which runs in the host's sandboxed iframe.
+  // Type-check only: scripts/build-widget.mjs bundles it with esbuild into
+  // dist/widget/documents.js, which the server inlines into the view's HTML.
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": [],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true
+  },
+  "include": ["src/widget"]
+}

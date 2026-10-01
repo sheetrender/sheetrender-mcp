@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
-import { createServer as createNodeServer, type Server } from "node:http";
+import { createHash } from "node:crypto";
+import { createServer as createNodeServer, type IncomingMessage, type Server } from "node:http";
 import { connect as connectSocket, type AddressInfo } from "node:net";
 import { afterEach, describe, it } from "node:test";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { ClientRequestSchema, JSONRPCRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 
-import { bearerToken, createHttpServer, keyFingerprint, type LogEntry } from "../src/http.js";
+import { bearerToken, clientIp, createHttpServer, keyFingerprint, loadHttpConfig, type LogEntry } from "../src/http.js";
 
 const closers: Array<() => Promise<void>> = [];
 
@@ -55,7 +57,7 @@ async function fakeBackend(): Promise<{ url: string; authHeaders: string[] }> {
 
 async function startMcp(
     apiUrl: string,
-    extra: { maxBodyBytes?: number } = {},
+    extra: { maxBodyBytes?: number; openaiAppsChallenge?: string } = {},
 ): Promise<{ url: string; logs: LogEntry[] }> {
     const logs: LogEntry[] = [];
     const server = createHttpServer({ apiUrl, log: (entry) => logs.push(entry), ...extra });
@@ -337,5 +339,337 @@ describe("MCP over HTTP", () => {
         const { url } = await startMcp("http://127.0.0.1:1");
         const response = await fetch(`${url}/`);
         assert.equal(response.status, 404);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Anonymous mode (SHEETRENDER_DEMO_API_KEY)
+// ---------------------------------------------------------------------------
+
+/**
+ * A stand-in for the built-in template routes. Records each call's path,
+ * Authorization header and JSON body.
+ */
+async function fakeBuiltinBackend(): Promise<{ url: string; calls: { path: string; auth: string; body: unknown }[] }> {
+    const calls: { path: string; auth: string; body: unknown }[] = [];
+    const server = createNodeServer((req, res) => {
+        let raw = "";
+        req.on("data", (chunk) => raw += chunk);
+        req.on("end", () => {
+            calls.push({ path: req.url ?? "", auth: req.headers.authorization ?? "<none>", body: raw ? JSON.parse(raw) : undefined });
+            res.writeHead(200, { "Content-Type": "application/json" });
+            if (req.url === "/api/v1/builtin-templates") {
+                res.end(JSON.stringify({ templates: [{ key: "letter", name: "Letter", fields: [] }] }));
+            } else if (req.url === "/api/v1/builtin-templates/letter/render") {
+                res.end(JSON.stringify({
+                    documents: [{ row_index: 0, label: "A", preview_png_url: "/api/previews/x/0.png", pdf_url: "/api/previews/x/0.pdf" }],
+                    missing_fields: [],
+                    volume: { used: 1, limit: 50, resets_at: "2026-11-01T00:00:00Z" },
+                    expires_at: "2026-10-01T14:00:00Z",
+                }));
+            } else {
+                res.writeHead(404);
+                res.end(JSON.stringify({ detail: "Not Found" }));
+            }
+        });
+    });
+    const url = await listen(server);
+    closers.push(() => closeServer(server));
+    return { url, calls };
+}
+
+async function startAnon(
+    apiUrl: string,
+    extra: Partial<Parameters<typeof createHttpServer>[0]> = {},
+): Promise<{ url: string; logs: LogEntry[] }> {
+    const logs: LogEntry[] = [];
+    const server = createHttpServer({
+        apiUrl,
+        log: (entry) => logs.push(entry),
+        demoApiKey: "sr_live_demo",
+        publicUrl: "https://mcp.sheetrender.test/mcp",
+        ...extra,
+    });
+    const url = await listen(server);
+    closers.push(() => closeServer(server));
+    return { url, logs };
+}
+
+async function connectAnon(mcpUrl: string, headers: Record<string, string> = {}): Promise<Client> {
+    const transport = new StreamableHTTPClientTransport(new URL(`${mcpUrl}/mcp`), { requestInit: { headers } });
+    const client = new Client({ name: "test", version: "0" });
+    await client.connect(transport);
+    closers.push(() => client.close());
+    return client;
+}
+
+/** One raw JSON-RPC call, answered as JSON or a single SSE event. */
+async function rawRpc(mcpUrl: string, body: unknown, headers: Record<string, string> = {}): Promise<{ status: number; json: unknown }> {
+    // These fixtures test routing and limits, so protocol validation must not
+    // reject them before the intended handler. Malformed-message tests use fetch.
+    assert.doesNotThrow(() => JSONRPCRequestSchema.parse(body), "rawRpc fixture must be valid JSON-RPC");
+    assert.doesNotThrow(() => ClientRequestSchema.parse(body), "rawRpc fixture must be a valid MCP request");
+    const response = await fetch(`${mcpUrl}/mcp`, {
+        method: "POST",
+        headers: { ...MCP_HEADERS, ...headers },
+        body: JSON.stringify(body),
+    });
+    const text = await response.text();
+    const data = text.startsWith("{") ? text : text.split("\n").find((line) => line.startsWith("data: "))?.slice(6) ?? "null";
+    return { status: response.status, json: JSON.parse(data) };
+}
+
+describe("anonymous mode", () => {
+    it("cannot cross tool registries in either direction, even with a forged metadata key", async () => {
+        const backend = await fakeBuiltinBackend();
+        const { url } = await startAnon(backend.url);
+        for (const [name, headers] of [
+            ["render_pdf", {}],
+            ["render_documents", { Authorization: "Bearer sr_test_user" }],
+        ] as const) {
+            const { status, json } = await rawRpc(url, {
+                jsonrpc: "2.0", id: 1, method: "tools/call",
+                params: { name, arguments: { html: "<p>x</p>", template: "letter", rows: [{ body: "x" }] },
+                    _meta: { authorization: "Bearer sr_test_user" } },
+            }, headers);
+            assert.equal(status, 200);
+            const result = (json as { result: { isError?: boolean; content: { text: string }[] } }).result;
+            assert.equal(result.isError, true);
+            assert.ok(result.content.some((item) => item.text.includes(`Tool ${name} not found`)));
+        }
+        assert.deepEqual(backend.calls, []);
+    });
+    it("serves the three anonymous tools to a caller without a key", async () => {
+        const backend = await fakeBuiltinBackend();
+        const { url } = await startAnon(backend.url);
+        const client = await connectAnon(url);
+        const { tools } = await client.listTools();
+        assert.deepEqual(tools.map((tool) => tool.name).sort(), [
+            "create_continue_link",
+            "list_document_templates",
+            "render_documents",
+        ]);
+    });
+
+    it("keeps the API-key tools, unchanged, for a caller that sends a key", async () => {
+        const backend = await fakeBackend();
+        const { url } = await startAnon(backend.url);
+        const client = await connect(url, "sr_test_keyed");
+        const names = (await client.listTools()).tools.map((tool) => tool.name);
+        assert.ok(names.includes("render_pdf"));
+        assert.ok(!names.includes("render_documents"));
+        await client.callTool({ name: "list_templates", arguments: {} });
+        assert.deepEqual(backend.authHeaders, ["Bearer sr_test_keyed"]);
+    });
+
+    it("still answers 401 to a malformed key, and to no key when no demo key is set", async () => {
+        const anon = await startAnon("http://127.0.0.1:1");
+        for (const authorization of ["Bearer junk", "", "Basic sr_test_key", "Bearer"]) {
+            const malformed = await fetch(`${anon.url}/mcp`, {
+                method: "POST",
+                headers: { ...MCP_HEADERS, Authorization: authorization },
+                body: INITIALIZE,
+            });
+            assert.equal(malformed.status, 401, authorization);
+        }
+        const plain = await startMcp("http://127.0.0.1:1");
+        const none = await fetch(`${plain.url}/mcp`, { method: "POST", headers: MCP_HEADERS, body: INITIALIZE });
+        assert.equal(none.status, 401);
+    });
+
+    it("renders with the demo key, a hashed subject, and logs no rows or raw subject", async () => {
+        const backend = await fakeBuiltinBackend();
+        const { url, logs } = await startAnon(backend.url);
+        const { status, json } = await rawRpc(url, {
+            jsonrpc: "2.0",
+            id: 7,
+            method: "tools/call",
+            params: {
+                name: "render_documents",
+                arguments: { template: "letter", rows: [{ recipient_name: "Ada Secret", body: "Hi" }] },
+                _meta: { "openai/subject": "subject-xyz" },
+            },
+        });
+        assert.equal(status, 200);
+        const result = (json as { result: { structuredContent: { rows_rendered: number; documents: { pdf_url: string }[] } } }).result;
+        assert.equal(result.structuredContent.rows_rendered, 1);
+        assert.equal(result.structuredContent.documents[0]!.pdf_url, `${backend.url}/api/previews/x/0.pdf`);
+
+        const render = backend.calls.find((call) => call.path === "/api/v1/builtin-templates/letter/render")!;
+        assert.equal(render.auth, "Bearer sr_live_demo");
+        const sent = render.body as { subject: string; source: string };
+        assert.equal(sent.subject, `sub:${createHash("sha256").update("subject-xyz").digest("hex")}`);
+        assert.equal(sent.source, "chatgpt");
+
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        const entry = logs.find((line) => line.msg === "request" && line.tool === "render_documents");
+        assert.ok(entry, JSON.stringify(logs));
+        assert.equal(entry.anonymous, true);
+        assert.equal(entry.source, "chatgpt");
+        assert.equal(entry.rows, 1);
+        assert.equal(entry.subject_fp, createHash("sha256").update("subject-xyz").digest("hex").slice(0, 12));
+        assert.equal("key_fp" in entry, false);
+        const logged = JSON.stringify(logs);
+        assert.equal(logged.includes("Ada Secret"), false);
+        assert.equal(logged.includes("subject-xyz"), false);
+        assert.equal(logged.includes("sr_live_demo"), false);
+    });
+
+    it("lists securitySchemes at the top level of each tool too, where ChatGPT reads it", async () => {
+        const { url } = await startAnon("http://127.0.0.1:1");
+        const { json } = await rawRpc(url, { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} });
+        const tools = (json as { result: { tools: { name: string; securitySchemes?: unknown }[] } }).result.tools;
+        assert.equal(tools.length, 3);
+        for (const tool of tools) assert.deepEqual(tool.securitySchemes, [{ type: "noauth" }], tool.name);
+    });
+
+    it("limits by the forwarded client IP when there is no subject", async () => {
+        const backend = await fakeBuiltinBackend();
+        const { url } = await startAnon(backend.url, { anonCallsPerHour: 1 });
+        const call = (forwardedFor: string) => rawRpc(url, {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "tools/call",
+            params: { name: "render_documents", arguments: { template: "letter", rows: [{ body: "x" }] } },
+        }, { "X-Forwarded-For": forwardedFor });
+        type Result = { result: { isError?: boolean } };
+        assert.equal(((await call("198.51.100.1")).json as Result).result.isError, undefined);
+        assert.equal(((await call("198.51.100.1")).json as Result).result.isError, true);
+        // The proxy appends the real peer last; a spoofed left-hand entry changes nothing.
+        assert.equal(((await call("10.9.9.9, 198.51.100.1")).json as Result).result.isError, true);
+        assert.equal(((await call("198.51.100.2")).json as Result).result.isError, undefined);
+        const renders = backend.calls.filter((c) => c.path.endsWith("/render"));
+        assert.deepEqual(
+            renders.map((c) => (c.body as { subject: string }).subject),
+            [
+                `ip:${createHash("sha256").update("198.51.100.1").digest("hex")}`,
+                `ip:${createHash("sha256").update("198.51.100.2").digest("hex")}`,
+            ],
+        );
+    });
+
+    it("shares the configurable Claude range bucket without changing other callers", async () => {
+        const backend = await fakeBuiltinBackend();
+        const { url } = await startAnon(backend.url, { anonCallsPerHour: 1, claudeCallsPerHour: 2 });
+        const call = (ip: string, meta?: Record<string, unknown>) => rawRpc(url, {
+            jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+                name: "render_documents", arguments: { template: "letter", rows: [{ body: "x" }] }, _meta: meta,
+            },
+        }, { "X-Forwarded-For": ip, "User-Agent": "Claude-User" });
+        const failed = async (ip: string, meta?: Record<string, unknown>) =>
+            ((await call(ip, meta)).json as { result: { isError?: boolean } }).result.isError;
+        assert.equal(await failed("160.79.104.1"), undefined);
+        assert.equal(await failed("160.79.111.255"), undefined);
+        assert.equal(await failed("160.79.105.9"), true);
+        assert.equal(await failed("160.79.104.1", { "openai/subject": "chatgpt-user" }), undefined);
+        assert.equal(await failed("160.79.104.1", { "openai/subject": "chatgpt-user" }), true);
+        // A Claude User-Agent outside the verified range cannot claim its budget.
+        assert.equal(await failed("203.0.113.8"), undefined);
+        assert.equal(await failed("203.0.113.8"), true);
+    });
+
+    it("caps anonymous HTTP bodies at 256 KB while preserving the API-key body cap", async () => {
+        const limit = 256 * 1024;
+        const paddedRequest = (bytes: number) => {
+            // Extension metadata is permitted; unknown JSON-RPC envelope keys
+            // are rejected by the SDK before tools/list can answer.
+            const body = { jsonrpc: "2.0", id: 1, method: "tools/list", params: { _meta: { "test/padding": "" } } };
+            body.params._meta["test/padding"] = "x".repeat(bytes - Buffer.byteLength(JSON.stringify(body)));
+            assert.equal(Buffer.byteLength(JSON.stringify(body)), bytes);
+            return body;
+        };
+        const atLimit = paddedRequest(limit);
+        const overLimit = paddedRequest(limit + 1);
+        const { url } = await startAnon("http://127.0.0.1:1");
+        const accepted = await rawRpc(url, atLimit);
+        assert.equal(accepted.status, 200);
+        assert.ok((accepted.json as { result: { tools: { name: string }[] } }).result.tools.some((tool) => tool.name === "render_documents"));
+        assert.equal((await rawRpc(url, overLimit)).status, 413);
+        const keyed = await rawRpc(url, overLimit, { Authorization: "Bearer sr_test_key" });
+        assert.equal(keyed.status, 200);
+        const names = (keyed.json as { result: { tools: { name: string }[] } }).result.tools.map((tool) => tool.name);
+        assert.ok(names.includes("render_pdf"));
+        assert.ok(!names.includes("render_documents"));
+    });
+
+    it("keeps reflected credentials out of errors, logs, tool replies and widget HTML", async () => {
+        const backend = createNodeServer((_req, res) => {
+            res.writeHead(422, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ detail: "Authorization: Bearer sr_live_demo, private rows, invalid input" }));
+        });
+        const apiUrl = await listen(backend);
+        closers.push(() => closeServer(backend));
+        const { url, logs } = await startAnon(apiUrl);
+        const { json } = await rawRpc(url, {
+            jsonrpc: "2.0", id: 1, method: "tools/call",
+            params: { name: "render_documents", arguments: { template: "letter", rows: [{ body: "x" }] } },
+        });
+        const client = await connectAnon(url);
+        const widget = await client.readResource({ uri: "ui://sheetrender/documents.html" });
+        assert.doesNotMatch(JSON.stringify({ json, logs, widget }), /sr_live_demo|private rows|Authorization: Bearer/);
+        assert.equal((json as { result: { isError: boolean } }).result.isError, true);
+    });
+});
+
+describe("client IP trust boundary", () => {
+    const request = (peer: string, xff?: string | string[]) => ({
+        socket: { remoteAddress: peer }, headers: { "x-forwarded-for": xff },
+    }) as unknown as IncomingMessage;
+
+    it("ignores forwarded addresses from public peers and trusts only the private proxy's final valid IP", () => {
+        assert.equal(clientIp(request("203.0.113.4", "160.79.104.1")), "203.0.113.4");
+        assert.equal(clientIp(request("::ffff:203.0.113.4", "160.79.104.1")), "::ffff:203.0.113.4");
+        assert.equal(clientIp(request("172.18.0.2", "160.79.104.1, 198.51.100.1")), "198.51.100.1");
+        assert.equal(clientIp(request("::ffff:172.18.0.2", ["1.2.3.4", "1.2.3.5, 198.51.100.2"])), "198.51.100.2");
+        assert.equal(clientIp(request("fd00::1", "2001:db8::1")), "2001:db8::1");
+        assert.equal(clientIp(request("172.18.0.2", "160.79.104.1, ")), "172.18.0.2");
+        assert.equal(clientIp(request("172.18.0.2", "160.79.104.1, not-an-ip")), "172.18.0.2");
+        assert.equal(clientIp(request("172.18.0.2", "160.79.104.999")), "172.18.0.2");
+        assert.equal(clientIp(request("172.18.0.2", "::ffff:160.79.104.1")), "160.79.104.1");
+    });
+});
+
+describe("openai-apps-challenge", () => {
+    it("serves the configured token as plain text", async () => {
+        const { url } = await startMcp("http://127.0.0.1:1", { openaiAppsChallenge: "challenge-token-123" });
+        const response = await fetch(`${url}/.well-known/openai-apps-challenge`);
+        assert.equal(response.status, 200);
+        assert.match(response.headers.get("content-type") ?? "", /^text\/plain/);
+        assert.equal(await response.text(), "challenge-token-123");
+        assert.equal(response.headers.get("cache-control"), "no-store");
+        const head = await fetch(`${url}/.well-known/openai-apps-challenge`, { method: "HEAD" });
+        assert.equal(head.status, 200);
+        assert.equal(await head.text(), "");
+        const post = await fetch(`${url}/.well-known/openai-apps-challenge`, { method: "POST" });
+        assert.equal(post.status, 405);
+    });
+
+    it("404s when no token is configured", async () => {
+        const { url } = await startMcp("http://127.0.0.1:1");
+        const response = await fetch(`${url}/.well-known/openai-apps-challenge`);
+        assert.equal(response.status, 404);
+    });
+});
+
+describe("loadHttpConfig", () => {
+    it("reads the anonymous-mode settings and refuses a demo key that is not an API key", () => {
+        const config = loadHttpConfig({
+            SHEETRENDER_DEMO_API_KEY: "sr_live_demo",
+            MCP_PUBLIC_URL: "https://mcp.sheetrender.com/mcp",
+            OPENAI_APPS_CHALLENGE: " tok ",
+        } as NodeJS.ProcessEnv);
+        assert.equal(config.demoApiKey, "sr_live_demo");
+        assert.equal(config.publicUrl, "https://mcp.sheetrender.com/mcp");
+        assert.equal(config.openaiAppsChallenge, "tok");
+        assert.equal(config.anonCallsPerHour, 30);
+        assert.equal(config.claudeCallsPerHour, 3000);
+        assert.equal(loadHttpConfig({ CLAUDE_CALLS_PER_HOUR: "6000" }).claudeCallsPerHour, 6000);
+        for (const value of ["0", "-1", "1.5", "not a number"]) {
+            assert.throws(() => loadHttpConfig({ CLAUDE_CALLS_PER_HOUR: value }), /CLAUDE_CALLS_PER_HOUR/);
+        }
+        const off = loadHttpConfig({} as NodeJS.ProcessEnv);
+        assert.equal(off.demoApiKey, undefined);
+        assert.throws(() => loadHttpConfig({ SHEETRENDER_DEMO_API_KEY: "nope" } as NodeJS.ProcessEnv), /sr_/);
+        assert.throws(() => loadHttpConfig({ MCP_PUBLIC_URL: "not a url" } as NodeJS.ProcessEnv), /MCP_PUBLIC_URL/);
     });
 });

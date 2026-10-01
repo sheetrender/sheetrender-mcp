@@ -10,16 +10,35 @@
  * never leak across tenants and any replica can answer any request. The cost
  * is re-registering the tools on every request, which is microseconds.
  *
+ * With SHEETRENDER_DEMO_API_KEY set, a request with no Authorization header
+ * at all gets the anonymous tool set instead (anon.ts): three tools that fill
+ * the built-in templates through the demo account. That is what the ChatGPT
+ * and Claude directory listings connect to. A request that does send a key
+ * gets exactly the API-key tools, as before.
+ *
  * The stdio server in index.ts is untouched by this file.
  */
 
 import { createHash } from "node:crypto";
 import { createServer as createNodeServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { isIP } from "node:net";
 
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
+import {
+    CatalogueCache,
+    createAnonServer,
+    DEFAULT_CALLS_PER_HOUR,
+    DEFAULT_CLAUDE_CALLS_PER_HOUR,
+    detectSource,
+    openaiSubject,
+    MAX_HANDOFF_BYTES,
+    SlidingWindowLimiter,
+    subjectFingerprint,
+} from "./anon.js";
 import { DEFAULT_API_URL, parseApiUrl, SheetRenderClient, SheetRenderError } from "./client.js";
 import { createServer, runningAsExecutable, SERVER_VERSION } from "./index.js";
+import { loadWidgetBundle } from "./widget-resource.js";
 
 const DEFAULT_PORT = 8080;
 const DEFAULT_HOST = "0.0.0.0";
@@ -41,6 +60,21 @@ export interface HttpServerOptions {
     idleTimeoutMs?: number;
     /** Receives one structured entry per request and per error. */
     log?: (entry: LogEntry) => void;
+    /**
+     * The demo account's API key. When set, requests without an Authorization
+     * header get the anonymous tools; when unset they get a 401, as before.
+     */
+    demoApiKey?: string;
+    /** The URL users paste for this server, e.g. https://mcp.sheetrender.com/mcp. */
+    publicUrl?: string;
+    /** Served at /.well-known/openai-apps-challenge for OpenAI's domain check. */
+    openaiAppsChallenge?: string;
+    /** Anonymous flood guard: tool calls per subject per hour. */
+    anonCallsPerHour?: number;
+    /** Shared hourly budget for subjectless traffic from 160.79.104.0/21. */
+    claudeCallsPerHour?: number;
+    /** Clock for the flood guard and catalogue cache; tests replace it. */
+    now?: () => number;
 }
 
 export type LogEntry = Record<string, unknown> & { level: "info" | "warn" | "error"; msg: string };
@@ -51,6 +85,11 @@ export interface HttpConfig {
     apiUrl: string;
     maxBodyBytes: number;
     idleTimeoutMs: number;
+    demoApiKey?: string;
+    publicUrl?: string;
+    openaiAppsChallenge?: string;
+    anonCallsPerHour: number;
+    claudeCallsPerHour: number;
 }
 
 /** Reads the hosted server's configuration from the environment. */
@@ -63,7 +102,40 @@ export function loadHttpConfig(env: NodeJS.ProcessEnv = process.env): HttpConfig
         apiUrl: parseApiUrl(env.SHEETRENDER_API_URL?.trim() || DEFAULT_API_URL),
         maxBodyBytes: readInteger(env, "MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES, 1024),
         idleTimeoutMs: readInteger(env, "IDLE_TIMEOUT_MS", DEFAULT_IDLE_TIMEOUT_MS, 1000),
+        demoApiKey: readDemoKey(env),
+        publicUrl: readPublicUrl(env),
+        openaiAppsChallenge: env.OPENAI_APPS_CHALLENGE?.trim() || undefined,
+        anonCallsPerHour: readInteger(env, "ANON_CALLS_PER_HOUR", DEFAULT_CALLS_PER_HOUR, 1),
+        claudeCallsPerHour: readInteger(env, "CLAUDE_CALLS_PER_HOUR", DEFAULT_CLAUDE_CALLS_PER_HOUR, 1),
     };
+}
+
+function readDemoKey(env: NodeJS.ProcessEnv): string | undefined {
+    const key = env.SHEETRENDER_DEMO_API_KEY?.trim();
+    if (!key) return undefined;
+    if (!key.startsWith(API_KEY_PREFIX)) {
+        throw new SheetRenderError("SHEETRENDER_DEMO_API_KEY must be a SheetRender API key (sr_...)");
+    }
+    return key;
+}
+
+/**
+ * MCP_PUBLIC_URL has to be byte for byte the URL users paste: Claude hashes it
+ * into the view's sandbox origin. It is validated, not normalised.
+ */
+function readPublicUrl(env: NodeJS.ProcessEnv): string | undefined {
+    const raw = env.MCP_PUBLIC_URL?.trim();
+    if (!raw) return undefined;
+    let url: URL;
+    try {
+        url = new URL(raw);
+    } catch {
+        throw new SheetRenderError(`MCP_PUBLIC_URL is not a valid URL: ${raw}`);
+    }
+    if (url.protocol !== "https:" && url.protocol !== "http:") {
+        throw new SheetRenderError(`MCP_PUBLIC_URL must be an http(s) URL, got ${raw}`);
+    }
+    return raw;
 }
 
 function readInteger(
@@ -168,6 +240,52 @@ function describeRpc(body: unknown): { rpc?: string; tool?: string } {
     return { rpc, tool };
 }
 
+/**
+ * The anonymous call's log fields: a subject fingerprint, the detected source
+ * and the row count. Never the subject itself and never a row.
+ */
+function describeAnonCall(body: unknown, userAgent: string | undefined): Record<string, unknown> {
+    const first = Array.isArray(body) ? body[0] : body;
+    if (!first || typeof first !== "object") return {};
+    const params = (first as { params?: { _meta?: unknown; arguments?: { rows?: unknown } } }).params;
+    const meta = params?._meta && typeof params._meta === "object"
+        ? params._meta as Record<string, unknown>
+        : undefined;
+    const fields: Record<string, unknown> = { source: detectSource(meta, userAgent) };
+    const subject = openaiSubject(meta);
+    if (subject) fields.subject_fp = subjectFingerprint(subject);
+    const rows = params?.arguments?.rows;
+    if (Array.isArray(rows)) fields.rows = rows.length;
+    return fields;
+}
+
+const PRIVATE_V4 = /^(10\.|127\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.)/;
+
+/** True for a peer address that can only be a proxy on our own network. */
+function isPrivateAddress(address: string): boolean {
+    const v4 = address.toLowerCase().startsWith("::ffff:") ? address.slice(7) : address;
+    if (isIP(v4) === 4) return PRIVATE_V4.test(v4);
+    return isIP(address) === 6 && (address === "::1" || /^f[cd]/i.test(address) || /^fe[89ab]/i.test(address));
+}
+
+/**
+ * The caller's IP. The socket peer, unless the peer is a private address (the
+ * reverse proxy in front of the container), in which case the right-most
+ * X-Forwarded-For entry — the one that proxy appended — is the caller.
+ * Entries further left are client-supplied and ignored.
+ */
+export function clientIp(req: IncomingMessage): string {
+    const peer = req.socket.remoteAddress ?? "";
+    if (!isPrivateAddress(peer)) return peer;
+    const header = req.headers["x-forwarded-for"];
+    const value = Array.isArray(header) ? header[header.length - 1] : header;
+    const last = value?.split(",").pop()?.trim();
+    // Do not fall back to an earlier, caller-supplied entry when the trusted
+    // proxy's final entry is empty or malformed.
+    const address = last && isIP(last) ? last : peer;
+    return address.toLowerCase().startsWith("::ffff:") ? address.slice(7) : address;
+}
+
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
@@ -176,8 +294,11 @@ function describeRpc(body: unknown): { rpc?: string; tool?: string } {
  * Builds the HTTP server without listening, so tests can bind it to port 0.
  *
  * Routes:
- *   GET  /healthz — liveness, no auth
- *   POST /mcp     — MCP over Streamable HTTP, bearer required
+ *   GET  /healthz                            — liveness, no auth
+ *   GET  /.well-known/openai-apps-challenge  — OpenAI's domain check token, 404 when unset
+ *   POST /mcp                                — MCP over Streamable HTTP; bearer required,
+ *                                              or none for the anonymous tools when a
+ *                                              demo key is configured
  *
  * Only POST reaches the transport. With no sessions there is nothing for a
  * GET (the standalone notification stream) or a DELETE (session teardown) to
@@ -190,6 +311,19 @@ export function createHttpServer(options: HttpServerOptions): Server {
     const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
     const idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
     const log = options.log ?? logJson;
+    const demoApiKey = options.demoApiKey;
+    const limiter = new SlidingWindowLimiter(
+        options.anonCallsPerHour ?? DEFAULT_CALLS_PER_HOUR,
+        60 * 60 * 1000,
+        options.now,
+    );
+    const claudeLimiter = new SlidingWindowLimiter(
+        options.claudeCallsPerHour ?? DEFAULT_CLAUDE_CALLS_PER_HOUR,
+        60 * 60 * 1000,
+        options.now,
+        1,
+    );
+    const catalogue = new CatalogueCache(undefined, options.now);
 
     const server = createNodeServer((req, res) => {
         const started = process.hrtime.bigint();
@@ -220,7 +354,8 @@ export function createHttpServer(options: HttpServerOptions): Server {
         fields.path = url.pathname;
 
         handle(req, res, url, method, fields).catch((error: unknown) => {
-            log({ level: "error", msg: "unhandled request error", ...fields, error: String(error) });
+            log({ level: "error", msg: "unhandled request error", ...fields,
+                error: fields.anonymous ? "Anonymous request failed" : String(error) });
             if (!res.headersSent) sendRpcError(res, 500, -32603, "Internal server error");
             else res.end();
         });
@@ -242,6 +377,20 @@ export function createHttpServer(options: HttpServerOptions): Server {
             return;
         }
 
+        if (url.pathname === "/.well-known/openai-apps-challenge") {
+            if (method !== "GET" && method !== "HEAD") {
+                sendJson(res, 405, { error: "method not allowed" }, { Allow: "GET, HEAD" });
+                return;
+            }
+            if (!options.openaiAppsChallenge) {
+                sendJson(res, 404, { error: "not found" });
+                return;
+            }
+            res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" });
+            res.end(method === "HEAD" ? undefined : options.openaiAppsChallenge);
+            return;
+        }
+
         if (url.pathname !== "/mcp") {
             sendJson(res, 404, { error: "not found" });
             return;
@@ -256,7 +405,11 @@ export function createHttpServer(options: HttpServerOptions): Server {
         // the SheetRender API can say whether a key is valid, and it does so
         // on the first tool call; the prefix check keeps a caller with no key
         // at all from making the process read and parse a body.
-        const apiKey = bearerToken(req.headers.authorization);
+        // No Authorization header at all, and a demo key to serve it with: the
+        // anonymous tools. A header that is present but wrong is still a 401,
+        // so a client that meant to send a key learns it is broken.
+        const anonymous = req.headers.authorization === undefined && demoApiKey !== undefined;
+        const apiKey = anonymous ? demoApiKey : bearerToken(req.headers.authorization);
         if (!apiKey?.startsWith(API_KEY_PREFIX)) {
             sendRpcError(
                 res,
@@ -268,16 +421,18 @@ export function createHttpServer(options: HttpServerOptions): Server {
             );
             return;
         }
-        fields.key_fp = keyFingerprint(apiKey);
+        if (anonymous) fields.anonymous = true;
+        else fields.key_fp = keyFingerprint(apiKey);
 
         let raw: Buffer;
         try {
-            raw = await readBody(req, maxBodyBytes);
+            raw = await readBody(req, anonymous ? Math.min(maxBodyBytes, MAX_HANDOFF_BYTES) : maxBodyBytes);
         } catch (error) {
             if (error instanceof BodyTooLarge) {
                 // `Connection: close` so the rest of the upload is dropped
                 // rather than drained once the response has been sent.
-                sendRpcError(res, 413, -32000, `Request body exceeds ${maxBodyBytes} bytes`, {
+                const limit = anonymous ? Math.min(maxBodyBytes, MAX_HANDOFF_BYTES) : maxBodyBytes;
+                sendRpcError(res, 413, -32000, `Request body exceeds ${limit} bytes`, {
                     Connection: "close",
                 });
                 return;
@@ -292,6 +447,8 @@ export function createHttpServer(options: HttpServerOptions): Server {
             return;
         }
         Object.assign(fields, describeRpc(parsedBody));
+        const userAgent = req.headers["user-agent"];
+        if (anonymous) Object.assign(fields, describeAnonCall(parsedBody, userAgent));
 
         // Aborted when the response closes, so a caller that disconnects mid
         // render does not leave the upstream request running to its timeout.
@@ -301,10 +458,21 @@ export function createHttpServer(options: HttpServerOptions): Server {
             apiKey,
             signal: disconnected.signal,
         });
-        const mcp = createServer(client, { hosted: true });
+        const mcp = anonymous
+            ? createAnonServer({
+                client,
+                limiter,
+                claudeLimiter,
+                catalogue,
+                clientIp: clientIp(req),
+                publicUrl: options.publicUrl,
+                demoApiKey,
+            })
+            : createServer(client, { hosted: true });
         const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
         transport.onerror = (error) => {
-            log({ level: "warn", msg: "transport error", ...fields, error: error.message });
+            log({ level: "warn", msg: "transport error", ...fields,
+                error: anonymous ? "Anonymous transport failed" : error.message });
         };
         res.on("close", () => {
             // Both are per-request; nothing else references them once the
@@ -342,6 +510,17 @@ async function main(): Promise<void> {
         process.exit(1);
     }
 
+    if (config.demoApiKey) {
+        // The anonymous tools' view is inlined from the built bundle; refuse
+        // to start without it rather than serve a broken view.
+        try {
+            loadWidgetBundle();
+        } catch (error) {
+            process.stderr.write(`sheetrender-mcp-http: ${error instanceof Error ? error.message : String(error)}\n`);
+            process.exit(1);
+        }
+    }
+
     const server = createHttpServer(config);
 
     let closing = false;
@@ -374,6 +553,11 @@ async function main(): Promise<void> {
         api_url: config.apiUrl,
         max_body_bytes: config.maxBodyBytes,
         idle_timeout_ms: config.idleTimeoutMs,
+        anonymous_tools: config.demoApiKey !== undefined,
+        public_url: config.publicUrl ?? null,
+        openai_apps_challenge: config.openaiAppsChallenge !== undefined,
+        anon_calls_per_hour: config.anonCallsPerHour,
+        claude_calls_per_hour: config.claudeCallsPerHour,
     });
 }
 
