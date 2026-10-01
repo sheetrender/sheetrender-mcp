@@ -13,7 +13,8 @@
  *
  * Input is rows of scalar cells only; the template HTML lives on the backend.
  * Nothing here calls a design (AI) endpoint. Each call is counted against the
- * caller's subject: ChatGPT's anonymised `openai/subject`, else the client IP.
+ * caller's subject: ChatGPT's anonymised `openai/subject` when the call comes
+ * from OpenAI's published egress ranges, else the client IP.
  * The flood guard here (calls per hour) sits in front of the backend's own
  * per-subject monthly document volume, which is the real limit.
  *
@@ -23,7 +24,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { isIP } from "node:net";
+import { BlockList, isIP } from "node:net";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -60,18 +61,30 @@ import {
 
 const SERVER_NAME = "sheetrender";
 
-/** Largest cell, in characters: the catalogue's `limits.cell_max_chars`. */
+/**
+ * Default cell cap, in characters: the catalogue's `limits.cell_max_chars`.
+ * Applies to a field the catalogue gives no `max_chars` (and to prose).
+ */
 export const MAX_CELL_CHARS = 2000;
-/** UTF-8 byte bound on a text cell, matching the backend catalogue. */
+/** Default UTF-8 byte bound on a text cell, the catalogue's `limits.cell_max_bytes`. */
 export const MAX_CELL_BYTES = 2048;
 /** Most columns a row may carry. The widest template has eight fields. */
 export const MAX_ROW_KEYS = 50;
 /** The handoff payload cap the backend enforces, checked here first. */
 export const MAX_HANDOFF_BYTES = 256 * 1024;
+/**
+ * Anonymous HTTP body cap: the backend's render body cap. 25 letters at their
+ * field caps are 650 KB of UTF-8 cell text, and still fit when a client
+ * escapes every emoji as `\uXXXX\uXXXX` (three times the bytes). The handoff
+ * cap above still applies to create_continue_link's own payload.
+ */
+export const MAX_ANON_BODY_BYTES = 2 * 1024 * 1024;
 /** Default flood guard: tool calls per subject per hour. */
 export const DEFAULT_CALLS_PER_HOUR = 30;
-/** Subjectless directory traffic shares one larger, isolated flood bucket. */
+/** Traffic from Claude's network shares one larger, isolated flood bucket. */
 export const DEFAULT_CLAUDE_CALLS_PER_HOUR = 3000;
+/** The backend's volume sentences are short; this bounds one that is not. */
+const MAX_MESSAGE_CHARS = 500;
 const HOUR_MS = 60 * 60 * 1000;
 const CATALOGUE_TTL_MS = HOUR_MS;
 
@@ -101,7 +114,122 @@ function sha256(value: string): string {
     return createHash("sha256").update(value).digest("hex");
 }
 
-/** ChatGPT's anonymised user id, when the call carries a usable one. */
+/**
+ * Anthropic's published outbound range for MCP tool calls, IPv4 only:
+ * https://platform.claude.com/docs/en/api/ip-addresses
+ */
+export const CLAUDE_EGRESS_CIDRS: readonly string[] = ["160.79.104.0/21"];
+
+/**
+ * OpenAI's published egress ranges for ChatGPT apps and connectors, copied
+ * from https://openai.com/chatgpt-connectors.json (creationTime
+ * 2026-09-22T18:18:05), which https://developers.openai.com/api/docs/guides/ip-addresses
+ * names for Apps SDK traffic. IPv4 only, as published. OpenAI calls the list
+ * best effort and changes it often: OPENAI_EGRESS_CIDRS (http.ts) replaces it
+ * without a release. A ChatGPT call from an address missing here is counted by
+ * its IP, never by its `openai/subject`.
+ */
+export const OPENAI_EGRESS_CIDRS: readonly string[] = [
+    "100.31.168.162/32", "102.37.57.54/32", "104.192.219.204/30", "104.208.184.192/28", "104.210.139.192/28",
+    "104.210.139.224/28", "108.179.20.6/31", "112.220.228.112/29", "115.42.241.224/29", "12.105.90.64/27",
+    "12.108.172.96/28", "12.117.245.68/30", "12.12.47.194/32", "12.12.56.224/28", "12.12.56.24/29",
+    "12.12.56.240/28", "12.12.56.32/29", "12.129.184.64/26", "12.162.186.200/29", "12.77.42.78/32",
+    "12.79.201.188/30", "12.79.202.152/30", "12.79.202.156/30", "12.79.202.228/30", "12.79.202.232/30",
+    "12.79.225.144/30", "12.79.34.30/32", "128.177.174.162/32", "128.177.85.168/30", "13.223.161.115/32",
+    "13.237.176.161/32", "13.238.110.96/32", "13.65.138.112/28", "13.67.72.16/28", "13.71.2.208/28",
+    "13.71.25.29/32", "13.76.116.80/28", "13.76.32.208/28", "13.83.237.176/28", "130.33.24.99/32",
+    "132.196.82.48/28", "134.138.52.16/28", "134.138.52.64/28", "134.138.57.64/28", "134.138.57.80/28",
+    "134.149.233.80/28", "134.33.102.192/28", "135.116.136.160/28", "135.13.64.240/28", "135.220.208.92/32",
+    "135.220.40.201/32", "135.220.73.208/28", "135.234.27.89/32", "135.237.133.48/28", "137.135.191.176/28",
+    "145.132.136.96/28", "148.109.10.28/30", "148.109.36.240/28", "148.76.185.192/27", "149.97.160.16/28",
+    "15.168.252.168/32", "152.44.170.32/29", "159.180.234.92/30", "172.162.248.64/28", "172.167.161.96/32",
+    "172.167.32.228/32", "172.170.1.80/28", "172.170.225.0/28", "172.170.241.80/28", "172.171.234.186/32",
+    "172.172.206.48/28", "172.175.152.224/28", "172.177.53.240/28", "172.183.143.224/28", "172.191.238.68/32",
+    "172.191.70.179/32", "172.192.112.208/28", "172.198.58.176/28", "172.198.79.112/28", "172.199.137.80/28",
+    "172.203.39.49/32", "172.204.96.80/28", "172.206.38.240/28", "172.207.1.32/28", "172.207.173.200/32",
+    "172.214.226.198/32", "172.215.215.32/28", "173.195.76.0/26", "18.218.234.253/32", "180.222.194.124/30",
+    "184.73.124.134/32", "191.232.238.96/28", "191.233.251.27/32", "191.234.167.144/28", "191.237.249.64/28",
+    "194.46.223.16/28", "195.171.64.176/28", "199.241.201.152/29", "199.47.142.0/23", "20.102.212.144/28",
+    "20.125.112.224/28", "20.125.40.252/32", "20.162.96.163/32", "20.168.7.192/28", "20.169.78.48/28",
+    "20.169.78.64/28", "20.169.86.224/28", "20.170.184.16/28", "20.170.184.32/28", "20.170.184.48/28",
+    "20.170.184.64/28", "20.170.184.80/28", "20.171.137.175/32", "20.172.29.32/28", "20.184.36.134/32",
+    "20.206.101.192/28", "20.215.187.208/28", "20.215.219.208/28", "20.219.184.96/28", "20.227.140.32/28",
+    "20.228.106.176/28", "20.235.87.224/28", "20.241.32.36/32", "20.249.63.208/28", "20.250.136.64/28",
+    "20.44.100.224/28", "20.45.178.144/28", "20.55.229.144/28", "20.57.199.192/28", "20.63.221.64/28",
+    "20.74.221.21/32", "20.78.130.48/28", "20.98.18.80/28", "203.125.229.136/29", "203.149.223.128/29",
+    "208.184.8.104/29", "208.184.8.84/30", "208.52.97.112/29", "208.69.43.136/29", "208.80.35.32/27",
+    "209.247.142.56/30", "209.247.151.176/28", "209.249.246.178/31", "209.249.37.128/26", "213.122.44.84/31",
+    "216.64.170.234/32", "217.111.182.45/32", "217.111.242.24/29", "23.101.217.176/28", "23.102.141.32/28",
+    "23.98.186.64/28", "23.98.186.96/28", "24.82.185.0/29", "3.12.200.18/32", "3.140.2.201/32",
+    "4.14.111.0/28", "4.151.119.48/28", "4.151.200.38/32", "4.151.71.176/28", "4.155.146.196/32",
+    "4.17.25.128/29", "4.185.216.109/32", "4.189.118.208/28", "4.19.160.0/28", "4.197.115.112/28",
+    "4.197.172.116/32", "4.197.64.0/28", "4.197.64.48/28", "4.201.232.64/28", "4.205.128.176/28",
+    "4.217.235.100/32", "4.218.24.64/28", "4.226.200.16/28", "4.226.226.32/28", "4.245.198.13/32",
+    "4.38.166.228/30", "4.53.139.144/28", "4.7.10.112/30", "4.7.11.196/30", "40.118.236.137/32",
+    "40.122.118.119/32", "40.122.118.202/32", "40.122.118.93/32", "40.124.161.0/28", "40.88.27.77/32",
+    "43.202.230.227/32", "44.221.134.118/32", "44.249.227.138/32", "45.147.211.96/29", "48.218.181.198/32",
+    "48.221.184.80/28", "48.221.184.96/28", "48.221.40.176/28", "50.145.17.208/30", "50.145.17.212/30",
+    "50.145.17.216/29", "50.145.17.224/29", "50.151.105.128/30", "50.151.105.136/29", "50.213.205.80/29",
+    "50.235.235.72/29", "51.4.112.173/32", "51.57.0.96/28", "51.59.24.64/28", "51.59.24.80/28",
+    "51.59.48.80/28", "52.119.123.85/32", "52.143.181.161/32", "52.148.129.32/28", "52.165.212.48/28",
+    "52.17.188.55/32", "52.172.129.160/28", "52.173.221.16/28", "52.173.234.16/28", "52.173.234.80/28",
+    "52.190.137.144/28", "52.190.137.16/28", "52.190.139.48/28", "52.190.142.64/28", "52.2.184.223/32",
+    "52.208.217.159/32", "52.231.30.48/28", "52.231.39.144/28", "52.242.132.224/28", "52.242.132.240/28",
+    "52.255.109.144/28", "52.255.109.80/28", "52.255.109.96/28", "52.255.111.0/28", "52.43.161.225/32",
+    "52.6.94.121/32", "54.180.197.31/32", "54.227.131.66/32", "56.155.71.179/32", "57.133.92.112/31",
+    "57.154.174.112/28", "57.154.187.32/28", "61.105.58.228/30", "62.96.221.184/29", "64.124.191.96/28",
+    "64.124.21.196/32", "64.71.12.112/28", "66.193.99.66/32", "67.207.103.240/28", "68.154.28.96/28",
+    "68.220.57.64/28", "70.153.32.16/28", "70.153.32.32/28", "70.156.152.96/28", "72.146.20.246/32",
+    "74.161.200.96/28", "74.224.217.64/28", "74.226.253.160/28", "74.248.148.7/32", "74.248.37.160/28",
+    "74.7.35.112/28", "74.7.35.48/28", "74.7.36.64/28", "74.7.36.80/28", "74.7.36.96/28",
+    "76.77.188.112/29", "77.75.96.48/29", "79.244.198.212/30", "8.244.149.100/30", "80.169.53.32/28",
+    "85.211.128.16/28", "85.211.128.32/28", "9.129.0.0/17", "9.160.128.16/28", "9.160.128.64/28",
+    "9.160.96.16/28", "9.205.128.32/28", "9.205.128.48/28", "9.205.8.48/28", "9.205.8.64/28",
+    "9.234.96.192/28", "9.234.97.96/28", "98.87.72.221/32",
+];
+
+function unmapV4(address: string): string {
+    return address.toLowerCase().startsWith("::ffff:") && isIP(address.slice(7)) === 4 ? address.slice(7) : address;
+}
+
+/** A CIDR as `address/prefix`, validated; throws on anything else. */
+export function parseCidr(cidr: string): { address: string; prefix: number; family: "ipv4" | "ipv6" } {
+    const match = /^([^/\s]+)\/(\d{1,3})$/.exec(cidr.trim());
+    const family = match ? isIP(match[1]!) : 0;
+    const prefix = match ? Number(match[2]) : NaN;
+    if (!match || family === 0 || prefix > (family === 4 ? 32 : 128)) {
+        throw new SheetRenderError(`Not a CIDR range: ${cidr.slice(0, 100)}`);
+    }
+    return { address: match[1]!, prefix, family: family === 4 ? "ipv4" : "ipv6" };
+}
+
+/** A set of IPv4 and IPv6 ranges; an IPv4-mapped IPv6 address matches as IPv4. */
+export class CidrSet {
+    readonly #list = new BlockList();
+
+    constructor(cidrs: readonly string[]) {
+        for (const cidr of cidrs) {
+            const { address, prefix, family } = parseCidr(cidr);
+            this.#list.addSubnet(address, prefix, family);
+        }
+    }
+
+    has(address: string): boolean {
+        const plain = unmapV4(address);
+        const family = isIP(plain);
+        return family !== 0 && this.#list.check(plain, family === 4 ? "ipv4" : "ipv6");
+    }
+}
+
+const CLAUDE_EGRESS = new CidrSet(CLAUDE_EGRESS_CIDRS);
+const DEFAULT_OPENAI_EGRESS = new CidrSet(OPENAI_EGRESS_CIDRS);
+
+/** Only the verified network address qualifies; a User-Agent cannot opt in. */
+export function isClaudeIp(address: string): boolean {
+    return CLAUDE_EGRESS.has(address);
+}
+
+/** The `openai/subject` a call carries, whoever sent it. See trustedOpenaiSubject. */
 export function openaiSubject(meta: Meta): string | undefined {
     const subject = meta?.["openai/subject"];
     if (typeof subject !== "string") return undefined;
@@ -110,26 +238,47 @@ export function openaiSubject(meta: Meta): string | undefined {
 }
 
 /**
- * Who a call is counted against, as the backend receives it: the subject
- * hashed (`sub:<sha256>`), else the client IP hashed (`ip:<sha256>`). Neither
- * raw value leaves this process or reaches a log.
+ * ChatGPT's anonymised user id, when it can be believed. Any caller can put
+ * `openai/subject` in `_meta`, and a fresh one per call would be a fresh
+ * monthly allowance and a fresh flood bucket, draining the shared account.
+ * So it counts only from OpenAI's egress ranges, and never from Claude's.
  */
-export function subjectKey(meta: Meta, clientIp: string): string {
-    const subject = openaiSubject(meta);
-    return subject ? `sub:${sha256(subject)}` : `ip:${sha256(clientIp || "unknown")}`;
+export function trustedOpenaiSubject(
+    meta: Meta,
+    clientIp: string,
+    openaiEgress: CidrSet = DEFAULT_OPENAI_EGRESS,
+): string | undefined {
+    if (isClaudeIp(clientIp) || !openaiEgress.has(clientIp)) return undefined;
+    return openaiSubject(meta);
+}
+
+/**
+ * Who a call is counted against, as the backend receives it: a trusted
+ * subject hashed (`sub:<sha256>`); else, for a Claude caller that sent an MCP
+ * session id, that id hashed (`mcps:<sha256>`, one Claude conversation); else
+ * the client IP hashed (`ip:<sha256>`). No raw value leaves this process or
+ * reaches a log.
+ */
+export function subjectKey(
+    meta: Meta,
+    clientIp: string,
+    sessionId?: string,
+    openaiEgress: CidrSet = DEFAULT_OPENAI_EGRESS,
+): string {
+    const subject = trustedOpenaiSubject(meta, clientIp, openaiEgress);
+    if (subject) return `sub:${sha256(subject)}`;
+    if (sessionId && isClaudeIp(clientIp)) return `mcps:${sha256(sessionId)}`;
+    return `ip:${sha256(clientIp || "unknown")}`;
+}
+
+/** Where a call came from; a Claude-range caller is "claude" whatever its `_meta` or User-Agent says. */
+export function callerSource(meta: Meta, userAgent: string | undefined, clientIp: string): Source {
+    return isClaudeIp(clientIp) ? "claude" : detectSource(meta, userAgent);
 }
 
 /** Short fingerprint of a subject for the request log. */
 export function subjectFingerprint(subject: string): string {
     return sha256(subject).slice(0, 12);
-}
-
-/** Only the verified network address qualifies; a User-Agent cannot opt in. */
-export function isClaudeIp(address: string): boolean {
-    const v4 = address.toLowerCase().startsWith("::ffff:") ? address.slice(7) : address;
-    if (isIP(v4) !== 4) return false;
-    const [a, b, c] = v4.split(".").map(Number);
-    return a === 160 && b === 79 && c !== undefined && c >= 104 && c <= 111;
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +350,10 @@ export interface CatalogueField {
     required: boolean;
     example: Cell;
     description: string;
+    /** Longest text value, in characters, after trimming. */
+    max_chars: number;
+    /** Longest text value, in UTF-8 bytes, after trimming. */
+    max_bytes: number;
 }
 
 export interface CatalogueTemplate {
@@ -227,6 +380,11 @@ function toCell(value: unknown): Cell {
     if (value === null || typeof value === "boolean") return value;
     if (typeof value === "number" && Number.isFinite(value)) return value;
     return null;
+}
+
+/** A catalogue cap, or the default when the catalogue does not carry one. */
+function capOf(value: unknown, fallback: number): number {
+    return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : fallback;
 }
 
 function catalogueText(value: unknown, fallback = ""): string {
@@ -262,6 +420,8 @@ export function normaliseCatalogue(raw: BuiltinTemplate[], apiUrl: string): Cata
                     required: field.required === true,
                     example: toCell(field.example),
                     description: catalogueText(field.description),
+                    max_chars: capOf(field.max_chars, MAX_CELL_CHARS),
+                    max_bytes: capOf(field.max_bytes, MAX_CELL_BYTES),
                 })),
         });
     }
@@ -316,10 +476,11 @@ export class CatalogueCache {
 // Schemas
 // ---------------------------------------------------------------------------
 
+// Text length is checked per field against the catalogue (checkRows), since
+// the letter's body allows more than the other fields; the HTTP body cap bounds
+// the total.
 const cellSchema = z.union([
-    z.string().max(MAX_CELL_CHARS).refine((value) => Buffer.byteLength(value.trim(), "utf8") <= MAX_CELL_BYTES, {
-        message: `A text cell may contain at most ${MAX_CELL_BYTES} UTF-8 bytes.`,
-    }).describe(`Text, at most ${MAX_CELL_CHARS} characters and ${MAX_CELL_BYTES} UTF-8 bytes.`),
+    z.string().describe(ANON_TEXT.cellText),
     z.number(), z.boolean(), z.null(),
 ]);
 
@@ -346,6 +507,8 @@ const fieldOutput = z.object({
     required: z.boolean(),
     example: z.union([z.string(), z.number(), z.boolean(), z.null()]),
     description: z.string(),
+    max_chars: z.number(),
+    max_bytes: z.number(),
 });
 
 const listOutputShape = {
@@ -381,6 +544,8 @@ const renderOutputShape = {
     missing_fields: z.array(z.object({ row_index: z.number(), fields: z.array(z.string()) })),
     volume: volumeOutput.nullable(),
     continue: z.object({ guide_url: z.string(), how: z.string() }),
+    status: z.string().optional(),
+    message: z.string().optional(),
 };
 
 const continueOutputShape = {
@@ -388,6 +553,86 @@ const continueOutputShape = {
     expires_at: z.string().nullable(),
     rows_saved: z.number(),
 };
+
+/** Row keys match a field exactly, else with case, spaces and dashes ignored, as the backend does. */
+function looseKey(key: string): string {
+    return key.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+}
+
+/**
+ * The row's value for each template field, with the key it came from, as the
+ * backend's normalise_row picks it: an exact key first, then the first key
+ * that matches loosely. Every other key is ignored, as the backend ignores it.
+ */
+function fieldValues(template: CatalogueTemplate, row: Record<string, Cell>): Map<string, [string, Cell]> {
+    const keys = new Set(template.fields.map((field) => field.key));
+    const picked = new Map<string, [string, Cell]>();
+    for (const [key, value] of Object.entries(row)) {
+        if (keys.has(key)) picked.set(key, [key, value]);
+    }
+    for (const [key, value] of Object.entries(row)) {
+        const loose = looseKey(key);
+        if (keys.has(loose) && !picked.has(loose)) picked.set(loose, [key, value]);
+    }
+    return picked;
+}
+
+/**
+ * Python's str.isspace() set, which the backend's str.strip() removes. JS
+ * trim() differs: it also strips U+FEFF and keeps U+001C-U+001F and U+0085.
+ */
+const PY_WHITESPACE = new Set([
+    0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0x85, 0xa0, 0x1680,
+    0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009, 0x200a,
+    0x2028, 0x2029, 0x202f, 0x205f, 0x3000,
+]);
+
+/** Python's `text.strip()`. A scan rather than a regex, which backtracks on long runs. */
+export function pythonStrip(text: string): string {
+    let start = 0;
+    let end = text.length;
+    while (start < end && PY_WHITESPACE.has(text.charCodeAt(start))) start++;
+    while (end > start && PY_WHITESPACE.has(text.charCodeAt(end - 1))) end--;
+    return text.slice(start, end);
+}
+
+/** Python's `len(text)`: code points, so a surrogate pair (an emoji) is one. */
+export function pythonLength(text: string): number {
+    let count = 0;
+    for (let i = 0; i < text.length; i++) {
+        const unit = text.charCodeAt(i);
+        if (unit >= 0xd800 && unit <= 0xdbff && i + 1 < text.length) {
+            const next = text.charCodeAt(i + 1);
+            if (next >= 0xdc00 && next <= 0xdfff) i++;
+        }
+        count++;
+    }
+    return count;
+}
+
+/**
+ * The first field value over its cap, as a message for the model, or
+ * undefined. Mirrors the backend's _clean_value: only the value it picks per
+ * field is checked, after Python's strip(), in code points and UTF-8 bytes.
+ */
+export function checkRows(template: CatalogueTemplate, rows: Record<string, Cell>[]): string | undefined {
+    for (const [index, row] of rows.entries()) {
+        const values = fieldValues(template, row);
+        for (const field of template.fields) {
+            const [key, value] = values.get(field.key) ?? [field.key, null];
+            if (typeof value !== "string") continue;
+            const text = pythonStrip(value);
+            if (pythonLength(text) > field.max_chars || Buffer.byteLength(text, "utf8") > field.max_bytes) {
+                return ANON_TEXT.cellTooLong
+                    .replace("{row}", String(index + 1))
+                    .replace("{field}", () => key.slice(0, 100))
+                    .replace("{chars}", String(field.max_chars))
+                    .replace("{bytes}", String(field.max_bytes));
+            }
+        }
+    }
+    return undefined;
+}
 
 // ---------------------------------------------------------------------------
 // Results
@@ -482,6 +727,18 @@ export function buildRenderResult(
         continue: { guide_url: guide, how: ANON_TEXT.continueHow },
     };
 
+    // A call the month's volume does not cover is a 200 with no documents and
+    // the backend's own sentence, which is already neutral: pass it on as is.
+    const message = typeof result.message === "string" ? result.message.trim().slice(0, MAX_MESSAGE_CHARS) : "";
+    if (documents.length === 0 && message) {
+        const refused = {
+            ...structured,
+            ...(typeof result.status === "string" ? { status: result.status } : {}),
+            message,
+        };
+        return { ...structuredResult(message, refused), isError: false };
+    }
+
     const resets = isoDate(volume?.resets_at ?? null);
     if (documents.length === 0 && volume && volume.used >= volume.limit) {
         return structuredResult(
@@ -526,12 +783,19 @@ export interface AnonServerOptions {
     client: SheetRenderClient;
     /** Shared across requests: the flood guard. */
     limiter: SlidingWindowLimiter;
-    /** Separate shared bucket for subjectless requests from Claude's network. */
+    /** Separate shared bucket for all requests from Claude's network. */
     claudeLimiter?: SlidingWindowLimiter;
     /** Shared across requests: the catalogue cache. */
     catalogue: CatalogueCache;
     /** The caller's IP, the limiter key when there is no subject. */
     clientIp: string;
+    /** Addresses whose `openai/subject` is believed; OpenAI's published list by default. */
+    openaiEgress?: CidrSet;
+    /**
+     * The `Mcp-Session-Id` the request carried. Only its hash goes upstream,
+     * and only for a Claude caller; it is never logged.
+     */
+    sessionId?: string;
     /** The URL users paste for this server; sets the view's sandbox origin. */
     publicUrl?: string;
     /** Reject an upstream reply that reflects the hosted credential. */
@@ -559,7 +823,9 @@ function refFor(source: Source): string {
  * Builds the anonymous MCP server for one HTTP request.
  */
 export function createAnonServer(options: AnonServerOptions): McpServer {
-    const { client, limiter, claudeLimiter, catalogue, clientIp, publicUrl } = options;
+    const { client, limiter, claudeLimiter, catalogue, clientIp, publicUrl, sessionId } = options;
+    const openaiEgress = options.openaiEgress ?? DEFAULT_OPENAI_EGRESS;
+    const claudeCaller = isClaudeIp(clientIp);
     const apiUrl = client.baseUrl;
     const apiOrigin = new URL(apiUrl).origin;
 
@@ -579,12 +845,27 @@ export function createAnonServer(options: AnonServerOptions): McpServer {
         return result;
     }
 
+    /**
+     * The text-length message for rows over their field's cap. With the
+     * catalogue unavailable it is skipped and the backend, which enforces the
+     * same caps, has the last word.
+     */
+    async function overlong(key: TemplateKey, rows: Record<string, Cell>[]): Promise<string | undefined> {
+        try {
+            const template = (await catalogue.get(client)).find((item) => item.key === key);
+            return template ? checkRows(template, rows) : undefined;
+        } catch {
+            return undefined;
+        }
+    }
+
     /** The flood guard, or the result to return when the caller is over it. */
     function guard(extra: RequestExtra): CallToolResult | undefined {
-        const shared = !openaiSubject(extra._meta) && isClaudeIp(clientIp) && claudeLimiter !== undefined;
+        // Claude's network never carries a trusted subject, so all of it shares one bucket.
+        const shared = claudeCaller && claudeLimiter !== undefined;
         const decision = shared
             ? claudeLimiter.take("claude:160.79.104.0/21")
-            : limiter.take(subjectKey(extra._meta, clientIp));
+            : limiter.take(subjectKey(extra._meta, clientIp, undefined, openaiEgress));
         if (decision.allowed) return undefined;
         const minutes = Math.max(1, Math.ceil(decision.retryAfterMs / 60_000));
         const message = shared ? ANON_TEXT.tooManySharedCalls : ANON_TEXT.tooManyCalls;
@@ -611,10 +892,14 @@ export function createAnonServer(options: AnonServerOptions): McpServer {
             try {
                 const templates = await catalogue.get(client);
                 const text = templates.map((template) => {
-                    const fields = template.fields.map((field) =>
-                        `  - ${field.key}${field.required ? " (required)" : ""}` +
-                        (field.description ? `: ${field.description}` : "")
-                    );
+                    const fields = template.fields.map((field) => {
+                        const notes = [
+                            ...(field.required ? ["required"] : []),
+                            ...(field.max_chars !== MAX_CELL_CHARS ? [`up to ${field.max_chars} characters`] : []),
+                        ];
+                        return `  - ${field.key}${notes.length ? ` (${notes.join(", ")})` : ""}` +
+                            (field.description ? `: ${field.description}` : "");
+                    });
                     return [
                         `${template.key}: ${template.name} (${template.page}, ${template.orientation}). ` +
                         template.description,
@@ -667,12 +952,16 @@ export function createAnonServer(options: AnonServerOptions): McpServer {
             const limited = guard(extra);
             if (limited) return limited;
             try {
-                const source = detectSource(extra._meta, userAgentOf(extra));
+                const tooLong = await overlong(template, rows as Record<string, Cell>[]);
+                if (tooLong) return errorResult(tooLong);
+                const source = callerSource(extra._meta, userAgentOf(extra), clientIp);
                 const result = await client.renderBuiltin(template, {
                     rows: rows as Record<string, Cell>[],
                     title,
-                    subject: subjectKey(extra._meta, clientIp),
+                    subject: subjectKey(extra._meta, clientIp, sessionId, openaiEgress),
                     source,
+                    // Claude sends no per-user id, so its callers also share a monthly pool.
+                    ...(claudeCaller ? { pool: "claude" as const } : {}),
                 });
                 return safeResult(buildRenderResult(template, rows.length, result, apiUrl));
             } catch (error) {
@@ -715,12 +1004,14 @@ export function createAnonServer(options: AnonServerOptions): McpServer {
             const limited = guard(extra);
             if (limited) return limited;
             try {
-                const source = detectSource(extra._meta, userAgentOf(extra));
+                const tooLong = await overlong(template, rows as Record<string, Cell>[]);
+                if (tooLong) return errorResult(tooLong);
+                const source = callerSource(extra._meta, userAgentOf(extra), clientIp);
                 const input: HandoffInput = {
                     template,
                     rows: rows as Record<string, Cell>[],
                     title,
-                    subject: subjectKey(extra._meta, clientIp),
+                    subject: subjectKey(extra._meta, clientIp, sessionId, openaiEgress),
                     source,
                 };
                 // The backend caps the whole body, including identity and title.

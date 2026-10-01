@@ -9,7 +9,10 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import {
     anonToolError,
     buildRenderResult,
+    callerSource,
     CatalogueCache,
+    checkRows,
+    CidrSet,
     createAnonServer,
     detectSource,
     isClaudeIp,
@@ -18,8 +21,13 @@ import {
     MAX_HANDOFF_BYTES,
     MAX_ROW_KEYS,
     normaliseCatalogue,
+    OPENAI_EGRESS_CIDRS,
+    parseCidr,
+    pythonLength,
+    pythonStrip,
     SlidingWindowLimiter,
     subjectKey,
+    trustedOpenaiSubject,
 } from "../src/anon.js";
 import {
     ANON_TEXT,
@@ -103,9 +111,18 @@ interface ConnectOptions {
     claudeLimiter?: SlidingWindowLimiter;
     catalogue?: CatalogueCache;
     clientIp?: string;
+    openaiEgress?: CidrSet;
+    sessionId?: string;
     publicUrl?: string;
     demoApiKey?: string;
 }
+
+/**
+ * Stands in for OpenAI's egress ranges in these tests: the default client IP
+ * (TEST-NET-3) is believed when it sends an `openai/subject`; 198.51.100.0/24
+ * (TEST-NET-2) is an ordinary caller whose subject is ignored.
+ */
+const TEST_OPENAI_EGRESS = new CidrSet(["203.0.113.0/24"]);
 
 async function connect(options: ConnectOptions = {}): Promise<{ client: Client; calls: Calls }> {
     const fake = options.client ? { client: options.client, calls: { renders: [], handoffs: [], catalogue: 0 } } : fakeClient();
@@ -115,6 +132,8 @@ async function connect(options: ConnectOptions = {}): Promise<{ client: Client; 
         claudeLimiter: options.claudeLimiter,
         catalogue: options.catalogue ?? new CatalogueCache(),
         clientIp: options.clientIp ?? "203.0.113.9",
+        openaiEgress: options.openaiEgress ?? TEST_OPENAI_EGRESS,
+        sessionId: options.sessionId,
         publicUrl: options.publicUrl,
         demoApiKey: options.demoApiKey,
     });
@@ -227,6 +246,8 @@ describe("list_document_templates", () => {
             required: false,
             example: "Northfield Training Institute",
             description: "The organisation awarding the certificate, printed across the top.",
+            max_chars: 2000,
+            max_bytes: 2048,
         });
         const text = textOf(result);
         assert.match(text, /^4 templates:\ncertificate: Certificate of completion \(A4, landscape\)\. A landscape certificate/);
@@ -248,6 +269,64 @@ describe("list_document_templates", () => {
         assert.equal(FIXTURE.limits.handoff_payload_max_bytes, MAX_HANDOFF_BYTES);
         assert.equal(FIXTURE.limits.title_max_chars, 120);
         assert.equal(FIXTURE.limits.documents_per_month, 50);
+    });
+
+    it("preserves every fixture field's integer caps, including the longer letter body", () => {
+        const normalised = normaliseCatalogue(FIXTURE.templates, API_URL);
+        for (const template of FIXTURE.templates) {
+            const fields = template.fields!;
+            assert.ok(fields.length > 0, template.key);
+            for (const field of fields) {
+                const label = `${template.key}.${field.key}`;
+                assert.ok(Number.isInteger(field.max_chars), label);
+                assert.ok(Number.isInteger(field.max_bytes), label);
+                const isBody = template.key === "letter" && field.key === "body";
+                assert.equal(field.max_chars, isBody ? 5000 : 2000, label);
+                assert.equal(field.max_bytes, isBody ? 12288 : 2048, label);
+            }
+            assert.deepEqual(
+                normalised.find((item) => item.key === template.key)!.fields.map((field) => ({
+                    key: field.key, max_chars: field.max_chars, max_bytes: field.max_bytes,
+                })),
+                fields.map((field) => ({ key: field.key, max_chars: field.max_chars, max_bytes: field.max_bytes })),
+            );
+        }
+        const body = normalised.find((template) => template.key === "letter")!.fields.find((field) => field.key === "body")!;
+        assert.equal(body.max_chars, 5000);
+        assert.equal(body.max_bytes, 12288);
+    });
+
+    it("defaults absent or invalid field caps independently to 2000 characters and 2048 bytes", () => {
+        const invalidCaps: unknown[] = [null, 0, -1, 1.5, "5000", NaN, Infinity];
+        // The catalogue arrives as JSON, so malformed runtime values need not
+        // conform to BuiltinTemplateField's declared numeric cap types.
+        const templates = normaliseCatalogue([{
+            key: "letter",
+            fields: [
+                { key: "missing" },
+                ...invalidCaps.map((cap, index) => ({ key: `invalid_${index}`, max_chars: cap, max_bytes: cap })),
+                { key: "chars_only", max_chars: 5000, max_bytes: 0 },
+                { key: "bytes_only", max_chars: -1, max_bytes: 12288 },
+            ],
+        }] as unknown as BuiltinTemplate[], API_URL);
+        const fields = templates[0]!.fields;
+        for (const field of fields.slice(0, invalidCaps.length + 1)) {
+            assert.equal(field.max_chars, MAX_CELL_CHARS, field.key);
+            assert.equal(field.max_bytes, MAX_CELL_BYTES, field.key);
+        }
+        assert.equal(fields.at(-2)!.max_chars, 5000);
+        assert.equal(fields.at(-2)!.max_bytes, MAX_CELL_BYTES);
+        assert.equal(fields.at(-1)!.max_chars, MAX_CELL_CHARS);
+        assert.equal(fields.at(-1)!.max_bytes, 12288);
+    });
+
+    it("mentions the longer character cap only on the letter body in the list text", async () => {
+        const { client } = await connect();
+        const result = await client.callTool({ name: "list_document_templates", arguments: {} });
+        const capped = textOf(result).split("\n").filter((line) => line.includes("up to"));
+        assert.equal(capped.length, 1);
+        assert.match(capped[0]!, /^  - body \(required, up to 5000 characters\):/);
+        assert.doesNotMatch(textOf(result), /up to 2000 characters/);
     });
 
     it("accepts the catalogue as a bare array or under `templates`, and fills in missing names", () => {
@@ -308,6 +387,95 @@ describe("list_document_templates", () => {
             assert.equal(result.isError, true);
             assert.doesNotMatch(JSON.stringify(result), BANNED_WORDS);
         }
+    });
+});
+
+describe("row field caps", () => {
+    const capped = (maxChars: number, maxBytes: number) => normaliseCatalogue([{
+        key: "letter", fields: [{ key: "body", max_chars: maxChars, max_bytes: maxBytes }],
+    }], API_URL)[0]!;
+    const letter = () => normaliseCatalogue(CATALOGUE, API_URL).find((t) => t.key === "letter")!;
+
+    it("strips Python's whitespace set, not JavaScript's", () => {
+        const all = "\t\n\v\f\r\x1c\x1d\x1e\x1f \x85\xa0        " +
+            "        　";
+        assert.equal(pythonStrip(`${all}x y${all}`), "x y");
+        // U+FEFF stays (JS trim() would strip it); U+0085 and U+001C go (trim() keeps them).
+        assert.equal(pythonStrip("﻿ x ﻿"), "﻿ x ﻿");
+        assert.equal(pythonStrip("\x85\x1cx\x1f"), "x");
+        assert.equal(pythonStrip("᠎​x"), "᠎​x");
+        assert.equal(pythonStrip(" ".repeat(1_000_000) + "x" + " ".repeat(10)), "x");
+    });
+
+    it("counts code points, as Python's len() does", () => {
+        assert.equal(pythonLength("😀"), 1);
+        assert.equal(pythonLength("𠀀a😀"), 3);
+        assert.equal(pythonLength("👩‍💻"), 3);
+        assert.equal(pythonLength("\ud800x"), 2);
+        assert.equal(pythonLength("x\udc00"), 2);
+        assert.equal(pythonLength(""), 0);
+    });
+
+    it("counts emoji and astral characters as one character each, bounded by UTF-8 bytes", () => {
+        const three = capped(3, 100);
+        assert.equal(checkRows(three, [{ body: "😀😀😀" }]), undefined);
+        assert.equal(checkRows(three, [{ body: "𠀀𠀁𠀂" }]), undefined);
+        assert.match(checkRows(three, [{ body: "😀😀😀😀" }]) ?? "", /limit of 3 characters/);
+        // Twelve bytes allow three emoji; a fourth passes the character cap but not the byte cap.
+        const bytes = capped(100, 12);
+        assert.equal(checkRows(bytes, [{ body: "😀😀😀" }]), undefined);
+        assert.match(checkRows(bytes, [{ body: "😀😀😀😀" }]) ?? "", /or 12 UTF-8 bytes/);
+        // The real letter body: 3,072 emoji are exactly 12,288 bytes.
+        assert.equal(checkRows(letter(), [{ body: "😀".repeat(3072) }]), undefined);
+        assert.match(checkRows(letter(), [{ body: "😀".repeat(3073) }]) ?? "", /field body:/);
+        assert.equal(checkRows(letter(), [{ recipient_name: "😀".repeat(512) }]), undefined);
+        assert.match(checkRows(letter(), [{ recipient_name: "😀".repeat(513) }]) ?? "", /field recipient_name:/);
+    });
+
+    it("counts U+FEFF, which Python's strip() keeps, and drops what it strips", () => {
+        const three = capped(3, 100);
+        assert.equal(checkRows(three, [{ body: "\x85abc\x1c" }]), undefined);
+        assert.equal(checkRows(three, [{ body: " abc　" }]), undefined);
+        assert.match(checkRows(three, [{ body: "﻿abc" }]) ?? "", /limit of 3 characters/);
+        assert.match(checkRows(three, [{ body: "abc﻿" }]) ?? "", /limit of 3 characters/);
+        // U+FEFF is three UTF-8 bytes.
+        assert.equal(checkRows(capped(100, 3), [{ body: " ﻿ " }]), undefined);
+        assert.match(checkRows(capped(100, 3), [{ body: "﻿a" }]) ?? "", /or 3 UTF-8 bytes/);
+    });
+
+    it("checks only the value the backend reads per field and ignores other keys", () => {
+        assert.equal(checkRows(letter(), [{ body: "Hello", "BODY ": "x".repeat(5001) }]), undefined);
+        assert.equal(checkRows(letter(), [{ body: "Hello", notes: "x".repeat(100_000) }]), undefined);
+        assert.equal(checkRows(letter(), [{ "Recipient Name": "A", recipient_name: "B", "recipient-name": "x".repeat(2001) }]), undefined);
+        // With no exact key, the first loose key wins and later ones are ignored.
+        assert.match(checkRows(letter(), [{ Body: "x".repeat(5001), "BODY ": "ok" }]) ?? "", /field Body:/);
+        assert.equal(checkRows(letter(), [{ "BODY ": "ok", Body: "x".repeat(5001) }]), undefined);
+        assert.match(checkRows(letter(), [{ "Address Line 1": "x".repeat(2001) }]) ?? "", /field Address Line 1:/);
+    });
+
+    it("checks exact keys before loose keys, trims text and reports the first overlong row", () => {
+        const template = normaliseCatalogue([{
+            key: "letter",
+            fields: [
+                { key: "body", max_chars: 5000, max_bytes: 12288 },
+                { key: "BODY ", max_chars: 2, max_bytes: 10 },
+                { key: "sender_name", max_chars: 3, max_bytes: 10 },
+            ],
+        }], API_URL)[0]!;
+        assert.equal(checkRows(template, [{
+            body: ` \n${"x".repeat(5000)}\t `,
+            "BODY ": " x ",
+            "Sender-Name": " A ",
+            extra: "x".repeat(2000),
+            number: 10_000,
+            boolean: true,
+            empty: null,
+        }]), undefined);
+        assert.equal(checkRows(template, [{ "BODY ": "xxx" }]),
+            "Row 1, field BODY : the text is longer than the limit of 2 characters or 10 UTF-8 bytes. Shorten it and try again.");
+        assert.equal(checkRows(template, [{ body: "x" }, { "Sender-Name": "xxxx" }, { extra: "x".repeat(2001) }]),
+            "Row 2, field Sender-Name: the text is longer than the limit of 3 characters or 10 UTF-8 bytes. Shorten it and try again.");
+        assert.equal(checkRows(template, [{ extra: "x".repeat(2001) }]), undefined);
     });
 });
 
@@ -387,7 +555,7 @@ describe("render_documents", () => {
         assert.equal(unknown.isError, true);
         const longCell = await client.callTool({
             name: "render_documents",
-            arguments: { template: "letter", rows: [{ recipient_name: "A", body: "x".repeat(2001) }] },
+            arguments: { template: "letter", rows: [{ recipient_name: "x".repeat(2001), body: "x" }] },
         });
         assert.equal(longCell.isError, true);
         assert.equal(calls.renders.length, 0);
@@ -410,17 +578,165 @@ describe("render_documents", () => {
         assert.deepEqual(structured.volume, { used: 50, limit: 50, resets_at: "2026-11-01T00:00:00Z" });
     });
 
+    it("returns volume refusal messages verbatim as non-error render results", () => {
+        for (const [status, message, used] of [
+            ["volume_used", "This month's documents for this connection are used. The count resets on 2026-11-01.", 50],
+            ["volume_short", "There are 2 documents left this month, fewer than the 3 rows sent. The count resets on 2026-11-01.", 48],
+        ] as const) {
+            const volume = { used, limit: 50, resets_at: "2026-11-01T00:00:00Z" };
+            const result = buildRenderResult("letter", 3, { documents: [], status, message, volume }, API_URL);
+            assert.equal(result.isError, false, status);
+            assert.equal(textOf(result), message);
+            assert.deepEqual(result.structuredContent, {
+                template: "letter",
+                template_name: "Letter",
+                rows_received: 3,
+                rows_rendered: 0,
+                documents: [],
+                expires_at: null,
+                missing_fields: [],
+                volume,
+                continue: { guide_url: `${API_URL}/templates/mail-merge-letter`, how: ANON_TEXT.continueHow },
+                status,
+                message,
+            });
+            assert.doesNotMatch(textOf(result), BANNED_WORDS);
+            assert.doesNotMatch(JSON.stringify(result.structuredContent), BANNED_WORDS);
+        }
+    });
+
+    it("passes volume refusal messages through the MCP client with valid structured output", async () => {
+        for (const [status, message, used] of [
+            ["volume_used", "This month's documents for this connection are used. The count resets on 2026-11-01.", 50],
+            ["volume_short", "There are 2 documents left this month, fewer than the 3 rows sent. The count resets on 2026-11-01.", 48],
+        ] as const) {
+            const body: BuiltinRenderResult = {
+                documents: [], status, message,
+                volume: { used, limit: 50, resets_at: "2026-11-01T00:00:00Z" },
+            };
+            const { client } = await connect({ client: fakeClient({ renderBuiltin: async () => body }).client });
+            // listTools caches outputSchema validators in the SDK client.
+            const tool = (await client.listTools()).tools.find((item) => item.name === "render_documents")!;
+            assert.ok(tool.outputSchema);
+            const result = await client.callTool({
+                name: "render_documents", arguments: { template: "letter", rows: CERT_ROWS },
+            });
+            assert.ok(!result.isError, status);
+            assert.equal(textOf(result), message);
+            const structured = result.structuredContent as { message: string; status: string };
+            assert.equal(structured.message, message);
+            assert.equal(structured.status, status);
+            assert.deepEqual(result.structuredContent, buildRenderResult("letter", CERT_ROWS.length, body, API_URL).structuredContent);
+            assert.doesNotMatch(textOf(result), BANNED_WORDS);
+            assert.doesNotMatch(JSON.stringify(result.structuredContent), BANNED_WORDS);
+        }
+    });
+
+    it("ignores a backend message when documents were rendered", () => {
+        const message = "This month's documents for this connection are used. The count resets on 2026-11-01.";
+        const expected = buildRenderResult("certificate", 3, RENDERED, API_URL);
+        const result = buildRenderResult("certificate", 3, { ...RENDERED, status: "volume_used", message }, API_URL);
+        assert.deepEqual(result, expected);
+        assert.equal("message" in result.structuredContent!, false);
+        assert.equal("status" in result.structuredContent!, false);
+        assert.ok(!textOf(result).includes(message));
+    });
+
     it("enforces the UTF-8 cell cap on render and continue without truncating valid cells", async () => {
         const { client, calls } = await connect();
         for (const name of ["render_documents", "create_continue_link"]) {
-            const tooLarge = await client.callTool({ name, arguments: { template: "letter", rows: [{ body: "😀".repeat(513) }] } });
+            const tooLarge = await client.callTool({ name, arguments: { template: "letter", rows: [{ recipient_name: "😀".repeat(513) }] } });
             assert.equal(tooLarge.isError, true);
-            const valid = await client.callTool({ name, arguments: { template: "letter", rows: [{ body: "😀".repeat(512) }] } });
+            const valid = await client.callTool({ name, arguments: { template: "letter", rows: [{ recipient_name: "😀".repeat(512) }] } });
             assert.equal(valid.isError, undefined);
         }
         assert.equal(calls.renders.length, 1);
         assert.equal(calls.handoffs.length, 1);
-        assert.equal(calls.renders[0]![1].rows[0]!.body, "😀".repeat(512));
+        assert.equal(calls.renders[0]![1].rows[0]!.recipient_name, "😀".repeat(512));
+        assert.equal(calls.handoffs[0]!.rows[0]!.recipient_name, "😀".repeat(512));
+    });
+
+    it("accepts letter bodies at the character and UTF-8 byte limits on render and continue", async () => {
+        const { client, calls } = await connect();
+        const bodies = ["x".repeat(5000), "界".repeat(4096)];
+        assert.equal(Buffer.byteLength(bodies[1]!, "utf8"), 12288);
+        for (const name of ["render_documents", "create_continue_link"]) {
+            for (const body of bodies) {
+                const result = await client.callTool({
+                    name, arguments: { template: "letter", rows: [{ recipient_name: "A", body }] },
+                });
+                assert.equal(result.isError, undefined, textOf(result));
+            }
+        }
+        assert.deepEqual(calls.renders.map(([, input]) => input.rows[0]!.body), bodies);
+        assert.deepEqual(calls.handoffs.map((input) => input.rows[0]!.body), bodies);
+        assert.equal(calls.catalogue, 1);
+    });
+
+    it("refuses overlong letter bodies and other fields before rendering or continuing", async () => {
+        const { client, calls } = await connect();
+        for (const name of ["render_documents", "create_continue_link"]) {
+            for (const [field, value, chars, bytes] of [
+                ["body", "x".repeat(5001), 5000, 12288],
+                ["body", "界".repeat(4097), 5000, 12288],
+                ["recipient_name", "x".repeat(2001), 2000, 2048],
+            ] as const) {
+                const result = await client.callTool({ name, arguments: { template: "letter", rows: [{ [field]: value }] } });
+                assert.equal(result.isError, true, `${name}: ${field}`);
+                assert.equal(textOf(result),
+                    `Row 1, field ${field}: the text is longer than the limit of ${chars} characters or ${bytes} UTF-8 bytes. Shorten it and try again.`);
+                assert.doesNotMatch(JSON.stringify(result), BANNED_WORDS);
+            }
+        }
+        assert.equal(calls.renders.length, 0);
+        assert.equal(calls.handoffs.length, 0);
+    });
+
+    it("passes aliases and extra columns the backend ignores, whatever their length", async () => {
+        const { client, calls } = await connect();
+        const rows = [
+            { body: "Hello", "BODY ": "x".repeat(5001) },
+            { recipient_name: "A", body: "Hi", notes: "x".repeat(20_000) },
+        ];
+        for (const name of ["render_documents", "create_continue_link"]) {
+            const result = await client.callTool({ name, arguments: { template: "letter", rows } });
+            assert.equal(result.isError, undefined, textOf(result));
+        }
+        assert.deepEqual(calls.renders[0]![1].rows, rows);
+        assert.deepEqual(calls.handoffs[0]!.rows, rows);
+    });
+
+    it("uses the body cap for loose keys and counts trimmed text without altering rows", async () => {
+        const { client, calls } = await connect();
+        const rows = [{ recipient_name: ` ${"x".repeat(2000)} `, "BODY ": `\n ${"x".repeat(5000)} \t` }];
+        for (const name of ["render_documents", "create_continue_link"]) {
+            const result = await client.callTool({ name, arguments: { template: "letter", rows } });
+            assert.equal(result.isError, undefined, textOf(result));
+            const tooLong = await client.callTool({
+                name, arguments: { template: "letter", rows: [{ "BODY ": "x".repeat(5001) }] },
+            });
+            assert.equal(tooLong.isError, true);
+            assert.match(textOf(tooLong), /limit of 5000 characters or 12288 UTF-8 bytes/);
+        }
+        assert.deepEqual(calls.renders.map(([, input]) => input.rows), [rows]);
+        assert.deepEqual(calls.handoffs.map((input) => input.rows), [rows]);
+    });
+
+    it("passes long values to the backend when the catalogue cannot be loaded", async () => {
+        let catalogueCalls = 0;
+        const fake = fakeClient({ listBuiltinTemplates: async () => {
+            catalogueCalls += 1;
+            throw new SheetRenderError("Unavailable", 503);
+        } });
+        const { client } = await connect({ client: fake.client });
+        const rows = [{ recipient_name: "x".repeat(2001), body: "x".repeat(5001) }];
+        for (const name of ["render_documents", "create_continue_link"]) {
+            const result = await client.callTool({ name, arguments: { template: "letter", rows } });
+            assert.equal(result.isError, undefined, textOf(result));
+        }
+        assert.equal(catalogueCalls, 2);
+        assert.deepEqual(fake.calls.renders.map(([, input]) => input.rows), [rows]);
+        assert.deepEqual(fake.calls.handoffs.map((input) => input.rows), [rows]);
     });
 
     it("reads the volume under its old `daily_volume` name too", () => {
@@ -461,6 +777,16 @@ describe("render_documents", () => {
         const result = await client.callTool({ name: "render_documents", arguments: { template: "letter", rows: [{ body: "x" }] } });
         assert.equal(result.isError, true);
         assert.equal(textOf(result), ANON_TEXT.busy);
+    });
+
+    it("maps both string and monthly document capacity 429 details to the busy text", () => {
+        const message = "This month's documents for this connection are used. The count resets on 2026-11-01.";
+        for (const detail of [message, { code: "monthly_capacity", kind: "documents", message }]) {
+            const result = anonToolError(new SheetRenderError("Rendering documents failed (HTTP 429).", 429, detail), "Rendering documents");
+            assert.equal(result.isError, true);
+            assert.equal(textOf(result), ANON_TEXT.busy);
+            assert.doesNotMatch(JSON.stringify(result), BANNED_WORDS);
+        }
     });
 
     it("never forwards upstream error text, credentials or row values", () => {
@@ -577,9 +903,14 @@ describe("flood guard", () => {
         assert.equal(textOf(sharedRefusal), ANON_TEXT.tooManySharedCalls.replace("{minutes}", "60"));
         assert.equal(claudeLimiter.size, 1);
         assert.equal(limiter.size, 0);
-        // A ChatGPT subject on that same network retains its ordinary budget.
-        assert.equal((await call(a.client, "chatgpt-user")).isError, undefined);
+        // An `openai/subject` from Claude's network buys no separate budget,
+        // even if the OpenAI list were misconfigured to cover that network.
         assert.equal((await call(a.client, "chatgpt-user")).isError, true);
+        const misconfigured = await connect({
+            limiter, claudeLimiter, clientIp: "160.79.104.1", openaiEgress: new CidrSet(["160.79.0.0/16"]),
+        });
+        assert.equal((await call(misconfigured.client, "fresh-user")).isError, true);
+        assert.equal(limiter.size, 0);
         assert.equal((await call(other.client)).isError, undefined);
         assert.equal((await call(other.client)).isError, true);
         // The backend's quota identity stays the hashed IP, not the shared key.
@@ -613,6 +944,35 @@ describe("flood guard", () => {
 
         now += 3_600_001;
         assert.equal((await call({ "openai/subject": "a" })).isError, undefined);
+    });
+
+    it("ignores a forged openai/subject from outside OpenAI's ranges", async () => {
+        const limiter = new SlidingWindowLimiter(2, 3_600_000);
+        const { client, calls } = await connect({ limiter, clientIp: "198.51.100.7" });
+        const call = (subject: string) => client.callTool({
+            name: "render_documents",
+            arguments: { template: "letter", rows: [{ body: "x" }] },
+            _meta: { "openai/subject": subject, "openai/locale": "en" },
+        });
+        // A fresh subject per call is still one caller: one IP, one bucket, one monthly subject.
+        assert.equal((await call("fresh-1")).isError, undefined);
+        assert.equal((await call("fresh-2")).isError, undefined);
+        assert.equal((await call("fresh-3")).isError, true);
+        assert.deepEqual(calls.renders.map(([, input]) => input.subject), [
+            `ip:${sha256("198.51.100.7")}`,
+            `ip:${sha256("198.51.100.7")}`,
+        ]);
+        assert.equal(limiter.size, 1);
+    });
+
+    it("ignores every openai/subject when the OpenAI list is empty", async () => {
+        const { client, calls } = await connect({ clientIp: "203.0.113.9", openaiEgress: new CidrSet([]) });
+        await client.callTool({
+            name: "render_documents",
+            arguments: { template: "letter", rows: [{ body: "x" }] },
+            _meta: { "openai/subject": "user-123" },
+        });
+        assert.equal(calls.renders[0]![1].subject, `ip:${sha256("203.0.113.9")}`);
     });
 
     it("does not count catalogue listings", async () => {
@@ -650,11 +1010,91 @@ describe("caller identity", () => {
         assert.equal(detectSource({ progressToken: 1 }, "curl/8"), "other");
     });
 
-    it("hashes the subject and falls back to the hashed IP", () => {
-        assert.equal(subjectKey({ "openai/subject": " s " }, "1.2.3.4"), `sub:${sha256("s")}`);
-        assert.equal(subjectKey({ "openai/subject": "" }, "1.2.3.4"), `ip:${sha256("1.2.3.4")}`);
-        assert.equal(subjectKey({ "openai/subject": 5 }, "1.2.3.4"), `ip:${sha256("1.2.3.4")}`);
-        assert.equal(subjectKey(undefined, "1.2.3.4"), `ip:${sha256("1.2.3.4")}`);
+    it("hashes a trusted subject and falls back to the hashed IP", () => {
+        const egress = new CidrSet(["1.2.3.0/24"]);
+        assert.equal(subjectKey({ "openai/subject": " s " }, "1.2.3.4", undefined, egress), `sub:${sha256("s")}`);
+        assert.equal(subjectKey({ "openai/subject": " s " }, "::ffff:1.2.3.4", undefined, egress), `sub:${sha256("s")}`);
+        assert.equal(subjectKey({ "openai/subject": "" }, "1.2.3.4", undefined, egress), `ip:${sha256("1.2.3.4")}`);
+        assert.equal(subjectKey({ "openai/subject": 5 }, "1.2.3.4", undefined, egress), `ip:${sha256("1.2.3.4")}`);
+        assert.equal(subjectKey(undefined, "1.2.3.4", undefined, egress), `ip:${sha256("1.2.3.4")}`);
+        // Outside the list the subject is ignored.
+        assert.equal(subjectKey({ "openai/subject": "s" }, "1.2.4.4", undefined, egress), `ip:${sha256("1.2.4.4")}`);
+        assert.equal(subjectKey({ "openai/subject": "s" }, "", undefined, egress), `ip:${sha256("unknown")}`);
+    });
+
+    it("believes openai/subject by default only from OpenAI's published ranges", () => {
+        assert.ok(OPENAI_EGRESS_CIDRS.length > 100);
+        for (const cidr of OPENAI_EGRESS_CIDRS) assert.doesNotThrow(() => parseCidr(cidr), cidr);
+        const meta = { "openai/subject": "user-123" };
+        // 104.208.184.192/28 and 98.87.72.221/32 are in chatgpt-connectors.json.
+        for (const ip of ["104.208.184.193", "104.208.184.207", "98.87.72.221", "::ffff:98.87.72.221"]) {
+            assert.equal(trustedOpenaiSubject(meta, ip), "user-123", ip);
+            assert.equal(subjectKey(meta, ip), `sub:${sha256("user-123")}`, ip);
+        }
+        for (const ip of ["104.208.184.208", "98.87.72.222", "203.0.113.9", "127.0.0.1", "160.79.104.5", "2001:db8::1"]) {
+            assert.equal(trustedOpenaiSubject(meta, ip), undefined, ip);
+            assert.equal(subjectKey(meta, ip), `ip:${sha256(ip)}`, ip);
+        }
+    });
+
+    it("matches IPv4 and IPv6 ranges and refuses malformed ones", () => {
+        const set = new CidrSet(["2001:db8::/32", "192.0.2.0/24", "198.51.100.7/32"]);
+        for (const ip of ["2001:db8::1", "2001:db8:ffff::1", "192.0.2.255", "::ffff:192.0.2.1", "198.51.100.7"]) {
+            assert.equal(set.has(ip), true, ip);
+        }
+        for (const ip of ["2001:db9::1", "192.0.3.0", "198.51.100.8", "not-an-ip", "", "192.0.2.1.evil"]) {
+            assert.equal(set.has(ip), false, ip);
+        }
+        for (const cidr of ["192.0.2.1", "192.0.2.0/33", "::/129", "x/8", "192.0.2.0/8/1", "192.0.2.0/-1", ""]) {
+            assert.throws(() => parseCidr(cidr), /Not a CIDR range/, cidr);
+        }
+    });
+
+    it("hashes a session for a Claude-range caller, whatever openai/subject it sends", () => {
+        const sessionId = "private-session-123";
+        assert.equal(subjectKey(undefined, "160.79.104.5", sessionId), `mcps:${sha256(sessionId)}`);
+        assert.equal(subjectKey(undefined, "::ffff:160.79.104.5", sessionId), `mcps:${sha256(sessionId)}`);
+        assert.equal(subjectKey({ "openai/subject": " " }, "160.79.104.5", sessionId), `mcps:${sha256(sessionId)}`);
+        assert.equal(subjectKey({ "openai/subject": " user-123 " }, "160.79.104.5", sessionId), `mcps:${sha256(sessionId)}`);
+        // Even with the Claude range wrongly listed as OpenAI's.
+        assert.equal(
+            subjectKey({ "openai/subject": "user-123" }, "160.79.104.5", sessionId, new CidrSet(["160.79.104.0/21"])),
+            `mcps:${sha256(sessionId)}`,
+        );
+        assert.equal(subjectKey({ "openai/subject": "user-123" }, "160.79.104.5"), `ip:${sha256("160.79.104.5")}`);
+        assert.equal(subjectKey(undefined, "160.79.104.5"), `ip:${sha256("160.79.104.5")}`);
+        assert.equal(subjectKey(undefined, "160.79.104.5", ""), `ip:${sha256("160.79.104.5")}`);
+        assert.equal(subjectKey(undefined, "203.0.113.9", sessionId), `ip:${sha256("203.0.113.9")}`);
+    });
+
+    it("treats every Claude-range call as Claude, whatever its _meta or User-Agent says", () => {
+        assert.equal(callerSource(undefined, undefined, "160.79.104.5"), "claude");
+        assert.equal(callerSource(undefined, "openai-mcp/1.0", "160.79.104.5"), "claude");
+        assert.equal(callerSource({ "openai/subject": "user-123" }, "Claude-User", "160.79.104.5"), "claude");
+        assert.equal(callerSource({ "openai/subject": "user-123" }, undefined, "203.0.113.9"), "chatgpt");
+        assert.equal(callerSource(undefined, "Claude-User", "203.0.113.9"), "claude");
+        assert.equal(callerSource(undefined, undefined, "203.0.113.9"), "other");
+    });
+
+    it("uses the Claude session subject and source for both render and continue", async () => {
+        const sessionId = "private-claude-session";
+        const { client, calls } = await connect({ clientIp: "160.79.104.5", sessionId });
+        const rows = [{ body: "x" }];
+        // A Claude-range caller cannot leave the Claude pool by sending a ChatGPT subject.
+        const forged = { "openai/subject": "forged-user" };
+        const rendered = await client.callTool({ name: "render_documents", arguments: { template: "letter", rows }, _meta: forged });
+        const continued = await client.callTool({ name: "create_continue_link", arguments: { template: "letter", rows }, _meta: forged });
+        assert.equal(rendered.isError, undefined);
+        assert.equal(continued.isError, undefined);
+        assert.equal(calls.renders[0]![1].subject, `mcps:${sha256(sessionId)}`);
+        assert.equal(calls.renders[0]![1].source, "claude");
+        assert.equal(calls.renders[0]![1].pool, "claude");
+        assert.equal(calls.handoffs[0]!.subject, `mcps:${sha256(sessionId)}`);
+        assert.equal(calls.handoffs[0]!.source, "claude");
+        assert.equal("pool" in calls.handoffs[0]!, false);
+        assert.match((continued.structuredContent as { continue_url: string }).continue_url, /\?ref=claude#handoff=/);
+        assert.ok(!JSON.stringify(calls).includes(sessionId));
+        assert.ok(!JSON.stringify([rendered, continued]).includes(sessionId));
     });
 
     it("uses ref=claude for Claude's continue links", async () => {

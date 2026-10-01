@@ -77,6 +77,7 @@ function stringLiterals(source: string): string[] {
 class Element {
     children: Element[] = [];
     textContent = "";
+    className = "";
     dataset = { origin: "https://sheetrender.com" };
     listeners = new Map<string, () => void | Promise<void>>();
     src?: string;
@@ -234,6 +235,28 @@ describe("widget resource", () => {
         await pdf[0]!.listeners.get("click")!();
         assert.equal(pdf[0]!.textContent, "Could not open PDF");
         assert.deepEqual(h.browserOpened, []);
+    });
+
+    it("shows volume refusal messages in a warn paragraph with no documents-left line", async () => {
+        const h = await view();
+        for (const [status, message, used] of [
+            ["volume_used", "This month's documents for this connection are used. The count resets on 2026-11-01.", 50],
+            ["volume_short", "There are 2 documents left this month, fewer than the 3 rows sent. The count resets on 2026-11-01.", 48],
+        ] as const) {
+            h.app.ontoolresult({ structuredContent: {
+                template: "letter", template_name: "Letter", rows_received: 3, rows_rendered: 0,
+                documents: [], missing_fields: [], expires_at: null, status, message,
+                volume: { used, limit: 50, resets_at: "2026-11-01T00:00:00Z" },
+            } });
+            const nodes = h.root.all();
+            assert.deepEqual(nodes.filter((node) => node.tag === "h1").map((node) => node.textContent), ["No documents rendered"]);
+            const warnings = nodes.filter((node) => node.tag === "p" && node.className === "warn");
+            assert.deepEqual(warnings.map((node) => node.textContent), [message]);
+            assert.doesNotMatch(nodes.filter((node) => node !== warnings[0]).map((node) => node.textContent).join(" "), /documents left/i);
+            assert.doesNotMatch(nodes.map((node) => node.textContent).join(" "), /\d+ of \d+ documents left/i);
+            assert.equal(nodes.some((node) => node.tag === "img"), false);
+            assert.doesNotMatch(nodes.map((node) => node.textContent).join(" "), BANNED_WORDS);
+        }
     });
 
     it("validates continue links and honours host link refusals", async () => {

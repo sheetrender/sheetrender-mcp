@@ -35,6 +35,8 @@ interface RenderOutput {
     expires_at: string | null;
     missing_fields: { row_index: number; fields: string[] }[];
     volume: { used: number; limit: number; resets_at: string | null } | null;
+    /** Set when the month's volume refused the call: the server's own sentence. */
+    message?: string;
 }
 
 interface RenderInput {
@@ -112,14 +114,19 @@ function render(): void {
 
     const documents = Array.isArray(output.documents) ? output.documents : [];
     const header = el("div");
-    header.append(el("h1", `${plural(documents.length, "document", "documents")} ready`));
+    const refusal = documents.length === 0 && typeof output.message === "string" && output.message
+        ? output.message
+        : undefined;
+    header.append(el("h1", refusal ? "No documents rendered" : `${plural(documents.length, "document", "documents")} ready`));
     const name = output.template_name ?? output.template;
     if (name) header.append(el("p", name, "muted"));
     root.append(header);
 
     const volume = output.volume;
     const resets = formatDate(volume?.resets_at);
-    if (documents.length === 0 && volume && volume.used >= volume.limit) {
+    if (refusal) {
+        root.append(el("p", refusal, "warn"));
+    } else if (documents.length === 0 && volume && volume.used >= volume.limit) {
         root.append(el(
             "p",
             `This month's ${volume.limit} documents are used.${resets ? ` The count resets on ${resets}.` : ""}`,

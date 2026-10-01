@@ -14,27 +14,33 @@
  * at all gets the anonymous tool set instead (anon.ts): three tools that fill
  * the built-in templates through the demo account. That is what the ChatGPT
  * and Claude directory listings connect to. A request that does send a key
- * gets exactly the API-key tools, as before.
+ * gets exactly the API-key tools, as before. An anonymous `initialize` is
+ * answered with a random `Mcp-Session-Id`; no session is kept behind it, and
+ * a later request that sends it (a Claude caller) is counted by its hash.
  *
  * The stdio server in index.ts is untouched by this file.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { createServer as createNodeServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { isIP } from "node:net";
 
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
 import {
+    callerSource,
     CatalogueCache,
+    CidrSet,
     createAnonServer,
     DEFAULT_CALLS_PER_HOUR,
     DEFAULT_CLAUDE_CALLS_PER_HOUR,
-    detectSource,
+    MAX_ANON_BODY_BYTES,
+    OPENAI_EGRESS_CIDRS,
     openaiSubject,
-    MAX_HANDOFF_BYTES,
+    parseCidr,
     SlidingWindowLimiter,
     subjectFingerprint,
+    trustedOpenaiSubject,
 } from "./anon.js";
 import { DEFAULT_API_URL, parseApiUrl, SheetRenderClient, SheetRenderError } from "./client.js";
 import { createServer, runningAsExecutable, SERVER_VERSION } from "./index.js";
@@ -71,8 +77,10 @@ export interface HttpServerOptions {
     openaiAppsChallenge?: string;
     /** Anonymous flood guard: tool calls per subject per hour. */
     anonCallsPerHour?: number;
-    /** Shared hourly budget for subjectless traffic from 160.79.104.0/21. */
+    /** Shared hourly budget for all traffic from 160.79.104.0/21. */
     claudeCallsPerHour?: number;
+    /** Ranges whose `openai/subject` is believed; OpenAI's published list by default. */
+    openaiEgressCidrs?: readonly string[];
     /** Clock for the flood guard and catalogue cache; tests replace it. */
     now?: () => number;
 }
@@ -90,6 +98,7 @@ export interface HttpConfig {
     openaiAppsChallenge?: string;
     anonCallsPerHour: number;
     claudeCallsPerHour: number;
+    openaiEgressCidrs: readonly string[];
 }
 
 /** Reads the hosted server's configuration from the environment. */
@@ -107,7 +116,28 @@ export function loadHttpConfig(env: NodeJS.ProcessEnv = process.env): HttpConfig
         openaiAppsChallenge: env.OPENAI_APPS_CHALLENGE?.trim() || undefined,
         anonCallsPerHour: readInteger(env, "ANON_CALLS_PER_HOUR", DEFAULT_CALLS_PER_HOUR, 1),
         claudeCallsPerHour: readInteger(env, "CLAUDE_CALLS_PER_HOUR", DEFAULT_CLAUDE_CALLS_PER_HOUR, 1),
+        openaiEgressCidrs: readCidrs(env, "OPENAI_EGRESS_CIDRS", OPENAI_EGRESS_CIDRS),
     };
+}
+
+/**
+ * A comma- or space-separated CIDR list replacing `fallback`; `none` empties
+ * it. OPENAI_EGRESS_CIDRS tracks https://openai.com/chatgpt-connectors.json
+ * between releases; with it set to `none` no `openai/subject` is believed.
+ */
+function readCidrs(env: NodeJS.ProcessEnv, name: string, fallback: readonly string[]): readonly string[] {
+    const raw = env[name]?.trim();
+    if (!raw) return fallback;
+    if (raw.toLowerCase() === "none") return [];
+    const cidrs = raw.split(/[\s,]+/).filter(Boolean);
+    for (const cidr of cidrs) {
+        try {
+            parseCidr(cidr);
+        } catch {
+            throw new SheetRenderError(`${name} must list CIDR ranges, got ${cidr.slice(0, 100)}`);
+        }
+    }
+    return cidrs;
 }
 
 function readDemoKey(env: NodeJS.ProcessEnv): string | undefined {
@@ -244,19 +274,48 @@ function describeRpc(body: unknown): { rpc?: string; tool?: string } {
  * The anonymous call's log fields: a subject fingerprint, the detected source
  * and the row count. Never the subject itself and never a row.
  */
-function describeAnonCall(body: unknown, userAgent: string | undefined): Record<string, unknown> {
+function describeAnonCall(
+    body: unknown,
+    userAgent: string | undefined,
+    ip: string,
+    openaiEgress: CidrSet,
+): Record<string, unknown> {
     const first = Array.isArray(body) ? body[0] : body;
     if (!first || typeof first !== "object") return {};
     const params = (first as { params?: { _meta?: unknown; arguments?: { rows?: unknown } } }).params;
     const meta = params?._meta && typeof params._meta === "object"
         ? params._meta as Record<string, unknown>
         : undefined;
-    const fields: Record<string, unknown> = { source: detectSource(meta, userAgent) };
-    const subject = openaiSubject(meta);
+    const fields: Record<string, unknown> = { source: callerSource(meta, userAgent, ip) };
+    const subject = trustedOpenaiSubject(meta, ip, openaiEgress);
     if (subject) fields.subject_fp = subjectFingerprint(subject);
+    // A subject from outside OpenAI's ranges is ignored. Logged so a stale
+    // list shows up as ChatGPT traffic counted by IP.
+    else if (openaiSubject(meta)) fields.subject_untrusted = true;
     const rows = params?.arguments?.rows;
     if (Array.isArray(rows)) fields.rows = rows.length;
     return fields;
+}
+
+/**
+ * A fresh `Mcp-Session-Id`: 256 random bits. Nothing is stored against it, so
+ * any instance can serve the conversation it names.
+ */
+export function newSessionId(): string {
+    return randomBytes(32).toString("hex");
+}
+
+/** True when a request body (one message or a batch) is, or contains, `initialize`. */
+function isInitialize(body: unknown): boolean {
+    return (Array.isArray(body) ? body : [body]).some((message) =>
+        Boolean(message) && typeof message === "object" && (message as { method?: unknown }).method === "initialize"
+    );
+}
+
+/** The session id a request carries, if it is a usable header value. */
+function sessionIdOf(req: IncomingMessage): string | undefined {
+    const value = req.headers["mcp-session-id"];
+    return typeof value === "string" && /^[\x21-\x7e]{1,256}$/.test(value) ? value : undefined;
 }
 
 const PRIVATE_V4 = /^(10\.|127\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.)/;
@@ -324,6 +383,7 @@ export function createHttpServer(options: HttpServerOptions): Server {
         1,
     );
     const catalogue = new CatalogueCache(undefined, options.now);
+    const openaiEgress = new CidrSet(options.openaiEgressCidrs ?? OPENAI_EGRESS_CIDRS);
 
     const server = createNodeServer((req, res) => {
         const started = process.hrtime.bigint();
@@ -424,14 +484,16 @@ export function createHttpServer(options: HttpServerOptions): Server {
         if (anonymous) fields.anonymous = true;
         else fields.key_fp = keyFingerprint(apiKey);
 
+        // Anonymous calls get the backend's render body cap: 25 rows at their
+        // field caps. create_continue_link checks the handoff cap itself.
+        const limit = anonymous ? Math.min(maxBodyBytes, MAX_ANON_BODY_BYTES) : maxBodyBytes;
         let raw: Buffer;
         try {
-            raw = await readBody(req, anonymous ? Math.min(maxBodyBytes, MAX_HANDOFF_BYTES) : maxBodyBytes);
+            raw = await readBody(req, limit);
         } catch (error) {
             if (error instanceof BodyTooLarge) {
                 // `Connection: close` so the rest of the upload is dropped
                 // rather than drained once the response has been sent.
-                const limit = anonymous ? Math.min(maxBodyBytes, MAX_HANDOFF_BYTES) : maxBodyBytes;
                 sendRpcError(res, 413, -32000, `Request body exceeds ${limit} bytes`, {
                     Connection: "close",
                 });
@@ -448,7 +510,8 @@ export function createHttpServer(options: HttpServerOptions): Server {
         }
         Object.assign(fields, describeRpc(parsedBody));
         const userAgent = req.headers["user-agent"];
-        if (anonymous) Object.assign(fields, describeAnonCall(parsedBody, userAgent));
+        const ip = clientIp(req);
+        if (anonymous) Object.assign(fields, describeAnonCall(parsedBody, userAgent, ip, openaiEgress));
 
         // Aborted when the response closes, so a caller that disconnects mid
         // render does not leave the upstream request running to its timeout.
@@ -464,12 +527,19 @@ export function createHttpServer(options: HttpServerOptions): Server {
                 limiter,
                 claudeLimiter,
                 catalogue,
-                clientIp: clientIp(req),
+                clientIp: ip,
+                openaiEgress,
+                sessionId: sessionIdOf(req),
                 publicUrl: options.publicUrl,
                 demoApiKey,
             })
             : createServer(client, { hosted: true });
+        // Left stateless on purpose: with a generator the SDK would check every
+        // later request's id against this one transport instance, and the next
+        // request lands on a fresh transport, perhaps on another replica. So the
+        // id is issued here and read from the request header in anon.ts.
         const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+        if (anonymous && isInitialize(parsedBody)) res.setHeader("Mcp-Session-Id", newSessionId());
         transport.onerror = (error) => {
             log({ level: "warn", msg: "transport error", ...fields,
                 error: anonymous ? "Anonymous transport failed" : error.message });
@@ -558,6 +628,7 @@ async function main(): Promise<void> {
         openai_apps_challenge: config.openaiAppsChallenge !== undefined,
         anon_calls_per_hour: config.anonCallsPerHour,
         claude_calls_per_hour: config.claudeCallsPerHour,
+        openai_egress_cidrs: config.openaiEgressCidrs.length,
     });
 }
 

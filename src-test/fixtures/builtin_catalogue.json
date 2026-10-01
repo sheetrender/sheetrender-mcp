@@ -15,42 +15,54 @@
           "label": "Recipient name",
           "required": true,
           "example": "Marisol Echeverria",
-          "description": "The person receiving the certificate, printed as the largest line."
+          "description": "The person receiving the certificate, printed as the largest line.",
+          "max_chars": 2000,
+          "max_bytes": 2048
         },
         {
           "key": "course",
           "label": "Course",
           "required": true,
           "example": "Workplace First Aid",
-          "description": "What the person completed."
+          "description": "What the person completed.",
+          "max_chars": 2000,
+          "max_bytes": 2048
         },
         {
           "key": "date",
           "label": "Completion date",
           "required": true,
           "example": "2026-03-12",
-          "description": "When the course was completed. A YYYY-MM-DD date is written out in full (12 March 2026); any other text prints as given."
+          "description": "When the course was completed. A YYYY-MM-DD date is written out in full (12 March 2026); any other text prints as given.",
+          "max_chars": 2000,
+          "max_bytes": 2048
         },
         {
           "key": "issuer",
           "label": "Issued by",
           "required": false,
           "example": "Northfield Training Institute",
-          "description": "The organisation awarding the certificate, printed across the top."
+          "description": "The organisation awarding the certificate, printed across the top.",
+          "max_chars": 2000,
+          "max_bytes": 2048
         },
         {
           "key": "signer_name",
           "label": "Signer name",
           "required": false,
           "example": "Dr Selina Adebayo",
-          "description": "Printed under the signature line."
+          "description": "Printed under the signature line.",
+          "max_chars": 2000,
+          "max_bytes": 2048
         },
         {
           "key": "signer_title",
           "label": "Signer title",
           "required": false,
           "example": "Course Director",
-          "description": "The signer's role, printed under their name."
+          "description": "The signer's role, printed under their name.",
+          "max_chars": 2000,
+          "max_bytes": 2048
         }
       ]
     },
@@ -69,56 +81,72 @@
           "label": "Recipient name",
           "required": true,
           "example": "Adaeze Nwachukwu",
-          "description": "Who the letter is to. Used in the address block and in the greeting (\"Dear Adaeze Nwachukwu,\")."
+          "description": "Who the letter is to. Used in the address block and in the greeting (\"Dear Adaeze Nwachukwu,\").",
+          "max_chars": 2000,
+          "max_bytes": 2048
         },
         {
           "key": "body",
           "label": "Letter text",
           "required": true,
           "example": "Thank you for another year with the club.\n\nYour membership renews on 1 May.",
-          "description": "The text of the letter, without the greeting or the sign-off, which the template adds. A blank line starts a new paragraph. If it starts with \"Dear\", the template leaves out its own greeting."
+          "description": "The text of the letter, without the greeting or the sign-off, which the template adds. A blank line starts a new paragraph. If it starts with \"Dear\", the template leaves out its own greeting.",
+          "max_chars": 5000,
+          "max_bytes": 12288
         },
         {
           "key": "date",
           "label": "Date",
           "required": false,
           "example": "2026-03-18",
-          "description": "The letter's date, top right. A YYYY-MM-DD date is written out in full (18 March 2026); any other text prints as given."
+          "description": "The letter's date, top right. A YYYY-MM-DD date is written out in full (18 March 2026); any other text prints as given.",
+          "max_chars": 2000,
+          "max_bytes": 2048
         },
         {
           "key": "sender_name",
           "label": "Sender name",
           "required": false,
           "example": "Harriet Mbeki",
-          "description": "Who the letter is from, printed at the top and under the sign-off."
+          "description": "Who the letter is from, printed at the top and under the sign-off.",
+          "max_chars": 2000,
+          "max_bytes": 2048
         },
         {
           "key": "sender_title",
           "label": "Sender title",
           "required": false,
           "example": "Membership Secretary",
-          "description": "The sender's role or organisation, printed under their name."
+          "description": "The sender's role or organisation, printed under their name.",
+          "max_chars": 2000,
+          "max_bytes": 2048
         },
         {
           "key": "address_line_1",
           "label": "Address line 1",
           "required": false,
           "example": "14 Pentridge Row",
-          "description": "First line of the recipient's address."
+          "description": "First line of the recipient's address.",
+          "max_chars": 2000,
+          "max_bytes": 2048
         },
         {
           "key": "address_line_2",
           "label": "Address line 2",
           "required": false,
           "example": "Bristol BS7 4CV",
-          "description": "Second line of the recipient's address, such as town and postcode."
+          "description": "Second line of the recipient's address, such as town and postcode.",
+          "max_chars": 2000,
+          "max_bytes": 2048
         },
         {
           "key": "subject",
           "label": "Subject",
           "required": false,
           "example": "Your membership renewal",
-          "description": "A one-line subject, printed in bold above the greeting."
+          "description": "A one-line subject, printed in bold above the greeting.",
+          "max_chars": 2000,
+          "max_bytes": 2048
         }
       ]
     },
@@ -137,56 +165,72 @@
           "label": "Donor name",
           "required": true,
           "example": "Anneke Vandermolen",
-          "description": "The person or organisation who gave."
+          "description": "The person or organisation who gave.",
+          "max_chars": 2000,
+          "max_bytes": 2048
         },
         {
           "key": "amount",
           "label": "Amount",
           "required": true,
           "example": "$1,250.00",
-          "description": "The amount received, with its currency symbol (\"$1,250.00\"). A bare number prints with two decimals and no symbol."
+          "description": "The amount received, with its currency symbol (\"$1,250.00\"). A bare number prints with two decimals and no symbol.",
+          "max_chars": 2000,
+          "max_bytes": 2048
         },
         {
           "key": "date",
           "label": "Date received",
           "required": true,
           "example": "2025-11-14",
-          "description": "When the gift was received. A YYYY-MM-DD date is written out in full (November 14, 2025); any other text prints as given."
+          "description": "When the gift was received. A YYYY-MM-DD date is written out in full (November 14, 2025); any other text prints as given.",
+          "max_chars": 2000,
+          "max_bytes": 2048
         },
         {
           "key": "receipt_number",
           "label": "Receipt number",
           "required": false,
           "example": "2025-1041",
-          "description": "Your reference for this receipt."
+          "description": "Your reference for this receipt.",
+          "max_chars": 2000,
+          "max_bytes": 2048
         },
         {
           "key": "organisation",
           "label": "Organisation",
           "required": false,
           "example": "Rowan Field Trust",
-          "description": "The organisation that received the gift, printed at the top."
+          "description": "The organisation that received the gift, printed at the top.",
+          "max_chars": 2000,
+          "max_bytes": 2048
         },
         {
           "key": "address",
           "label": "Organisation address",
           "required": false,
           "example": "112 Calder Lane, Corvallis OR 97330",
-          "description": "The organisation's address, under its name. Line breaks are kept."
+          "description": "The organisation's address, under its name. Line breaks are kept.",
+          "max_chars": 2000,
+          "max_bytes": 2048
         },
         {
           "key": "tax_id",
           "label": "Tax ID",
           "required": false,
           "example": "12-3456789",
-          "description": "The organisation's tax ID or charity registration number."
+          "description": "The organisation's tax ID or charity registration number.",
+          "max_chars": 2000,
+          "max_bytes": 2048
         },
         {
           "key": "notes",
           "label": "Notes",
           "required": false,
           "example": "No goods or services were provided in exchange for this gift.",
-          "description": "A statement printed under the gift, such as whether anything was given in return."
+          "description": "A statement printed under the gift, such as whether anything was given in return.",
+          "max_chars": 2000,
+          "max_bytes": 2048
         }
       ]
     },
@@ -205,56 +249,72 @@
           "label": "Candidate name",
           "required": true,
           "example": "Mariam Sadeghi",
-          "description": "The person being offered the job. Used in the address block, the greeting and the acceptance signature line."
+          "description": "The person being offered the job. Used in the address block, the greeting and the acceptance signature line.",
+          "max_chars": 2000,
+          "max_bytes": 2048
         },
         {
           "key": "role",
           "label": "Role",
           "required": true,
           "example": "Firmware Engineer",
-          "description": "The job title being offered."
+          "description": "The job title being offered.",
+          "max_chars": 2000,
+          "max_bytes": 2048
         },
         {
           "key": "start_date",
           "label": "Start date",
           "required": true,
           "example": "2026-09-14",
-          "description": "The first day of work. A YYYY-MM-DD date is written out in full (September 14, 2026); any other text prints as given."
+          "description": "The first day of work. A YYYY-MM-DD date is written out in full (September 14, 2026); any other text prints as given.",
+          "max_chars": 2000,
+          "max_bytes": 2048
         },
         {
           "key": "salary",
           "label": "Salary",
           "required": false,
           "example": "$118,000 per year",
-          "description": "The pay, as it should read (\"$118,000 per year\"). A bare number prints with thousands separators and no symbol."
+          "description": "The pay, as it should read (\"$118,000 per year\"). A bare number prints with thousands separators and no symbol.",
+          "max_chars": 2000,
+          "max_bytes": 2048
         },
         {
           "key": "manager_name",
           "label": "Manager name",
           "required": false,
           "example": "Farida Okpara",
-          "description": "Who the candidate will report to. Also signs the letter."
+          "description": "Who the candidate will report to. Also signs the letter.",
+          "max_chars": 2000,
+          "max_bytes": 2048
         },
         {
           "key": "company",
           "label": "Company",
           "required": false,
           "example": "Larkfield Instruments",
-          "description": "The employer, printed at the top and in the offer sentence."
+          "description": "The employer, printed at the top and in the offer sentence.",
+          "max_chars": 2000,
+          "max_bytes": 2048
         },
         {
           "key": "address_line_1",
           "label": "Candidate address",
           "required": false,
           "example": "118 Alder Court, Portland, OR 97214",
-          "description": "The candidate's address, on one line under their name."
+          "description": "The candidate's address, on one line under their name.",
+          "max_chars": 2000,
+          "max_bytes": 2048
         },
         {
           "key": "reply_by",
           "label": "Reply by",
           "required": false,
           "example": "2026-08-28",
-          "description": "The date the candidate should accept by. A YYYY-MM-DD date is written out in full; any other text prints as given."
+          "description": "The date the candidate should accept by. A YYYY-MM-DD date is written out in full; any other text prints as given.",
+          "max_chars": 2000,
+          "max_bytes": 2048
         }
       ]
     }
@@ -262,6 +322,7 @@
   "limits": {
     "rows_per_render": 25,
     "documents_per_month": 50,
+    "claude_pool_per_month": 1000,
     "rows_per_handoff": 100,
     "handoffs_per_day": 10,
     "cell_max_chars": 2000,

@@ -98,17 +98,22 @@ button. Its script, `src/widget/documents.ts`, is bundled by esbuild into
 when the resource is read.
 
 Calls are counted per user: ChatGPT's anonymised `openai/subject`, else the
-client IP. The server allows 30 render or continue calls per subject or IP
-per hour (`ANON_CALLS_PER_HOUR`). Subjectless traffic from Claude's
+client IP. Any caller can send `openai/subject`, so it is believed only from
+OpenAI's published egress ranges ([chatgpt-connectors.json](https://openai.com/chatgpt-connectors.json),
+overridable with `OPENAI_EGRESS_CIDRS`); from anywhere else the call is
+counted by IP. The server allows 30 render or continue calls per subject or IP
+per hour (`ANON_CALLS_PER_HOUR`). All traffic from Claude's
 `160.79.104.0/21` network shares a separate 3,000-call hourly bucket
 (`CLAUDE_CALLS_PER_HOUR`), so its shared addresses do not exhaust an
-individual user's flood guard. User-Agent text cannot claim this bucket.
+individual user's flood guard. Neither User-Agent text nor `_meta` can claim
+or leave this bucket.
 The SheetRender API still applies the monthly document volume against the
 hashed subject or IP. The subject and IP are sent to the API only as SHA-256
 hashes, and the request log carries a fingerprint, the detected client (`chatgpt`,
 `claude` or `other`) and the row count, never the rows.
 
-Anonymous HTTP bodies are capped at 256 KB. A private socket peer is
+Anonymous HTTP bodies are capped at 2 MB, enough for 25 rows at every
+field's limit; a continue link's rows are capped at 256 KB. A private socket peer is
 treated as a proxy and only the final valid IP in `X-Forwarded-For` is
 trusted. Keep this listener behind Caddy, with no publicly exposed container
 port, as in the deployment's Compose topology.
@@ -133,7 +138,8 @@ For the anonymous tools it also reads:
 | `MCP_PUBLIC_URL` | The URL users paste, byte for byte, e.g. `https://mcp.sheetrender.com/mcp`. Sets the view's sandbox origin (Claude hashes this exact string). |
 | `OPENAI_APPS_CHALLENGE` | OpenAI's domain-verification token, served as plain text at `GET /.well-known/openai-apps-challenge` (404 when unset). |
 | `ANON_CALLS_PER_HOUR` | Render and continue calls per subject or IP per hour, default 30. |
-| `CLAUDE_CALLS_PER_HOUR` | Shared render and continue calls per hour for subjectless traffic from `160.79.104.0/21`, default 3000. |
+| `CLAUDE_CALLS_PER_HOUR` | Shared render and continue calls per hour for all traffic from `160.79.104.0/21`, default 3000. |
+| `OPENAI_EGRESS_CIDRS` | Comma- or space-separated CIDRs whose `openai/subject` is believed, replacing the built-in copy of [chatgpt-connectors.json](https://openai.com/chatgpt-connectors.json); `none` believes no subject. |
 
 With `SHEETRENDER_DEMO_API_KEY` set, the server refuses to start if the view
 bundle (`dist/widget/documents.js`) is missing. The `Dockerfile` in this repo

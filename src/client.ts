@@ -112,6 +112,10 @@ export interface BuiltinTemplateField {
     example?: string | number | boolean | null;
     /** How the template prints the value, written for whoever fills it in. */
     description?: string;
+    /** Longest text value, in characters after trimming; absent means the catalogue default. */
+    max_chars?: number;
+    /** Longest text value, in UTF-8 bytes after trimming; absent means the catalogue default. */
+    max_bytes?: number;
 }
 
 /** One built-in template from the public catalogue. Fields past these are ignored. */
@@ -133,10 +137,12 @@ export type Cell = string | number | boolean | null;
 export interface BuiltinRenderInput {
     rows: Record<string, Cell>[];
     title?: string;
-    /** `sub:<sha256>` or `ip:<sha256>`: who the monthly document volume is counted against. */
+    /** `sub:`, `mcps:` or `ip:` and a SHA-256 hex digest: who the monthly document volume is counted against. */
     subject: string;
     /** `chatgpt`, `claude` or `other`, for the backend's usage counters. */
     source: string;
+    /** A shared monthly pool the call is also counted against; only `claude` exists. */
+    pool?: "claude";
 }
 
 export interface BuiltinRenderDocument {
@@ -161,6 +167,10 @@ export interface DocumentVolume {
 export interface BuiltinRenderResult {
     render_id?: string;
     documents?: BuiltinRenderDocument[];
+    /** `rendered`, or `volume_used` / `volume_short` when the month's volume refused the call. */
+    status?: string;
+    /** With a refusal: the backend's own sentence, already neutral. */
+    message?: string;
     missing_fields?: { row_index: number; fields: string[] }[];
     volume?: DocumentVolume;
     monthly_volume?: DocumentVolume;
@@ -717,6 +727,7 @@ export class SheetRenderClient {
             source: input.source,
         };
         if (input.title !== undefined) body.title = input.title;
+        if (input.pool !== undefined) body.pool = input.pool;
         return this.#json<BuiltinRenderResult>({
             method: "POST",
             path: `/api/v1/builtin-templates/${encodeURIComponent(key)}/render`,

@@ -66,7 +66,9 @@ export const ANON_TEXT = {
         "CSV or list and wants a certificate of completion, letter, donation receipt or job " +
         "offer letter for each row. Get the field keys from list_document_templates, map the " +
         "user's columns onto them, and pass each row as an object keyed by field key; values " +
-        "must be text, numbers, true/false or null. Renders up to 25 rows per call and up to " +
+        "must be text, numbers, true/false or null; a text value may hold at most 2000 " +
+        "characters unless list_document_templates gives a different limit for that field. " +
+        "Renders up to 25 rows per call and up to " +
         "50 documents per month for each user; the response says how many documents remain " +
         "this month and when the count resets. Rows missing a required field are reported in " +
         "missing_fields. Preview and PDF links expire after one hour. This tool only fills the " +
@@ -87,6 +89,15 @@ export const ANON_TEXT = {
     continueHow:
         "On the template page the same rows can be kept as a project, connected to a Google " +
         "Sheet, rendered on a schedule, and delivered as a zip, merged PDF or email.",
+
+    /** Describes a text cell in the tools' input schema. */
+    cellText:
+        "Text. A field's length limit is listed by list_document_templates; 2000 characters " +
+        "when none is given.",
+    /** A text value over its field's limit. `{row}` counts from 1. */
+    cellTooLong:
+        "Row {row}, field {field}: the text is longer than the limit of {chars} characters " +
+        "or {bytes} UTF-8 bytes. Shorten it and try again.",
 
     invoking: "Rendering documents",
     invoked: "Documents ready",
