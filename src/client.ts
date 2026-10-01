@@ -167,9 +167,9 @@ export interface DocumentVolume {
 export interface BuiltinRenderResult {
     render_id?: string;
     documents?: BuiltinRenderDocument[];
-    /** `rendered`, or `volume_used` / `volume_short` when the month's volume refused the call. */
+    /** `rendered`, or `volume_used` / `volume_short` when the month's volume covers fewer rows. */
     status?: string;
-    /** With a refusal: the backend's own sentence, already neutral. */
+    /** The backend's own sentence, with either a refusal or a partial render. */
     message?: string;
     missing_fields?: { row_index: number; fields: string[] }[];
     volume?: DocumentVolume;
@@ -188,6 +188,7 @@ export interface HandoffInput {
 
 export interface HandoffResult {
     token: string;
+    rows_saved: number;
     continue_url?: string;
     expires_at?: string | null;
 }

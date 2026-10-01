@@ -259,6 +259,42 @@ describe("widget resource", () => {
         }
     });
 
+    it("shows a partial-render notice above the documents and retains their PDF links", async () => {
+        const h = await view();
+        const message = "  1 of the 3 rows was rendered. The remaining rows were not rendered.\n";
+        const pdf = "https://sheetrender.com/api/previews/x/0.pdf";
+        h.app.ontoolresult({ structuredContent: {
+            template: "letter", template_name: "Letter", rows_received: 3, rows_rendered: 1,
+            documents: [{ row_index: 0, label: "A", preview_png_url: "https://sheetrender.com/api/previews/x/0.png", pdf_url: pdf }],
+            missing_fields: [], expires_at: null, status: "volume_short", message,
+            volume: { used: 50, limit: 50, resets_at: "2026-11-01T00:00:00Z" },
+        } });
+        const nodes = h.root.all();
+        assert.deepEqual(nodes.filter((node) => node.tag === "h1").map((node) => node.textContent), ["1 document ready"]);
+        const notices = nodes.filter((node) => node.tag === "p" && node.className === "warn");
+        assert.deepEqual(notices.map((node) => node.textContent), [message]);
+        const strip = nodes.find((node) => node.className === "strip")!;
+        assert.ok(strip);
+        assert.ok(nodes.indexOf(notices[0]!) < nodes.indexOf(strip));
+        assert.equal(nodes.filter((node) => node.tag === "img").length, 1);
+        const button = nodes.find((node) => node.tag === "button" && node.textContent === "PDF")!;
+        await button.listeners.get("click")!();
+        assert.deepEqual(h.opened, [pdf]);
+    });
+
+    it("opens continue links with the saved row count intact in the fragment", async () => {
+        const h = await view();
+        h.app.ontoolinput({ arguments: { template: "letter", rows: [{ body: "A" }, { body: "B" }] } });
+        h.app.ontoolresult({ structuredContent: { template: "letter", documents: [], missing_fields: [] } });
+        const url = "https://sheetrender.com/templates/mail-merge-letter?ref=mcp#handoff=abc&rows=1";
+        h.reply(url);
+        const button = h.root.all().find((node) => node.textContent === "Continue in SheetRender with these rows")!;
+        await button.listeners.get("click")!();
+        assert.deepEqual(h.opened, [url]);
+        assert.equal(new URL(h.opened[0]!).hash, "#handoff=abc&rows=1");
+        assert.equal(h.calls.length, 1);
+    });
+
     it("validates continue links and honours host link refusals", async () => {
         const h = await view();
         h.app.ontoolinput({ arguments: { template: "letter", rows: [{ body: "x" }] } });

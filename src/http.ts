@@ -286,7 +286,7 @@ function describeAnonCall(
     const meta = params?._meta && typeof params._meta === "object"
         ? params._meta as Record<string, unknown>
         : undefined;
-    const fields: Record<string, unknown> = { source: callerSource(meta, userAgent, ip) };
+    const fields: Record<string, unknown> = { source: callerSource(meta, userAgent, ip, openaiEgress) };
     const subject = trustedOpenaiSubject(meta, ip, openaiEgress);
     if (subject) fields.subject_fp = subjectFingerprint(subject);
     // A subject from outside OpenAI's ranges is ignored. Logged so a stale
@@ -342,7 +342,8 @@ export function clientIp(req: IncomingMessage): string {
     // Do not fall back to an earlier, caller-supplied entry when the trusted
     // proxy's final entry is empty or malformed.
     const address = last && isIP(last) ? last : peer;
-    return address.toLowerCase().startsWith("::ffff:") ? address.slice(7) : address;
+    // Keep hexadecimal mapped IPv4 intact for the identity code to unwrap.
+    return address.toLowerCase().startsWith("::ffff:") && isIP(address.slice(7)) === 4 ? address.slice(7) : address;
 }
 
 // ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@ import {
     CatalogueCache,
     checkRows,
     CidrSet,
+    clientNetwork,
     createAnonServer,
     detectSource,
     isClaudeIp,
@@ -92,7 +93,7 @@ function fakeClient(overrides: Partial<SheetRenderClient> = {}): { client: Sheet
         },
         createHandoff: async (input: HandoffInput) => {
             calls.handoffs.push(input);
-            return { token: "tok_abc-123", expires_at: "2026-10-08T12:00:00Z" };
+            return { token: "tok_abc-123", rows_saved: input.rows.length, expires_at: "2026-10-08T12:00:00Z" };
         },
         ...overrides,
     } as unknown as SheetRenderClient;
@@ -605,13 +606,14 @@ describe("render_documents", () => {
         }
     });
 
-    it("passes volume refusal messages through the MCP client with valid structured output", async () => {
-        for (const [status, message, used] of [
-            ["volume_used", "This month's documents for this connection are used. The count resets on 2026-11-01.", 50],
-            ["volume_short", "There are 2 documents left this month, fewer than the 3 rows sent. The count resets on 2026-11-01.", 48],
+    it("passes refusal and partial-render messages through the MCP client with valid structured output", async () => {
+        for (const [status, message, used, documents] of [
+            ["volume_used", "This month's documents for this connection are used. The count resets on 2026-11-01.", 50, []],
+            ["volume_short", "There are 2 documents left this month, fewer than the 3 rows sent. The count resets on 2026-11-01.", 48, []],
+            ["volume_short", "2 of the 3 rows were rendered. The remaining row was not rendered.", 50, RENDERED.documents!],
         ] as const) {
             const body: BuiltinRenderResult = {
-                documents: [], status, message,
+                documents: [...documents], status, message,
                 volume: { used, limit: 50, resets_at: "2026-11-01T00:00:00Z" },
             };
             const { client } = await connect({ client: fakeClient({ renderBuiltin: async () => body }).client });
@@ -622,24 +624,36 @@ describe("render_documents", () => {
                 name: "render_documents", arguments: { template: "letter", rows: CERT_ROWS },
             });
             assert.ok(!result.isError, status);
-            assert.equal(textOf(result), message);
-            const structured = result.structuredContent as { message: string; status: string };
+            if (documents.length === 0) assert.equal(textOf(result), message);
+            else assert.ok(textOf(result).startsWith(`${message}\nRendered 2 documents`));
+            const structured = result.structuredContent as { message: string; status: string; rows_rendered: number };
             assert.equal(structured.message, message);
             assert.equal(structured.status, status);
+            assert.equal(structured.rows_rendered, documents.length);
             assert.deepEqual(result.structuredContent, buildRenderResult("letter", CERT_ROWS.length, body, API_URL).structuredContent);
             assert.doesNotMatch(textOf(result), BANNED_WORDS);
             assert.doesNotMatch(JSON.stringify(result.structuredContent), BANNED_WORDS);
         }
     });
 
-    it("ignores a backend message when documents were rendered", () => {
-        const message = "This month's documents for this connection are used. The count resets on 2026-11-01.";
+    it("includes the backend notice alongside partially rendered documents", () => {
+        const message = "2 of the 3 rows were rendered. The remaining row was not rendered.";
         const expected = buildRenderResult("certificate", 3, RENDERED, API_URL);
-        const result = buildRenderResult("certificate", 3, { ...RENDERED, status: "volume_used", message }, API_URL);
-        assert.deepEqual(result, expected);
-        assert.equal("message" in result.structuredContent!, false);
-        assert.equal("status" in result.structuredContent!, false);
-        assert.ok(!textOf(result).includes(message));
+        const result = buildRenderResult("certificate", 3, { ...RENDERED, status: "volume_short", message }, API_URL);
+        assert.equal(result.isError, false);
+        assert.deepEqual(result.structuredContent, { ...expected.structuredContent, status: "volume_short", message });
+        assert.equal(textOf(result), `${message}\n${textOf(expected)}`);
+    });
+
+    it("preserves backend messages without trimming or truncating them, with and without documents", () => {
+        const message = "  Some rows were not rendered.\n" + "More rows remain. ".repeat(40) + " \n";
+        assert.ok(message.length > 500);
+        for (const documents of [[], RENDERED.documents!]) {
+            const result = buildRenderResult("certificate", 3, { ...RENDERED, documents, status: "volume_short", message }, API_URL);
+            assert.equal(result.structuredContent!.message, message);
+            if (documents.length === 0) assert.equal(textOf(result), message);
+            else assert.ok(textOf(result).startsWith(`${message}\nRendered 2 documents`));
+        }
     });
 
     it("enforces the UTF-8 cell cap on render and continue without truncating valid cells", async () => {
@@ -813,7 +827,7 @@ describe("render_documents", () => {
             client: fakeClient({
                 listBuiltinTemplates: async () => [{ key: "letter", name: "sr_live_secret" }],
                 renderBuiltin: async () => ({ documents: [{ row_index: 0, label: "sr_live_secret" }] }),
-                createHandoff: async () => ({ token: "sr_live_secret" }),
+                createHandoff: async () => ({ token: "sr_live_secret", rows_saved: 1 }),
             }).client,
         });
         for (const name of ["list_document_templates", "render_documents", "create_continue_link"]) {
@@ -834,7 +848,7 @@ describe("create_continue_link", () => {
             _meta: { "openai/subject": "user-123" },
         });
         assert.equal(result.isError, undefined, textOf(result));
-        const url = `${API_URL}/templates/certificate-of-completion?ref=chatgpt#handoff=tok_abc-123`;
+        const url = `${API_URL}/templates/certificate-of-completion?ref=chatgpt#handoff=tok_abc-123&rows=42`;
         assert.deepEqual(result.structuredContent, {
             continue_url: url,
             expires_at: "2026-10-08T12:00:00Z",
@@ -848,6 +862,46 @@ describe("create_continue_link", () => {
             subject: `sub:${sha256("user-123")}`,
             source: "chatgpt",
         }]);
+    });
+
+    it("preserves the backend continue URL and its saved row count", async () => {
+        const url = `${API_URL}/templates/mail-merge-letter?ref=mcp#handoff=backend_token&rows=1`;
+        const { client } = await connect({ client: fakeClient({
+            createHandoff: async () => ({ token: "tok_abc-123", rows_saved: 1, continue_url: url }),
+        }).client });
+        const result = await client.callTool({
+            name: "create_continue_link", arguments: { template: "letter", rows: [{ body: "A" }, { body: "B" }] },
+        });
+        assert.equal(result.isError, undefined, textOf(result));
+        assert.deepEqual(result.structuredContent, { continue_url: url, expires_at: null, rows_saved: 1 });
+        assert.equal(textOf(result), `Your 1 row is loaded on the template page: ${url}\nThe link expires in 7 days.`);
+    });
+
+    it("rebuilds absent or unsafe backend continue URLs using the backend's saved row count", async () => {
+        const path = "/templates/mail-merge-letter";
+        for (const continueUrl of [
+            undefined,
+            "not a URL",
+            `https://evil.test${path}#handoff=bad`,
+            `https://staging.sheetrender.test.evil.test${path}#handoff=bad`,
+            `http://staging.sheetrender.test${path}#handoff=bad`,
+            `https://user:pass@staging.sheetrender.test${path}#handoff=bad`,
+            `${API_URL}/templates/donation-receipt#handoff=bad`,
+            `${API_URL}${path}/extra#handoff=bad`,
+            `${API_URL}/templates/../elsewhere#handoff=bad`,
+            "javascript:alert(1)",
+        ]) {
+            const { client } = await connect({ client: fakeClient({
+                createHandoff: async () => ({ token: "tok/a&b", rows_saved: 1, continue_url: continueUrl }),
+            }).client });
+            const result = await client.callTool({
+                name: "create_continue_link", arguments: { template: "letter", rows: [{ body: "A" }, { body: "B" }] },
+            });
+            assert.equal(result.isError, undefined, textOf(result));
+            const structured = result.structuredContent as Record<string, unknown>;
+            assert.equal(structured.continue_url, `${API_URL}${path}?ref=mcp#handoff=tok%2Fa%26b&rows=1`);
+            assert.equal(structured.rows_saved, 1);
+        }
     });
 
     it("accepts 100 rows and refuses 101", async () => {
@@ -872,18 +926,52 @@ describe("create_continue_link", () => {
     it("includes title and identity in the handoff byte cap", async () => {
         const { client, calls } = await connect();
         const rows = Array.from({ length: 100 }, () => ({ body: "x".repeat(2000), a: "y".repeat(600) }));
-        // Rows fit, but adding the envelope crosses the backend's exact cap.
-        const gap = MAX_HANDOFF_BYTES - Buffer.byteLength(JSON.stringify(rows)) - 1;
+        const withoutTitle: HandoffInput = {
+            template: "letter", rows, subject: `ip:${sha256("203.0.113.9")}`, source: "other",
+        };
+        // The complete envelope fits exactly; only the title crosses the cap.
+        const gap = MAX_HANDOFF_BYTES - Buffer.byteLength(JSON.stringify(withoutTitle));
         rows[0]!.a += "z".repeat(gap);
-        assert.equal(Buffer.byteLength(JSON.stringify(rows)), MAX_HANDOFF_BYTES - 1);
-        const result = await client.callTool({ name: "create_continue_link", arguments: { template: "letter", rows, title: "x".repeat(120) } });
+        const title = "x".repeat(120);
+        assert.ok(Buffer.byteLength(JSON.stringify(withoutTitle)) <= MAX_HANDOFF_BYTES);
+        assert.ok(Buffer.byteLength(JSON.stringify({ ...withoutTitle, title })) > MAX_HANDOFF_BYTES);
+        const accepted = await client.callTool({ name: "create_continue_link", arguments: { template: "letter", rows } });
+        assert.equal(accepted.isError, undefined, textOf(accepted));
+        const result = await client.callTool({ name: "create_continue_link", arguments: { template: "letter", rows, title } });
         assert.equal(result.isError, true);
         assert.match(textOf(result), /256 KB/);
-        assert.equal(calls.handoffs.length, 0);
+        assert.equal(calls.handoffs.length, 1);
     });
 });
 
 describe("flood guard", () => {
+    it("shares render and continue allowances across an IPv6 /64 and mapped IPv4 spellings", async () => {
+        for (const [addresses, networks] of [
+            [["2001:db8:1:2::1", "2001:0DB8:0001:0002:ffff:ffff:ffff:ffff", "2001:db8:1:3::1"],
+                ["2001:db8:1:2::/64", "2001:db8:1:3::/64"]],
+            [["198.51.100.7", "::ffff:198.51.100.7", "::ffff:c633:6407", "198.51.100.8"],
+                ["198.51.100.7", "198.51.100.8"]],
+        ]) {
+            const limiter = new SlidingWindowLimiter(1, 3_600_000);
+            const callers = await Promise.all(addresses.map((clientIp) => connect({ clientIp, limiter })));
+            const render = (client: Client) => client.callTool({
+                name: "render_documents", arguments: { template: "letter", rows: [{ body: "x" }] },
+            });
+            assert.equal((await render(callers[0]!.client)).isError, undefined);
+            for (const caller of callers.slice(1, -1)) {
+                const result = await caller.client.callTool({
+                    name: "create_continue_link", arguments: { template: "letter", rows: [{ body: "x" }] },
+                });
+                assert.equal(result.isError, true);
+                assert.equal(caller.calls.handoffs.length, 0);
+            }
+            assert.equal((await render(callers.at(-1)!.client)).isError, undefined);
+            assert.deepEqual(callers.flatMap((caller) => caller.calls.renders.map(([, input]) => input.subject)),
+                networks.map((network) => `ip:${sha256(network)}`));
+            assert.equal(limiter.size, 2);
+        }
+    });
+
     it("isolates the shared Claude network budget, retains subjects and expires the window", async () => {
         let now = 0;
         const limiter = new SlidingWindowLimiter(1, 3_600_000, () => now);
@@ -962,6 +1050,7 @@ describe("flood guard", () => {
             `ip:${sha256("198.51.100.7")}`,
             `ip:${sha256("198.51.100.7")}`,
         ]);
+        assert.ok(calls.renders.every(([, input]) => input.source === "other" && !("pool" in input)));
         assert.equal(limiter.size, 1);
     });
 
@@ -973,6 +1062,7 @@ describe("flood guard", () => {
             _meta: { "openai/subject": "user-123" },
         });
         assert.equal(calls.renders[0]![1].subject, `ip:${sha256("203.0.113.9")}`);
+        assert.equal(calls.renders[0]![1].source, "other");
     });
 
     it("does not count catalogue listings", async () => {
@@ -998,22 +1088,48 @@ describe("flood guard", () => {
 
 describe("caller identity", () => {
     it("recognises only valid IPv4 addresses in Claude's exact /21, including mapped IPv4", () => {
-        for (const ip of ["160.79.104.0", "160.79.111.255", "::ffff:160.79.105.2"]) assert.equal(isClaudeIp(ip), true, ip);
+        for (const ip of ["160.79.104.0", "160.79.111.255", "::ffff:160.79.105.2", "0:0:0:0:0:ffff:a04f:6902"]) assert.equal(isClaudeIp(ip), true, ip);
         for (const ip of ["160.79.103.255", "160.79.112.0", "160.79.104.999", "160.79.104.1.evil", "2001:db8::1"]) {
             assert.equal(isClaudeIp(ip), false, ip);
         }
     });
-    it("detects ChatGPT from openai/* meta, and Claude or ChatGPT from the User-Agent", () => {
-        assert.equal(detectSource({ "openai/subject": "x" }, undefined), "chatgpt");
-        assert.equal(detectSource(undefined, "openai-mcp/1.0"), "chatgpt");
-        assert.equal(detectSource(undefined, "Claude-User/1.0"), "claude");
+    it("requires verified identity to detect a source", () => {
+        assert.equal(detectSource({ "openai/subject": "x" }, undefined), "other");
+        assert.equal(detectSource(undefined, "openai-mcp/1.0"), "other");
+        assert.equal(detectSource(undefined, "Claude-User/1.0"), "other");
         assert.equal(detectSource({ progressToken: 1 }, "curl/8"), "other");
+        assert.equal(detectSource(undefined, "curl/8", "160.79.104.5"), "claude");
+        assert.equal(detectSource({ "openai/subject": "x" }, undefined, "203.0.113.9", TEST_OPENAI_EGRESS), "chatgpt");
+    });
+
+    it("uses the backend's exact network spelling before hashing IP subjects", () => {
+        for (const [address, network] of [
+            ["198.51.100.7", "198.51.100.7"],
+            ["::ffff:198.51.100.7", "198.51.100.7"],
+            ["::FFFF:C633:6407", "198.51.100.7"],
+            ["0:0:0:0:0:ffff:c633:6407", "198.51.100.7"],
+            ["2001:db8:1:2:abcd:ef01:2345:6789", "2001:db8:1:2::/64"],
+            ["2001:0DB8:0001:0002::1", "2001:db8:1:2::/64"],
+            ["2001:db8:1:3::1", "2001:db8:1:3::/64"],
+            ["2001:db8::1", "2001:db8::/64"],
+            ["2001:0:0:1:ffff:ffff:ffff:ffff", "2001:0:0:1::/64"],
+            ["::192.0.2.1", "::/64"],
+            ["::1", "::/64"],
+            ["::", "::/64"],
+            ["fe80::1234%eth0", "fe80::/64"],
+            ["not-an-ip", "not-an-ip"],
+            ["", "unknown"],
+        ]) {
+            assert.equal(clientNetwork(address!), network, address);
+            assert.equal(subjectKey(undefined, address!), `ip:${sha256(network!)}`, address);
+        }
     });
 
     it("hashes a trusted subject and falls back to the hashed IP", () => {
         const egress = new CidrSet(["1.2.3.0/24"]);
         assert.equal(subjectKey({ "openai/subject": " s " }, "1.2.3.4", undefined, egress), `sub:${sha256("s")}`);
         assert.equal(subjectKey({ "openai/subject": " s " }, "::ffff:1.2.3.4", undefined, egress), `sub:${sha256("s")}`);
+        assert.equal(subjectKey({ "openai/subject": " s " }, "::ffff:102:304", undefined, egress), `sub:${sha256("s")}`);
         assert.equal(subjectKey({ "openai/subject": "" }, "1.2.3.4", undefined, egress), `ip:${sha256("1.2.3.4")}`);
         assert.equal(subjectKey({ "openai/subject": 5 }, "1.2.3.4", undefined, egress), `ip:${sha256("1.2.3.4")}`);
         assert.equal(subjectKey(undefined, "1.2.3.4", undefined, egress), `ip:${sha256("1.2.3.4")}`);
@@ -1033,7 +1149,7 @@ describe("caller identity", () => {
         }
         for (const ip of ["104.208.184.208", "98.87.72.222", "203.0.113.9", "127.0.0.1", "160.79.104.5", "2001:db8::1"]) {
             assert.equal(trustedOpenaiSubject(meta, ip), undefined, ip);
-            assert.equal(subjectKey(meta, ip), `ip:${sha256(ip)}`, ip);
+            assert.equal(subjectKey(meta, ip), `ip:${sha256(ip === "2001:db8::1" ? "2001:db8::/64" : ip)}`, ip);
         }
     });
 
@@ -1071,9 +1187,49 @@ describe("caller identity", () => {
         assert.equal(callerSource(undefined, undefined, "160.79.104.5"), "claude");
         assert.equal(callerSource(undefined, "openai-mcp/1.0", "160.79.104.5"), "claude");
         assert.equal(callerSource({ "openai/subject": "user-123" }, "Claude-User", "160.79.104.5"), "claude");
-        assert.equal(callerSource({ "openai/subject": "user-123" }, undefined, "203.0.113.9"), "chatgpt");
-        assert.equal(callerSource(undefined, "Claude-User", "203.0.113.9"), "claude");
+        assert.equal(callerSource({ "openai/subject": "user-123" }, undefined, "203.0.113.9"), "other");
+        assert.equal(callerSource(undefined, "Claude-User", "203.0.113.9"), "other");
         assert.equal(callerSource(undefined, undefined, "203.0.113.9"), "other");
+    });
+
+    it("labels ChatGPT only when the subject is trusted by the configured OpenAI ranges", () => {
+        const meta = { "openai/subject": "user-123" };
+        assert.equal(callerSource(meta, "Claude-User", "203.0.113.9", TEST_OPENAI_EGRESS), "chatgpt");
+        assert.equal(callerSource(meta, "openai-mcp/1.0", "198.51.100.7", TEST_OPENAI_EGRESS), "other");
+        assert.equal(callerSource(undefined, "ChatGPT", "203.0.113.9", TEST_OPENAI_EGRESS), "other");
+        assert.equal(callerSource({ "openai/locale": "en" }, "ChatGPT", "203.0.113.9", TEST_OPENAI_EGRESS), "other");
+        assert.equal(callerSource({ "openai/subject": " " }, "ChatGPT", "203.0.113.9", TEST_OPENAI_EGRESS), "other");
+        assert.equal(callerSource(meta, undefined, "98.87.72.221"), "chatgpt");
+        assert.equal(callerSource(meta, "ChatGPT", "98.87.72.221", new CidrSet([])), "other");
+    });
+
+    it("sends source other and no pool for a Claude User-Agent outside Claude's range", async () => {
+        const { client: fake, calls } = fakeClient();
+        const server = createAnonServer({
+            client: fake, limiter: new SlidingWindowLimiter(30, 3_600_000), catalogue: new CatalogueCache(),
+            clientIp: "198.51.100.7", sessionId: "forged-claude-session",
+        });
+        closers.push(() => server.close());
+        // In-memory MCP transports have no HTTP headers; exercise the handlers directly.
+        type Registered = { handler: (args: unknown, extra: unknown) => Promise<ToolResult> };
+        const tools = (server as unknown as { _registeredTools: Record<string, Registered> })._registeredTools;
+        for (const meta of [undefined, { "openai/subject": "forged-user", "source": "claude", "pool": "claude" }]) {
+            for (const name of ["render_documents", "create_continue_link"]) {
+                const result = await tools[name]!.handler(
+                    { template: "letter", rows: [{ body: "x" }] },
+                    { _meta: meta, requestInfo: { headers: { "user-agent": "Claude-User" } } },
+                );
+                assert.equal(result.isError, undefined, textOf(result));
+                if (name === "create_continue_link") assert.match((result.structuredContent as Record<string, unknown>).continue_url as string, /\?ref=mcp#handoff=/);
+            }
+        }
+        for (const input of [...calls.renders.map(([, input]) => input), ...calls.handoffs]) {
+            assert.equal(input.source, "other");
+            assert.equal(input.subject, `ip:${sha256("198.51.100.7")}`);
+            assert.equal("pool" in input, false);
+        }
+        assert.equal(calls.renders.length, 2);
+        assert.equal(calls.handoffs.length, 2);
     });
 
     it("uses the Claude session subject and source for both render and continue", async () => {
@@ -1103,8 +1259,9 @@ describe("caller identity", () => {
             client: fake,
             limiter: new SlidingWindowLimiter(30, 3_600_000),
             catalogue: new CatalogueCache(),
-            clientIp: "203.0.113.9",
+            clientIp: "160.79.104.5",
         });
+        closers.push(() => server.close());
         // The in-memory transport carries no HTTP headers, so drive the
         // handler as the HTTP transport would, with a Claude User-Agent.
         type Registered = { handler: (args: unknown, extra: unknown) => Promise<{ structuredContent: { continue_url: string } }> };
@@ -1115,7 +1272,7 @@ describe("caller identity", () => {
         );
         assert.equal(
             result.structuredContent.continue_url,
-            `${API_URL}/templates/donation-receipt?ref=claude#handoff=tok_abc-123`,
+            `${API_URL}/templates/donation-receipt?ref=claude#handoff=tok_abc-123&rows=1`,
         );
     });
 });

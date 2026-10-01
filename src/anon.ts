@@ -83,8 +83,6 @@ export const MAX_ANON_BODY_BYTES = 2 * 1024 * 1024;
 export const DEFAULT_CALLS_PER_HOUR = 30;
 /** Traffic from Claude's network shares one larger, isolated flood bucket. */
 export const DEFAULT_CLAUDE_CALLS_PER_HOUR = 3000;
-/** The backend's volume sentences are short; this bounds one that is not. */
-const MAX_MESSAGE_CHARS = 500;
 const HOUR_MS = 60 * 60 * 1000;
 const CATALOGUE_TTL_MS = HOUR_MS;
 
@@ -92,22 +90,23 @@ const CATALOGUE_TTL_MS = HOUR_MS;
 // Caller identity
 // ---------------------------------------------------------------------------
 
-/** Which directory the call came from, as far as the request tells. */
+/** Which directory the call came from, based on verified caller identity. */
 export type Source = "chatgpt" | "claude" | "other";
 
 type Meta = Record<string, unknown> | undefined;
 
 /**
- * ChatGPT puts `openai/*` keys (subject, locale, userAgent, …) on every call's
- * `_meta`; Claude sends no such keys, so the User-Agent is the fallback for
- * both. guess: Claude's connector User-Agent contains "Claude" or "Anthropic".
+ * A User-Agent or untrusted `_meta` cannot select a source. Claude must come
+ * from its egress range; ChatGPT must carry a trusted OpenAI subject.
  */
-export function detectSource(meta: Meta, userAgent: string | undefined): Source {
-    if (meta && Object.keys(meta).some((key) => key.startsWith("openai/"))) return "chatgpt";
-    const ua = userAgent ?? "";
-    if (/openai|chatgpt/i.test(ua)) return "chatgpt";
-    if (/claude|anthropic/i.test(ua)) return "claude";
-    return "other";
+export function detectSource(
+    meta: Meta,
+    _userAgent: string | undefined,
+    clientIp = "",
+    openaiEgress: CidrSet = DEFAULT_OPENAI_EGRESS,
+): Source {
+    if (isClaudeIp(clientIp)) return "claude";
+    return trustedOpenaiSubject(meta, clientIp, openaiEgress) ? "chatgpt" : "other";
 }
 
 function sha256(value: string): string {
@@ -188,8 +187,53 @@ export const OPENAI_EGRESS_CIDRS: readonly string[] = [
     "9.234.96.192/28", "9.234.97.96/28", "98.87.72.221/32",
 ];
 
+/** Expand an already validated IPv6 address, including a dotted IPv4 tail. */
+function ipv6Words(address: string): number[] {
+    let plain = address.split("%", 1)[0]!;
+    if (plain.includes(".")) {
+        const tailAt = plain.lastIndexOf(":") + 1;
+        const octets = plain.slice(tailAt).split(".").map(Number);
+        plain = plain.slice(0, tailAt) + ((octets[0]! << 8) | octets[1]!).toString(16) +
+            ":" + ((octets[2]! << 8) | octets[3]!).toString(16);
+    }
+    const [head, tail] = plain.split("::");
+    const words = (part: string) => part ? part.split(":").map((word) => parseInt(word, 16)) : [];
+    const leading = words(head!);
+    if (tail === undefined) return leading;
+    const trailing = words(tail);
+    return [...leading, ...Array<number>(8 - leading.length - trailing.length).fill(0), ...trailing];
+}
+
 function unmapV4(address: string): string {
-    return address.toLowerCase().startsWith("::ffff:") && isIP(address.slice(7)) === 4 ? address.slice(7) : address;
+    if (isIP(address) !== 6) return address;
+    const words = ipv6Words(address);
+    if (words.slice(0, 5).some((word) => word !== 0) || words[5] !== 0xffff) return address;
+    return [words[6]! >> 8, words[6]! & 255, words[7]! >> 8, words[7]! & 255].join(".");
+}
+
+/** Match the backend's client_network: IPv4, unwrapped mapped IPv4, or IPv6 /64. */
+export function clientNetwork(address: string): string {
+    const plain = unmapV4(address);
+    if (isIP(plain) !== 6) return plain || "unknown";
+    const words = ipv6Words(plain);
+    words.fill(0, 4);
+    // Python's IPv6 spelling compresses the longest zero run, first on a tie.
+    let start = 0;
+    let length = 0;
+    for (let i = 0; i < words.length;) {
+        if (words[i] !== 0) {
+            i++;
+            continue;
+        }
+        const from = i;
+        while (i < words.length && words[i] === 0) i++;
+        if (i - from > length) {
+            start = from;
+            length = i - from;
+        }
+    }
+    const hex = words.map((word) => word.toString(16));
+    return `${hex.slice(0, start).join(":")}::${hex.slice(start + length).join(":")}/64`;
 }
 
 /** A CIDR as `address/prefix`, validated; throws on anything else. */
@@ -256,7 +300,7 @@ export function trustedOpenaiSubject(
  * Who a call is counted against, as the backend receives it: a trusted
  * subject hashed (`sub:<sha256>`); else, for a Claude caller that sent an MCP
  * session id, that id hashed (`mcps:<sha256>`, one Claude conversation); else
- * the client IP hashed (`ip:<sha256>`). No raw value leaves this process or
+ * the client network hashed (`ip:<sha256>`). No raw value leaves this process or
  * reaches a log.
  */
 export function subjectKey(
@@ -268,12 +312,17 @@ export function subjectKey(
     const subject = trustedOpenaiSubject(meta, clientIp, openaiEgress);
     if (subject) return `sub:${sha256(subject)}`;
     if (sessionId && isClaudeIp(clientIp)) return `mcps:${sha256(sessionId)}`;
-    return `ip:${sha256(clientIp || "unknown")}`;
+    return `ip:${sha256(clientNetwork(clientIp))}`;
 }
 
 /** Where a call came from; a Claude-range caller is "claude" whatever its `_meta` or User-Agent says. */
-export function callerSource(meta: Meta, userAgent: string | undefined, clientIp: string): Source {
-    return isClaudeIp(clientIp) ? "claude" : detectSource(meta, userAgent);
+export function callerSource(
+    meta: Meta,
+    userAgent: string | undefined,
+    clientIp: string,
+    openaiEgress: CidrSet = DEFAULT_OPENAI_EGRESS,
+): Source {
+    return detectSource(meta, userAgent, clientIp, openaiEgress);
 }
 
 /** Short fingerprint of a subject for the request log. */
@@ -678,6 +727,20 @@ function absoluteUrl(raw: unknown, apiUrl: string): string | null {
     }
 }
 
+/** A continue URL must stay on the API origin and the selected template page. */
+function safeContinueUrl(raw: unknown, apiOrigin: string, key: TemplateKey): string | null {
+    if (typeof raw !== "string" || !raw) return null;
+    try {
+        const url = new URL(raw, `${apiOrigin}/`);
+        return (url.protocol === "https:" || url.protocol === "http:") &&
+                url.origin === apiOrigin && !url.username && !url.password &&
+                url.pathname === `/templates/${TEMPLATE_SLUGS[key]}`
+            ? url.href : null;
+    } catch {
+        return null;
+    }
+}
+
 function readVolume(result: BuiltinRenderResult): DocumentVolume | null {
     const raw = result.volume ?? result.monthly_volume ?? result.daily_volume;
     if (!raw || typeof raw.used !== "number" || typeof raw.limit !== "number") return null;
@@ -714,6 +777,7 @@ export function buildRenderResult(
     const expiresAt = typeof result.expires_at === "string" ? result.expires_at : null;
     const guide = guideUrl(apiUrl, key);
     const name = TEMPLATE_NAMES[key];
+    const message = typeof result.message === "string" ? result.message : undefined;
 
     const structured = {
         template: key,
@@ -725,18 +789,13 @@ export function buildRenderResult(
         missing_fields: missing,
         volume,
         continue: { guide_url: guide, how: ANON_TEXT.continueHow },
+        ...(typeof result.status === "string" ? { status: result.status } : {}),
+        ...(message !== undefined ? { message } : {}),
     };
 
-    // A call the month's volume does not cover is a 200 with no documents and
-    // the backend's own sentence, which is already neutral: pass it on as is.
-    const message = typeof result.message === "string" ? result.message.trim().slice(0, MAX_MESSAGE_CHARS) : "";
-    if (documents.length === 0 && message) {
-        const refused = {
-            ...structured,
-            ...(typeof result.status === "string" ? { status: result.status } : {}),
-            message,
-        };
-        return { ...structuredResult(message, refused), isError: false };
+    // The backend's notice accompanies either a refusal or a partial render.
+    if (documents.length === 0 && message !== undefined) {
+        return { ...structuredResult(message, structured), isError: false };
     }
 
     const resets = isoDate(volume?.resets_at ?? null);
@@ -749,6 +808,7 @@ export function buildRenderResult(
     }
 
     const lines: string[] = [
+        ...(message !== undefined ? [message] : []),
         `Rendered ${plural(documents.length, "document", "documents")} from ` +
             `${plural(rowsReceived, "row", "rows")} with the ${name} template.`,
     ];
@@ -771,7 +831,7 @@ export function buildRenderResult(
         }
     }
     lines.push(ANON_TEXT.continueHow);
-    return structuredResult(lines.join("\n"), structured);
+    return { ...structuredResult(lines.join("\n"), structured), ...(message !== undefined ? { isError: false } : {}) };
 }
 
 // ---------------------------------------------------------------------------
@@ -954,7 +1014,7 @@ export function createAnonServer(options: AnonServerOptions): McpServer {
             try {
                 const tooLong = await overlong(template, rows as Record<string, Cell>[]);
                 if (tooLong) return errorResult(tooLong);
-                const source = callerSource(extra._meta, userAgentOf(extra), clientIp);
+                const source = callerSource(extra._meta, userAgentOf(extra), clientIp, openaiEgress);
                 const result = await client.renderBuiltin(template, {
                     rows: rows as Record<string, Cell>[],
                     title,
@@ -1006,7 +1066,7 @@ export function createAnonServer(options: AnonServerOptions): McpServer {
             try {
                 const tooLong = await overlong(template, rows as Record<string, Cell>[]);
                 if (tooLong) return errorResult(tooLong);
-                const source = callerSource(extra._meta, userAgentOf(extra), clientIp);
+                const source = callerSource(extra._meta, userAgentOf(extra), clientIp, openaiEgress);
                 const input: HandoffInput = {
                     template,
                     rows: rows as Record<string, Cell>[],
@@ -1024,15 +1084,20 @@ export function createAnonServer(options: AnonServerOptions): McpServer {
                 if (typeof handoff.token !== "string" || !handoff.token) {
                     throw new SheetRenderError("Creating the continue link failed: no token came back.");
                 }
+                const rowsSaved = handoff.rows_saved;
+                if (typeof rowsSaved !== "number" || !Number.isSafeInteger(rowsSaved) || rowsSaved < 0) {
+                    throw new SheetRenderError("Creating the continue link failed: no valid row count came back.");
+                }
                 // The token rides in the fragment, so it never reaches a
                 // server log or a Referer header.
-                const url = `${apiOrigin}/templates/${TEMPLATE_SLUGS[template]}` +
-                    `?ref=${refFor(source)}#handoff=${encodeURIComponent(handoff.token)}`;
+                const url = safeContinueUrl(handoff.continue_url, apiOrigin, template) ??
+                    `${apiOrigin}/templates/${TEMPLATE_SLUGS[template]}` +
+                        `?ref=${refFor(source)}#handoff=${encodeURIComponent(handoff.token)}&rows=${rowsSaved}`;
                 const expiresAt = typeof handoff.expires_at === "string" ? handoff.expires_at : null;
                 return safeResult(structuredResult(
-                    `Your ${plural(rows.length, "row is", "rows are")} loaded on the template page: ${url}\n` +
+                    `Your ${plural(rowsSaved, "row is", "rows are")} loaded on the template page: ${url}\n` +
                         "The link expires in 7 days.",
-                    { continue_url: url, expires_at: expiresAt, rows_saved: rows.length },
+                    { continue_url: url, expires_at: expiresAt, rows_saved: rowsSaved },
                 ));
             } catch (error) {
                 return anonToolError(error, "Creating the continue link");
@@ -1050,7 +1115,7 @@ export function createAnonServer(options: AnonServerOptions): McpServer {
             _meta: widgetResourceMeta({ apiOrigin, publicUrl, host: "other" }),
         },
         async (uri, extra) => {
-            const host = detectSource(extra._meta as Meta, userAgentOf(extra as RequestExtra));
+            const host = callerSource(extra._meta as Meta, userAgentOf(extra as RequestExtra), clientIp, openaiEgress);
             return {
                 contents: [{
                     uri: uri.href,

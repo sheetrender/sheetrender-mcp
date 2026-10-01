@@ -35,7 +35,7 @@ interface RenderOutput {
     expires_at: string | null;
     missing_fields: { row_index: number; fields: string[] }[];
     volume: { used: number; limit: number; resets_at: string | null } | null;
-    /** Set when the month's volume refused the call: the server's own sentence. */
+    /** The server's own notice, with either a refusal or a partial render. */
     message?: string;
 }
 
@@ -114,18 +114,18 @@ function render(): void {
 
     const documents = Array.isArray(output.documents) ? output.documents : [];
     const header = el("div");
-    const refusal = documents.length === 0 && typeof output.message === "string" && output.message
+    const message = typeof output.message === "string" && output.message
         ? output.message
         : undefined;
-    header.append(el("h1", refusal ? "No documents rendered" : `${plural(documents.length, "document", "documents")} ready`));
+    header.append(el("h1", documents.length === 0 && message ? "No documents rendered" : `${plural(documents.length, "document", "documents")} ready`));
     const name = output.template_name ?? output.template;
     if (name) header.append(el("p", name, "muted"));
     root.append(header);
 
     const volume = output.volume;
     const resets = formatDate(volume?.resets_at);
-    if (refusal) {
-        root.append(el("p", refusal, "warn"));
+    if (message) {
+        root.append(el("p", message, "warn"));
     } else if (documents.length === 0 && volume && volume.used >= volume.limit) {
         root.append(el(
             "p",

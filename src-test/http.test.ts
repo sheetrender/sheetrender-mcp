@@ -363,7 +363,8 @@ async function fakeBuiltinBackend(): Promise<{ url: string; calls: { path: strin
         req.on("data", (chunk: Buffer) => chunks.push(chunk));
         req.on("end", () => {
             const raw = Buffer.concat(chunks).toString("utf8");
-            calls.push({ path: req.url ?? "", auth: req.headers.authorization ?? "<none>", body: raw ? JSON.parse(raw) : undefined });
+            const body = raw ? JSON.parse(raw) as { rows?: unknown[] } : undefined;
+            calls.push({ path: req.url ?? "", auth: req.headers.authorization ?? "<none>", body });
             res.writeHead(200, { "Content-Type": "application/json" });
             if (req.url === "/api/v1/builtin-templates") {
                 res.end(CATALOGUE_JSON);
@@ -375,7 +376,7 @@ async function fakeBuiltinBackend(): Promise<{ url: string; calls: { path: strin
                     expires_at: "2026-10-01T14:00:00Z",
                 }));
             } else if (req.url === "/api/v1/handoffs") {
-                res.end(JSON.stringify({ token: "tok_http", expires_at: "2026-10-08T12:00:00Z" }));
+                res.end(JSON.stringify({ token: "tok_http", rows_saved: body?.rows?.length ?? 0, expires_at: "2026-10-08T12:00:00Z" }));
             } else {
                 res.writeHead(404);
                 res.end(JSON.stringify({ detail: "Not Found" }));
@@ -676,7 +677,7 @@ describe("anonymous mode", () => {
 
     it("shares the configurable Claude range bucket without changing other callers", async () => {
         const backend = await fakeBuiltinBackend();
-        const { url } = await startAnon(backend.url, { anonCallsPerHour: 1, claudeCallsPerHour: 2 });
+        const { url, logs } = await startAnon(backend.url, { anonCallsPerHour: 1, claudeCallsPerHour: 2 });
         const call = (ip: string, meta?: Record<string, unknown>) => rawRpc(url, {
             jsonrpc: "2.0", id: 1, method: "tools/call", params: {
                 name: "render_documents", arguments: { template: "letter", rows: [{ body: "x" }] }, _meta: meta,
@@ -692,6 +693,38 @@ describe("anonymous mode", () => {
         // A Claude User-Agent outside the verified range cannot claim its budget.
         assert.equal(await failed("203.0.113.8"), undefined);
         assert.equal(await failed("203.0.113.8"), true);
+        const renders = backend.calls.filter((call) => call.path.endsWith("/render"));
+        assert.deepEqual(renders.map((call) => (call.body as { source: string }).source), ["claude", "claude", "other"]);
+        assert.equal("pool" in (renders[2]!.body as Record<string, unknown>), false);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        const entries = logs.filter((entry) => entry.msg === "request" && entry.tool === "render_documents");
+        assert.deepEqual(entries.map((entry) => entry.source), ["claude", "claude", "claude", "claude", "other", "other"]);
+    });
+
+    it("shares HTTP flood buckets across IPv6 /64 addresses and mapped IPv4 spellings", async () => {
+        const backend = await fakeBuiltinBackend();
+        const { url } = await startAnon(backend.url, { anonCallsPerHour: 1 });
+        const call = (ip: string) => rawRpc(url, {
+            jsonrpc: "2.0", id: 1, method: "tools/call",
+            params: { name: "render_documents", arguments: { template: "letter", rows: [{ body: "x" }] } },
+        }, { "X-Forwarded-For": ip });
+        for (const [ip, refused] of [
+            ["2001:db8:1:2::1", false],
+            ["2001:db8:1:2::2", true],
+            ["2001:0DB8:0001:0002:ffff:ffff:ffff:ffff", true],
+            ["2001:db8:1:3::1", false],
+            ["198.51.100.7", false],
+            ["::ffff:198.51.100.7", true],
+            ["::ffff:c633:6407", true],
+            ["198.51.100.8", false],
+        ] as const) {
+            const result = (await call(ip)).json as { result: { isError?: boolean } };
+            assert.equal(Boolean(result.result.isError), refused, ip);
+        }
+        const renders = backend.calls.filter((call) => call.path.endsWith("/render"));
+        assert.deepEqual(renders.map((call) => (call.body as { subject: string }).subject),
+            ["2001:db8:1:2::/64", "2001:db8:1:3::/64", "198.51.100.7", "198.51.100.8"]
+                .map((network) => `ip:${createHash("sha256").update(network).digest("hex")}`));
     });
 
     it("renders 25 letters at their field caps through the HTTP body cap", async () => {
@@ -736,20 +769,44 @@ describe("anonymous mode", () => {
                 name: "render_documents", arguments: { template: "letter", rows: [{ body: "x" }] },
                 _meta: { "openai/subject": subject },
             },
-        }, { "X-Forwarded-For": "198.51.100.9" });
+        }, { "X-Forwarded-For": "198.51.100.9", "User-Agent": "ChatGPT" });
         type Result = { result: { isError?: boolean } };
         assert.equal(((await call("fresh-1")).json as Result).result.isError, undefined);
         assert.equal(((await call("fresh-2")).json as Result).result.isError, true);
         const render = backend.calls.find((c) => c.path.endsWith("/render"))!;
         assert.equal((render.body as { subject: string }).subject, `ip:${createHash("sha256").update("198.51.100.9").digest("hex")}`);
+        assert.equal((render.body as { source: string }).source, "other");
+        assert.equal("pool" in (render.body as Record<string, unknown>), false);
         await new Promise((resolve) => setTimeout(resolve, 20));
         const entries = logs.filter((entry) => entry.msg === "request" && entry.tool === "render_documents");
         assert.equal(entries.length, 2);
         for (const entry of entries) {
+            assert.equal(entry.source, "other");
             assert.equal(entry.subject_untrusted, true);
             assert.equal("subject_fp" in entry, false);
         }
         assert.equal(JSON.stringify(logs).includes("fresh-1"), false);
+    });
+
+    it("logs source other when configured OpenAI ranges do not trust a published OpenAI IP", async () => {
+        const backend = await fakeBuiltinBackend();
+        const { url, logs } = await startAnon(backend.url, { openaiEgressCidrs: [] });
+        const response = await rawRpc(url, {
+            jsonrpc: "2.0", id: 1, method: "tools/call",
+            params: {
+                name: "render_documents", arguments: { template: "letter", rows: [{ body: "x" }] },
+                _meta: { "openai/subject": "untrusted-user" },
+            },
+        }, { "X-Forwarded-For": "98.87.72.221", "User-Agent": "ChatGPT" });
+        assert.ok(!(response.json as { result: { isError?: boolean } }).result.isError);
+        const render = backend.calls.find((call) => call.path.endsWith("/render"))!;
+        assert.equal((render.body as { source: string }).source, "other");
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        const entry = logs.find((entry) => entry.msg === "request" && entry.tool === "render_documents")!;
+        assert.ok(entry);
+        assert.equal(entry.source, "other");
+        assert.equal(entry.subject_untrusted, true);
+        assert.equal("subject_fp" in entry, false);
     });
 
     it("caps anonymous HTTP bodies at 2 MB while preserving the API-key body cap", async () => {
