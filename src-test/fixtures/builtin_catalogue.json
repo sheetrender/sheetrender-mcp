@@ -92,7 +92,8 @@
           "example": "Thank you for another year with the club.\n\nYour membership renews on 1 May.",
           "description": "The text of the letter, without the greeting or the sign-off, which the template adds. A blank line starts a new paragraph. If it starts with \"Dear\", the template leaves out its own greeting.",
           "max_chars": 5000,
-          "max_bytes": 12288
+          "max_bytes": 12288,
+          "max_lines": 150
         },
         {
           "key": "date",
@@ -212,7 +213,8 @@
           "example": "112 Calder Lane, Corvallis OR 97330",
           "description": "The organisation's address, under its name. Line breaks are kept.",
           "max_chars": 2000,
-          "max_bytes": 2048
+          "max_bytes": 2048,
+          "max_lines": 150
         },
         {
           "key": "tax_id",
@@ -230,7 +232,8 @@
           "example": "No goods or services were provided in exchange for this gift.",
           "description": "A statement printed under the gift, such as whether anything was given in return.",
           "max_chars": 2000,
-          "max_bytes": 2048
+          "max_bytes": 2048,
+          "max_lines": 150
         }
       ]
     },
