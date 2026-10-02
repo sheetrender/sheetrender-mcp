@@ -9,7 +9,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { ClientRequestSchema, JSONRPCRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 
-import { CidrSet, MAX_ANON_BODY_BYTES, OPENAI_EGRESS_CIDRS, subjectFingerprint } from "../src/anon.js";
+import { CidrSet, MAX_ANON_BATCH, MAX_ANON_BODY_BYTES, OPENAI_EGRESS_CIDRS, subjectFingerprint } from "../src/anon.js";
 import { ANON_TEXT } from "../src/anon-descriptions.js";
 import {
     bearerToken,
@@ -17,8 +17,10 @@ import {
     createHttpServer,
     keyFingerprint,
     loadHttpConfig,
+    MAX_KEYED_BATCH,
     newSessionId,
     UntrustedSubjectTally,
+    VerifiedKeys,
     type LogEntry,
 } from "../src/http.js";
 
@@ -67,9 +69,32 @@ async function fakeBackend(): Promise<{ url: string; authHeaders: string[] }> {
     return { url, authHeaders };
 }
 
+/**
+ * A stand-in API that, like the real one, answers 401 to every key but
+ * `validKey`, and an empty template list to that one.
+ */
+async function keyCheckingBackend(validKey: string): Promise<{ url: string; authHeaders: string[] }> {
+    const authHeaders: string[] = [];
+    const server = createNodeServer((req, res) => {
+        req.resume();
+        authHeaders.push(req.headers.authorization ?? "<none>");
+        const ok = req.headers.authorization === `Bearer ${validKey}`;
+        res.writeHead(ok ? 200 : 401, { "Content-Type": "application/json" });
+        res.end(ok ? "[]" : JSON.stringify({ detail: "Invalid API key" }));
+    });
+    const url = await listen(server);
+    closers.push(() => closeServer(server));
+    return { url, authHeaders };
+}
+
+/** The cheapest API-key tool call: one GET of the account's templates. */
+const LIST_TEMPLATES_CALL = {
+    jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "list_templates", arguments: {} },
+};
+
 async function startMcp(
     apiUrl: string,
-    extra: { maxBodyBytes?: number; openaiAppsChallenge?: string } = {},
+    extra: Partial<Parameters<typeof createHttpServer>[0]> = {},
 ): Promise<{ url: string; logs: LogEntry[] }> {
     const logs: LogEntry[] = [];
     const server = createHttpServer({ apiUrl, log: (entry) => logs.push(entry), ...extra });
@@ -893,7 +918,7 @@ describe("anonymous mode", () => {
         assert.equal("subject_fp" in entry, false);
     });
 
-    it("caps anonymous HTTP bodies at 2 MB while preserving the API-key body cap", async () => {
+    it("caps anonymous and unconfirmed-key bodies at 2 MB, and gives a key the API accepted the full cap", async () => {
         const limit = MAX_ANON_BODY_BYTES;
         assert.equal(limit, 2 * 1024 * 1024);
         const paddedRequest = (bytes: number) => {
@@ -911,11 +936,26 @@ describe("anonymous mode", () => {
         assert.equal(accepted.status, 200);
         assert.ok((accepted.json as { result: { tools: { name: string }[] } }).result.tools.some((tool) => tool.name === "render_documents"));
         assert.equal((await rawRpc(url, overLimit)).status, 413);
-        const keyed = await rawRpc(url, overLimit, { Authorization: "Bearer sr_test_key" });
+        // Any `sr_` string selects the API-key tools, but proves nothing: a
+        // made-up key gets the anonymous cap, and is told how to get more.
+        const madeUpKey = await rawRpc(url, overLimit, { Authorization: "Bearer sr_test_key" });
+        assert.equal(madeUpKey.status, 413);
+        assert.match((madeUpKey.json as { error: { message: string } }).error.message, /accepted this key/);
+        // Once the API has answered a call made with the key, the full cap applies.
+        const backend = await keyCheckingBackend("sr_live_real");
+        const keyedServer = await startMcp(backend.url);
+        const real = { Authorization: "Bearer sr_live_real" };
+        assert.equal((await rawRpc(keyedServer.url, overLimit, real)).status, 413);
+        await rawRpc(keyedServer.url, LIST_TEMPLATES_CALL, real);
+        const keyed = await rawRpc(keyedServer.url, overLimit, real);
         assert.equal(keyed.status, 200);
         const names = (keyed.json as { result: { tools: { name: string }[] } }).result.tools.map((tool) => tool.name);
         assert.ok(names.includes("render_pdf"));
         assert.ok(!names.includes("render_documents"));
+        // A key the API refused stays bounded.
+        const refused = { Authorization: "Bearer sr_live_revoked" };
+        await rawRpc(keyedServer.url, LIST_TEMPLATES_CALL, refused);
+        assert.equal((await rawRpc(keyedServer.url, overLimit, refused)).status, 413);
     });
 
     it("refuses an anonymous batch past 4 messages before dispatching any of it", async () => {
@@ -932,11 +972,140 @@ describe("anonymous mode", () => {
         const small = await postRaw(url, widgetReads(4));
         assert.equal(small.status, 200);
         assert.equal(events(await small.text()), 4);
-        // API-key callers keep the SDK's batching as before.
-        const listTools = Array.from({ length: 50 }, (_, index) => ({ jsonrpc: "2.0", id: index + 1, method: "tools/list" }));
-        const keyed = await postRaw(url, listTools, { Authorization: "Bearer sr_test_key" });
-        assert.equal(keyed.status, 200);
-        assert.equal(events(await keyed.text()), 50);
+        // A made-up key gets the same cap: the keyed server answers tools/list
+        // locally, so 50 of them would never meet an authentication check.
+        const listTools = (count: number) =>
+            Array.from({ length: count }, (_, index) => ({ jsonrpc: "2.0", id: index + 1, method: "tools/list" }));
+        const madeUp = await postRaw(url, listTools(50), { Authorization: "Bearer sr_test_key" });
+        const madeUpText = await madeUp.text();
+        assert.equal(madeUp.status, 400, `answered with ${events(madeUpText)} messages`);
+        assert.equal((JSON.parse(madeUpText) as { error: { code: number } }).error.code, -32600);
+        assert.equal((await postRaw(url, listTools(MAX_ANON_BATCH + 1), { Authorization: "Bearer sr_test_key" })).status, 400);
+        const fits = await postRaw(url, listTools(MAX_ANON_BATCH), { Authorization: "Bearer sr_test_key" });
+        assert.equal(fits.status, 200);
+        assert.equal(events(await fits.text()), MAX_ANON_BATCH);
+    });
+
+    it("lets a key the API accepted batch up to 20 messages, and no further", async () => {
+        assert.equal(MAX_KEYED_BATCH, 20);
+        const backend = await keyCheckingBackend("sr_live_real");
+        const { url } = await startMcp(backend.url);
+        const listTools = (count: number) =>
+            Array.from({ length: count }, (_, index) => ({ jsonrpc: "2.0", id: index + 1, method: "tools/list" }));
+        const events = (text: string) => text.split("\n").filter((line) => line.startsWith("data: {")).length;
+        const real = { Authorization: "Bearer sr_live_real" };
+        assert.equal((await postRaw(url, listTools(MAX_ANON_BATCH + 1), real)).status, 400, "not yet accepted");
+        await rawRpc(url, LIST_TEMPLATES_CALL, real);
+        const full = await postRaw(url, listTools(MAX_KEYED_BATCH), real);
+        assert.equal(full.status, 200);
+        assert.equal(events(await full.text()), MAX_KEYED_BATCH);
+        const over = await postRaw(url, listTools(MAX_KEYED_BATCH + 1), real);
+        assert.equal(over.status, 400);
+        assert.match((await over.json() as { error: { message: string } }).error.message, /at most 20 messages/);
+        // The key the API turned away gets nothing from having asked.
+        const refused = { Authorization: "Bearer sr_live_revoked" };
+        await rawRpc(url, LIST_TEMPLATES_CALL, refused);
+        assert.equal((await postRaw(url, listTools(MAX_ANON_BATCH + 1), refused)).status, 400);
+        assert.deepEqual(backend.authHeaders, ["Bearer sr_live_real", "Bearer sr_live_revoked"]);
+    });
+
+    it("counts every message from an unconfirmed key toward the network budget, tool calls too", async () => {
+        const backend = await keyCheckingBackend("sr_live_real");
+        const { url, logs } = await startMcp(backend.url, { anonRpcPerHour: 3 });
+        const list = (key: string, ip: string) =>
+            postRaw(url, { jsonrpc: "2.0", id: 1, method: "tools/list" }, { Authorization: `Bearer ${key}`, "X-Forwarded-For": ip });
+        for (let i = 0; i < 3; i++) assert.equal((await list("sr_fake_a", "198.51.100.1")).status, 200);
+        const refused = await list("sr_fake_a", "198.51.100.1");
+        assert.equal(refused.status, 429);
+        assert.equal(refused.headers.get("retry-after"), "3600");
+        // A fresh made-up key from the same /24 is the same caller.
+        assert.equal((await list("sr_fake_b", "198.51.100.2")).status, 429);
+        // Tool calls count as well: each would be a free trip to the API.
+        const call = (key: string, ip: string) =>
+            rawRpc(url, LIST_TEMPLATES_CALL, { Authorization: `Bearer ${key}`, "X-Forwarded-For": ip });
+        for (let i = 0; i < 3; i++) assert.equal((await call("sr_fake_c", "198.51.101.1")).status, 200);
+        assert.equal((await call("sr_fake_c", "198.51.101.1")).status, 429);
+        assert.equal(backend.authHeaders.filter((header) => header.startsWith("Bearer sr_fake")).length, 3);
+        // A batch needs room for all of its messages.
+        const batch = await postRaw(url, [
+            { jsonrpc: "2.0", id: 1, method: "tools/list" },
+            { jsonrpc: "2.0", id: 2, method: "tools/list" },
+            { jsonrpc: "2.0", id: 3, method: "tools/list" },
+            { jsonrpc: "2.0", id: 4, method: "tools/list" },
+        ], { Authorization: "Bearer sr_fake_d", "X-Forwarded-For": "198.51.102.1" });
+        assert.equal(batch.status, 429);
+        // A key the API accepted is no longer counted once confirmed.
+        assert.equal((await call("sr_live_real", "198.51.103.1")).status, 200);
+        for (let i = 0; i < 5; i++) assert.equal((await list("sr_live_real", "198.51.103.1")).status, 200);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        const entries = logs.filter((entry) => entry.msg === "request");
+        assert.ok(entries.some((entry) => entry.key_verified === false && entry.refused === "network_rpc"));
+        assert.ok(entries.some((entry) => entry.key_verified === true));
+        assert.equal(JSON.stringify(logs).includes("sr_fake"), false);
+        assert.equal(JSON.stringify(logs).includes("sr_live_real"), false);
+    });
+
+    it("holds every keyed request to the overall in-flight cap, and unconfirmed keys to the network cap", async () => {
+        let release!: () => void;
+        const held = new Promise<void>((resolve) => { release = resolve; });
+        let renders = 0;
+        const backend = createNodeServer((req, res) => {
+            req.resume();
+            const ok = req.headers.authorization === "Bearer sr_live_real";
+            const answer = () => {
+                if (!ok) {
+                    res.writeHead(401, { "Content-Type": "application/json" });
+                    res.end(JSON.stringify({ detail: "Invalid API key" }));
+                } else if (req.url === "/api/v1/renders") {
+                    res.writeHead(200, { "Content-Type": "application/pdf" });
+                    res.end("%PDF-1.4\n%%EOF\n");
+                } else {
+                    res.writeHead(200, { "Content-Type": "application/json" });
+                    res.end("[]");
+                }
+            };
+            if (req.url !== "/api/v1/renders") {
+                answer();
+                return;
+            }
+            // Renders are held until release(), so their requests stay in flight.
+            renders++;
+            void held.then(answer);
+        });
+        const apiUrl = await listen(backend);
+        closers.push(() => closeServer(backend));
+        const { url } = await startMcp(apiUrl, { anonMaxInFlight: 2, anonNetworkMaxInFlight: 1 });
+        const headers = (key: string, ip: string) => ({ Authorization: `Bearer ${key}`, "X-Forwarded-For": ip });
+        const list = (key: string, ip: string) => postRaw(url, { jsonrpc: "2.0", id: 1, method: "tools/list" }, headers(key, ip));
+        const render = (key: string, ip: string) => postRaw(url, {
+            jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "render_pdf", arguments: { html: "<p>x</p>" } },
+        }, headers(key, ip));
+
+        assert.equal((await rawRpc(url, LIST_TEMPLATES_CALL, headers("sr_live_real", "198.51.100.9"))).status, 200);
+        // A made-up key holds its network's one slot...
+        const fake = render("sr_fake_1", "198.51.100.1");
+        await waitUntil(() => renders === 1);
+        // ...and a fresh made-up key from that network is refused,
+        const sameNetwork = await list("sr_fake_2", "198.51.100.2");
+        assert.equal(sameNetwork.status, 429);
+        assert.equal(sameNetwork.headers.get("retry-after"), "5");
+        // while a key the API accepted is not held to the network cap.
+        assert.equal((await list("sr_live_real", "198.51.100.3")).status, 200);
+        const real = render("sr_live_real", "198.51.101.1");
+        await waitUntil(() => renders === 2);
+        // Two in flight overall: every caller is refused, the confirmed key included.
+        const busy = await list("sr_fake_3", "198.51.102.1");
+        assert.equal(busy.status, 503);
+        assert.equal(busy.headers.get("retry-after"), "5");
+        assert.equal((await list("sr_live_real", "198.51.102.2")).status, 503);
+        assert.equal(renders, 2, "a refused request never reaches the backend");
+        release();
+        for (const pending of [fake, real]) {
+            const response = await pending;
+            assert.equal(response.status, 200);
+            await response.text();
+        }
+        await waitUntil(async () => (await list("sr_fake_4", "198.51.100.4")).status === 200);
     });
 
     it("counts resources/read and other non-tool messages per network, but not the platforms' traffic", async () => {
@@ -1018,9 +1187,11 @@ describe("anonymous mode", () => {
         assert.equal(busy.status, 503);
         assert.equal(busy.headers.get("retry-after"), "5");
         assert.equal(received, 2, "a refused request never reaches the backend");
-        // API-key callers are not counted.
-        assert.equal((await postRaw(url, { jsonrpc: "2.0", id: 1, method: "tools/list" },
-            { Authorization: "Bearer sr_test_key" })).status, 200);
+        // A made-up key does not get around either bound.
+        const keyedList = (ip: string) => postRaw(url, { jsonrpc: "2.0", id: 1, method: "tools/list" },
+            { Authorization: "Bearer sr_test_key", "X-Forwarded-For": ip });
+        assert.equal((await keyedList("198.51.100.3")).status, 429);
+        assert.equal((await keyedList("198.51.103.1")).status, 503);
         release();
         for (const pending of [first, second]) {
             const response = await pending;
@@ -1159,5 +1330,34 @@ describe("UntrustedSubjectTally", () => {
         now += 2 * 60 * 60 * 1000;
         tally.flush();
         assert.equal(logs.length, 2);
+    });
+});
+
+describe("VerifiedKeys", () => {
+    it("remembers an accepted key until its time runs out, renewed by each acceptance", () => {
+        let now = 0;
+        const keys = new VerifiedKeys(1000, 10, () => now);
+        assert.equal(keys.has("sr_live_a"), false);
+        keys.add("sr_live_a");
+        now = 900;
+        assert.equal(keys.has("sr_live_a"), true);
+        keys.add("sr_live_a");
+        now = 1800;
+        assert.equal(keys.has("sr_live_a"), true);
+        now = 1900;
+        assert.equal(keys.has("sr_live_a"), false);
+        assert.equal(keys.size, 0);
+    });
+
+    it("keeps at most its limit, dropping the least recently accepted", () => {
+        const keys = new VerifiedKeys(60_000, 2);
+        keys.add("sr_live_a");
+        keys.add("sr_live_b");
+        keys.add("sr_live_a");
+        keys.add("sr_live_c");
+        assert.equal(keys.size, 2);
+        assert.equal(keys.has("sr_live_b"), false);
+        assert.equal(keys.has("sr_live_a"), true);
+        assert.equal(keys.has("sr_live_c"), true);
     });
 });

@@ -68,6 +68,23 @@ const DEFAULT_MAX_BODY_BYTES = 25 * 1024 * 1024;
 const DEFAULT_IDLE_TIMEOUT_MS = 60_000;
 /** The MCP-Protocol-Version header is logged as sent, cut to this length. */
 const MAX_LOGGED_HEADER_CHARS = 40;
+/**
+ * Most messages a JSON-RPC batch may carry from an API key the SheetRender API
+ * has accepted. MCP removed batching in protocol version 2025-06-18 and the
+ * official SDK clients send one message per POST; a 2025-03-26 client could
+ * batch a few responses and notifications together. Twenty is ample for that
+ * while keeping a 25 MB body from dispatching thousands of messages. Anonymous
+ * requests and keys not yet accepted get MAX_ANON_BATCH.
+ */
+export const MAX_KEYED_BATCH = 20;
+/**
+ * How long a key the API accepted keeps the API-key limits, renewed by every
+ * accepted call. Only the limits ride on this: every tool call still sends
+ * the key to the API, so a key revoked meanwhile is refused there at once.
+ */
+const VERIFIED_KEY_TTL_MS = 60 * 60 * 1000;
+/** Most accepted keys remembered at once; the least recently accepted go first. */
+const MAX_VERIFIED_KEYS = 10_000;
 
 export interface HttpServerOptions {
     /** SheetRender API base URL every per-request client talks to. */
@@ -95,13 +112,14 @@ export interface HttpServerOptions {
     anonNetworkCallsPerHour?: number;
     /**
      * Anonymous JSON-RPC messages other than tool calls (initialize,
-     * tools/list, resources/read, ...) per IPv4 /24 or IPv6 /48 per hour.
+     * tools/list, resources/read, ...) per IPv4 /24 or IPv6 /48 per hour,
+     * plus every message sent with a key the API has not yet accepted.
      * ChatGPT's and Claude's egress addresses are not counted here.
      */
     anonRpcPerHour?: number;
-    /** Anonymous requests being answered at once, across all callers. */
+    /** Requests being answered at once, across all callers, keyed ones included. */
     anonMaxInFlight?: number;
-    /** Anonymous requests being answered at once per IPv4 /24 or IPv6 /48. */
+    /** Anonymous and not-yet-accepted-key requests being answered at once per IPv4 /24 or IPv6 /48. */
     anonNetworkMaxInFlight?: number;
     /** Ranges whose `openai/subject` is believed; OpenAI's published list by default. */
     openaiEgressCidrs?: readonly string[];
@@ -377,6 +395,54 @@ export class UntrustedSubjectTally {
 }
 
 /**
+ * API keys the SheetRender API recently answered a 2xx for, held as SHA-256
+ * hashes, never the key. Starting with `sr_` proves nothing, so until a key is
+ * in here its requests get the anonymous bounds (batch, body size, in-flight,
+ * messages per network); only the API can say a key is real, and it does so
+ * on the first tool call that succeeds.
+ */
+export class VerifiedKeys {
+    readonly #ttlMs: number;
+    readonly #maxKeys: number;
+    readonly #now: () => number;
+    /** Hash -> expiry. Map order tracks recency for eviction. */
+    readonly #until = new Map<string, number>();
+
+    constructor(ttlMs = VERIFIED_KEY_TTL_MS, maxKeys = MAX_VERIFIED_KEYS, now: () => number = Date.now) {
+        this.#ttlMs = ttlMs;
+        this.#maxKeys = maxKeys;
+        this.#now = now;
+    }
+
+    has(key: string): boolean {
+        const hash = hashKey(key);
+        const until = this.#until.get(hash);
+        if (until === undefined) return false;
+        if (until > this.#now()) return true;
+        this.#until.delete(hash);
+        return false;
+    }
+
+    add(key: string): void {
+        const hash = hashKey(key);
+        this.#until.delete(hash);
+        this.#until.set(hash, this.#now() + this.#ttlMs);
+        for (const oldest of this.#until.keys()) {
+            if (this.#until.size <= this.#maxKeys) break;
+            this.#until.delete(oldest);
+        }
+    }
+
+    get size(): number {
+        return this.#until.size;
+    }
+}
+
+function hashKey(key: string): string {
+    return createHash("sha256").update(key).digest("hex");
+}
+
+/**
  * A fresh `Mcp-Session-Id`: 256 random bits. Nothing is stored against it, so
  * any instance can serve the conversation it names.
  */
@@ -480,6 +546,7 @@ export function createHttpServer(options: HttpServerOptions): Server {
         options.anonMaxInFlight ?? DEFAULT_MAX_IN_FLIGHT,
         options.anonNetworkMaxInFlight ?? DEFAULT_NETWORK_MAX_IN_FLIGHT,
     );
+    const verifiedKeys = new VerifiedKeys(undefined, undefined, options.now);
     const catalogue = new CatalogueCache(undefined, options.now);
     const openaiEgress = options.openaiEgress ?? new CidrSet(options.openaiEgressCidrs ?? OPENAI_EGRESS_CIDRS);
     const untrusted = new UntrustedSubjectTally(log, options.now);
@@ -589,42 +656,54 @@ export function createHttpServer(options: HttpServerOptions): Server {
         else fields.key_fp = keyFingerprint(apiKey);
 
         const ip = clientIp(req);
+        // A key counts as real only once the API has answered a call made
+        // with it. Until then the request gets exactly the anonymous bounds
+        // below, so a made-up `sr_` key gains nothing over sending none.
+        const verified = !anonymous && verifiedKeys.has(apiKey);
+        if (!anonymous) fields.key_verified = verified;
+        const bounded = !verified;
         // ChatGPT's and Claude's egress addresses each carry many users: they
         // count only toward the overall bounds. Everyone else is counted by
         // network (IPv4 /24, IPv6 /48), as the tool calls' network bucket is.
-        const networkKey = anonymous && !isClaudeIp(ip) && !openaiEgress.has(ip)
+        const networkKey = bounded && !isClaudeIp(ip) && !openaiEgress.has(ip)
             ? `net:${floodNetwork(ip)}`
             : undefined;
-        if (anonymous) {
-            const slot = inFlight.enter(networkKey);
-            if (typeof slot === "string") {
-                fields.refused = slot === "key" ? "network_in_flight" : "in_flight";
-                // `Connection: close`: the body is never read.
-                sendRpcError(
-                    res,
-                    slot === "key" ? 429 : 503,
-                    -32000,
-                    slot === "key" ? ANON_TEXT.tooManyNetworkInFlight : ANON_TEXT.serverBusy,
-                    { "Retry-After": "5", Connection: "close" },
-                );
-                return;
-            }
-            res.on("close", slot);
+        // Every request holds a slot while it is answered, keyed or not: the
+        // overall cap bounds the process's memory whoever is asking.
+        const slot = inFlight.enter(networkKey);
+        if (typeof slot === "string") {
+            fields.refused = slot === "key" ? "network_in_flight" : "in_flight";
+            // `Connection: close`: the body is never read.
+            sendRpcError(
+                res,
+                slot === "key" ? 429 : 503,
+                -32000,
+                slot === "key" ? ANON_TEXT.tooManyNetworkInFlight : ANON_TEXT.serverBusy,
+                { "Retry-After": "5", Connection: "close" },
+            );
+            return;
         }
+        res.on("close", slot);
 
         // Anonymous calls get the backend's render body cap: 25 rows at their
-        // field caps. create_continue_link checks the handoff cap itself.
-        const limit = anonymous ? Math.min(maxBodyBytes, MAX_ANON_BODY_BYTES) : maxBodyBytes;
+        // field caps. create_continue_link checks the handoff cap itself. A key
+        // not yet accepted gets the same; the full allowance (render_pdf's HTML,
+        // create_dataset's rows) comes with the first call the API accepts.
+        const limit = bounded ? Math.min(maxBodyBytes, MAX_ANON_BODY_BYTES) : maxBodyBytes;
         let raw: Buffer;
         try {
             raw = await readBody(req, limit);
         } catch (error) {
             if (error instanceof BodyTooLarge) {
+                fields.refused = "body";
+                const message = !anonymous && limit < maxBodyBytes
+                    ? `Request body exceeds ${limit} bytes. Bodies up to ${maxBodyBytes} bytes are accepted ` +
+                        "once the SheetRender API has accepted this key: make a small call first " +
+                        "(list_templates), then retry."
+                    : `Request body exceeds ${limit} bytes`;
                 // `Connection: close` so the rest of the upload is dropped
                 // rather than drained once the response has been sent.
-                sendRpcError(res, 413, -32000, `Request body exceeds ${limit} bytes`, {
-                    Connection: "close",
-                });
+                sendRpcError(res, 413, -32000, message, { Connection: "close" });
                 return;
             }
             throw error;
@@ -637,29 +716,34 @@ export function createHttpServer(options: HttpServerOptions): Server {
             return;
         }
         Object.assign(fields, describeRpc(parsedBody));
-        if (anonymous) {
-            const messages: unknown[] = Array.isArray(parsedBody) ? parsedBody : [parsedBody];
-            // The SDK would dispatch every entry at once and queue every answer.
-            if (messages.length > MAX_ANON_BATCH) {
-                fields.refused = "batch";
-                sendRpcError(res, 400, -32600, `Invalid Request: at most ${MAX_ANON_BATCH} messages per batch`);
+        const messages: unknown[] = Array.isArray(parsedBody) ? parsedBody : [parsedBody];
+        // The SDK would dispatch every entry at once and queue every answer.
+        const maxBatch = bounded ? MAX_ANON_BATCH : MAX_KEYED_BATCH;
+        if (messages.length > maxBatch) {
+            fields.refused = "batch";
+            sendRpcError(res, 400, -32600, `Invalid Request: at most ${maxBatch} messages per batch`);
+            return;
+        }
+        // Anonymous tool calls have their own buckets (guard() in anon.ts), so
+        // only the other messages count here. A key not yet accepted counts
+        // every message, tool calls too: each would otherwise be a free call
+        // to the API that ends in a 401.
+        const counted = anonymous
+            ? messages.filter((message) =>
+                !(message && typeof message === "object" && (message as { method?: unknown }).method === "tools/call")
+            ).length
+            : messages.length;
+        if (networkKey !== undefined && counted > 0) {
+            const decision = rpcLimiter.check(networkKey, counted);
+            if (!decision.allowed) {
+                fields.refused = "network_rpc";
+                const minutes = Math.max(1, Math.ceil(decision.retryAfterMs / 60_000));
+                sendRpcError(res, 429, -32000, ANON_TEXT.tooManyNetworkCalls.replace("{minutes}", String(minutes)), {
+                    "Retry-After": String(Math.max(1, Math.ceil(decision.retryAfterMs / 1000))),
+                });
                 return;
             }
-            const counted = messages.filter((message) =>
-                !(message && typeof message === "object" && (message as { method?: unknown }).method === "tools/call")
-            ).length;
-            if (networkKey !== undefined && counted > 0) {
-                const decision = rpcLimiter.check(networkKey, counted);
-                if (!decision.allowed) {
-                    fields.refused = "network_rpc";
-                    const minutes = Math.max(1, Math.ceil(decision.retryAfterMs / 60_000));
-                    sendRpcError(res, 429, -32000, ANON_TEXT.tooManyNetworkCalls.replace("{minutes}", String(minutes)), {
-                        "Retry-After": String(Math.max(1, Math.ceil(decision.retryAfterMs / 1000))),
-                    });
-                    return;
-                }
-                rpcLimiter.takeMany(networkKey, counted);
-            }
+            rpcLimiter.takeMany(networkKey, counted);
         }
         const userAgent = req.headers["user-agent"];
         if (anonymous) {
@@ -674,6 +758,10 @@ export function createHttpServer(options: HttpServerOptions): Server {
             baseUrl: apiUrl,
             apiKey,
             signal: disconnected.signal,
+            // Every route the API-key tools call needs the key, so a 2xx is the
+            // API vouching for it. Never for the demo key: anonymous requests
+            // stay bounded whatever the API answers.
+            onAccepted: anonymous ? undefined : () => verifiedKeys.add(apiKey),
         });
         const mcp = anonymous
             ? createAnonServer({

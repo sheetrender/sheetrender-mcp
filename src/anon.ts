@@ -102,7 +102,7 @@ export const MAX_ANON_BATCH = 4;
  * ChatGPT's or Claude's egress, where one address carries many users.
  */
 export const DEFAULT_RPC_PER_HOUR = 600;
-/** Anonymous requests being answered at once, all callers together. */
+/** Requests being answered at once, all callers together, API-key requests included (http.ts). */
 export const DEFAULT_MAX_IN_FLIGHT = 64;
 /** Anonymous requests being answered at once per IPv4 /24 or IPv6 /48, outside the platforms' egress. */
 export const DEFAULT_NETWORK_MAX_IN_FLIGHT = 8;

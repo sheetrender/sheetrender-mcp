@@ -72,6 +72,20 @@ local file to read — send rows with `create_dataset` instead.
 `GET /healthz` answers 200 without credentials. Request bodies are capped at
 25 MB; anything larger is a 413.
 
+A key that merely starts with `sr_` proves nothing, so the server waits for
+the SheetRender API to accept it. Until a call made with the key has
+succeeded (normally the first tool call, e.g. `list_templates`), its requests
+get the same bounds as requests without a key, described below: bodies up to
+2 MB, at most 4 JSON-RPC messages per batch, and every message counted toward
+the per-network budgets. Once the API has accepted the key, the server
+remembers a hash of it (never the key) for an hour after its latest
+successful call, and its requests get the 25 MB body cap and batches of up to
+20 messages. MCP clients send one message per request, so the batch caps only
+matter to hand-written clients. If the very first call is a body over 2 MB
+(a large `create_dataset`), it gets a 413 that says to make a small call
+first and retry. Every request, with a key or without, counts toward the
+server-wide in-flight cap.
+
 ### Without a key (ChatGPT and Claude directory listings)
 
 When the server runs with `SHEETRENDER_DEMO_API_KEY` set, a request that
@@ -140,10 +154,13 @@ anything in it runs. Messages other than tool calls (`initialize`,
 `tools/list`, `resources/read`, ...) count 600 an hour per IPv4 /24 or IPv6
 /48 (`ANON_RPC_PER_HOUR`); traffic from OpenAI's and Claude's egress ranges
 is not counted there, since each of those addresses carries many users. And
-at most 64 anonymous requests are answered at once (`ANON_MAX_IN_FLIGHT`),
+at most 64 requests, with a key or without, are answered at once (`ANON_MAX_IN_FLIGHT`),
 8 per network outside those ranges (`ANON_NETWORK_MAX_IN_FLIGHT`); past
 either, the answer is a 503 or 429 with `Retry-After: 5`. Requests with an
-API key keep their batches and are not counted.
+API key the SheetRender API has not yet accepted get all three bounds, with
+tool calls counted toward the 600 as well; once the key is accepted they
+count only toward the overall in-flight cap, and their batches may carry 20
+messages.
 
 A request carrying a SheetRender bearer key uses the API-key tools above.
 A malformed `Authorization` header is rejected. The stdio server never
@@ -155,9 +172,11 @@ offers the anonymous tools.
 (default 8080), `HOST` (default `0.0.0.0`), `SHEETRENDER_API_URL`,
 `MAX_BODY_BYTES` and `IDLE_TIMEOUT_MS` (default 60000), and logs one JSON
 line per request to stdout — method, path, status, duration, the JSON-RPC
-method and tool name, and a fingerprint of the key, never the key.
+method and tool name, a fingerprint of the key (never the key), and
+`key_verified`, whether the API had accepted that key yet.
 
-For the anonymous tools it also reads:
+For the anonymous tools, and the request bounds above (which also apply to
+keyed requests when no demo key is set), it also reads:
 
 | Variable | |
 | --- | --- |
@@ -167,9 +186,9 @@ For the anonymous tools it also reads:
 | `ANON_CALLS_PER_HOUR` | Render and continue calls per subject or IP per hour, default 30. |
 | `ANON_NETWORK_CALLS_PER_HOUR` | Render and continue calls per hour per IPv4 /24 or IPv6 /48, for callers counted by IP, default 300. |
 | `CLAUDE_CALLS_PER_HOUR` | Shared render and continue calls per hour for all traffic from `160.79.104.0/21`, default 3000. |
-| `ANON_RPC_PER_HOUR` | Anonymous messages other than tool calls per hour per IPv4 /24 or IPv6 /48, outside the OpenAI and Claude ranges, default 600. |
-| `ANON_MAX_IN_FLIGHT` | Anonymous requests answered at once, default 64. |
-| `ANON_NETWORK_MAX_IN_FLIGHT` | Anonymous requests answered at once per IPv4 /24 or IPv6 /48, outside the OpenAI and Claude ranges, default 8. |
+| `ANON_RPC_PER_HOUR` | Anonymous messages other than tool calls, plus every message sent with a key the API has not yet accepted, per hour per IPv4 /24 or IPv6 /48, outside the OpenAI and Claude ranges, default 600. |
+| `ANON_MAX_IN_FLIGHT` | Requests answered at once, all callers together (with a key or without), default 64. |
+| `ANON_NETWORK_MAX_IN_FLIGHT` | Anonymous requests, and requests with a key the API has not yet accepted, answered at once per IPv4 /24 or IPv6 /48, outside the OpenAI and Claude ranges, default 8. |
 | `OPENAI_EGRESS_CIDRS` | Comma- or space-separated CIDRs whose `openai/subject` is believed, replacing both the built-in copy and the live fetch of [chatgpt-connectors.json](https://openai.com/chatgpt-connectors.json); `none` believes no subject. |
 
 With `SHEETRENDER_DEMO_API_KEY` set, the server refuses to start if the view

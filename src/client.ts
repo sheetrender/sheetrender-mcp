@@ -31,6 +31,12 @@ export interface SheetRenderConfig {
      * an abandoned render does not hold a connection open until its timeout.
      */
     signal?: AbortSignal;
+    /**
+     * Called after every 2xx answer from the API. The hosted server uses it to
+     * learn that the API accepted this client's key (every route the API-key
+     * tools call requires one); the stdio server leaves it unset.
+     */
+    onAccepted?: () => void;
 }
 
 export interface TemplateSummary {
@@ -451,11 +457,13 @@ export class SheetRenderClient {
     readonly baseUrl: string;
     readonly #apiKey: string;
     readonly #signal?: AbortSignal;
+    readonly #onAccepted?: () => void;
 
     constructor(config: SheetRenderConfig) {
         this.baseUrl = config.baseUrl.replace(/\/+$/, "");
         this.#apiKey = config.apiKey;
         this.#signal = config.signal;
+        this.#onAccepted = config.onAccepted;
     }
 
     async #send(options: RequestOptions): Promise<Response> {
@@ -490,6 +498,7 @@ export class SheetRenderClient {
             throw toNetworkError(error, what, this.baseUrl);
         }
         if (!response.ok) throw await toError(response, what, options.advice);
+        this.#onAccepted?.();
         return response;
     }
 
