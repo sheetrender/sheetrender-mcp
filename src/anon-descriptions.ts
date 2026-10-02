@@ -83,8 +83,7 @@ export const ANON_TEXT = {
     continueTitle: "Create a continue link",
     continue:
         "Create a link to the template's page on the SheetRender website with the user's rows " +
-        "loaded. From that page the rows can be kept as a project, connected to a Google " +
-        "Sheet, rendered again on a schedule, or delivered as a zip, a merged PDF or by email. " +
+        "loaded, so they can be kept as a SheetRender project. " +
         "Call this only when the user asks to continue on the website, to keep or save the " +
         "rows, to repeat or schedule the job, or to have the documents delivered by email; do " +
         "not call it otherwise. Accepts up to 100 rows. The rows are stored until they are " +

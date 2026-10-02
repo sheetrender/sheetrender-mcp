@@ -209,7 +209,7 @@ function render(): void {
         const section = el("div", undefined, "continue");
         const button = el("button", "Continue in SheetRender with these rows");
         button.type = "button";
-        const caption = el("p", "Keep the rows as a project, connect a Google Sheet, run it on a schedule.", "muted");
+        const caption = el("p", "Keep these rows as a SheetRender project.", "muted");
         const status = el("p", undefined, "warn");
         button.addEventListener("click", async () => {
             button.disabled = true;
