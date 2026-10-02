@@ -10,7 +10,9 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { ClientRequestSchema, JSONRPCRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 
 import { CidrSet, MAX_ANON_BATCH, MAX_ANON_BODY_BYTES, OPENAI_EGRESS_CIDRS, subjectFingerprint } from "../src/anon.js";
-import { ANON_TEXT } from "../src/anon-descriptions.js";
+import { ANON_TEXT, BANNED_WORDS } from "../src/anon-descriptions.js";
+import { PROTECTED_TOOL_SCOPES, PROTECTED_RESOURCE_PATH } from "../src/auth.js";
+import { describeTools } from "../src/descriptions.js";
 import {
     bearerToken,
     clientIp,
@@ -1470,5 +1472,458 @@ describe("VerifiedKeys", () => {
         assert.equal(keys.has("sr_live_b"), false);
         assert.equal(keys.has("sr_live_a"), true);
         assert.equal(keys.has("sr_live_c"), true);
+    });
+});
+
+const OAUTH_TOKEN = `sro_${"a".repeat(43)}`;
+const FAKE_OAUTH_TOKEN = `sro_${"f".repeat(43)}`;
+const OAUTH_OPTIONS = {
+    oauthIssuer: "https://staging.sheetrender.test",
+    introspectSecret: "test-introspection-secret-keep-out-of-logs",
+    publicUrl: "https://mcp.staging.sheetrender.test/mcp",
+    demoApiKey: "sr_live_demo",
+};
+const SIGN_IN_CHALLENGE = `Bearer resource_metadata="https://mcp.staging.sheetrender.test${PROTECTED_RESOURCE_PATH}", scope="profile render design jobs", error="invalid_token", error_description="Requires a signed-in SheetRender account."`;
+const OAUTH_HEADERS = { Authorization: `Bearer ${OAUTH_TOKEN}` };
+const TOOLS_LIST = { jsonrpc: "2.0", id: 1, method: "tools/list" };
+const PROFILE_CALL = { jsonrpc: "2.0", id: 12, method: "tools/call", params: { name: "get_profile", arguments: {} } };
+
+interface OAuthBackendState {
+    mode: "active" | "inactive" | "down" | "wrong-audience";
+    scope: string;
+    holdIntrospection?: Promise<void>;
+    holdSchedules?: Promise<void>;
+}
+
+/** Serves the fixed introspection contract and just the public routes these tests call. */
+async function oauthBackend() {
+    const state: OAuthBackendState = { mode: "active", scope: "profile render design jobs" };
+    const calls: { method: string; path: string; auth: string; body: unknown }[] = [];
+    const profile = { id: "account-uuid", name: "Ada" as string | null, email: "ada@example.test" as string | null };
+    const schedule = {
+        id: "schedule-1", template_id: "tpl_1", template_name: "Letter", dataset_id: "ds_1", dataset_name: "rows",
+        name: "Weekly letters", cadence: "weekly", hour_utc: 9, weekday: 0, day_of_month: null,
+        enabled: true, paused_reason: null, delivery_email: null, next_run_at: "2026-10-05T09:00:00Z",
+        last_run_at: null, created_at: "2026-10-02T12:00:00Z",
+    };
+    const server = createNodeServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (chunk: Buffer) => chunks.push(chunk));
+        req.on("end", () => {
+            const path = req.url ?? "";
+            const raw = Buffer.concat(chunks).toString("utf8");
+            const body: unknown = path === "/api/oauth/introspect" ? new URLSearchParams(raw).get("token") : raw ? JSON.parse(raw) : undefined;
+            calls.push({ method: req.method ?? "", path, auth: req.headers.authorization ?? "", body });
+            const answer = (status: number, payload: unknown) => {
+                res.writeHead(status, { "Content-Type": "application/json" });
+                res.end(JSON.stringify(payload));
+            };
+            void (async () => {
+                if (path === "/api/oauth/introspect") {
+                    assert.match(req.headers["content-type"] ?? "", /^application\/x-www-form-urlencoded/);
+                    if (req.headers.authorization !== `Bearer ${OAUTH_OPTIONS.introspectSecret}`) return answer(401, {});
+                    await state.holdIntrospection;
+                    if (state.mode === "down") return answer(503, { detail: `${OAUTH_TOKEN} ${OAUTH_OPTIONS.introspectSecret}` });
+                    if (state.mode === "inactive" || body !== OAUTH_TOKEN) return answer(200, { active: false });
+                    return answer(200, {
+                        active: true, scope: state.scope, client_id: "test-client", sub: profile.id,
+                        aud: [state.mode === "wrong-audience" ? "https://other.test/mcp" : OAUTH_OPTIONS.publicUrl, `${OAUTH_OPTIONS.oauthIssuer}/api`],
+                        exp: Math.floor(Date.now() / 1000) + 3600, token_type: "Bearer",
+                    });
+                }
+                if (path === "/api/v1/builtin-templates") return answer(200, JSON.parse(CATALOGUE_JSON));
+                if (path === "/api/v1/builtin-templates/letter/render") {
+                    assert.equal(req.headers.authorization, "Bearer sr_live_demo");
+                    return answer(200, { documents: [], volume: { used: 1, limit: 50, resets_at: null } });
+                }
+                if (![ `Bearer ${OAUTH_TOKEN}`, "Bearer sr_live_real" ].includes(req.headers.authorization ?? "")) {
+                    return answer(401, { detail: "Invalid credential" });
+                }
+                if (state.mode === "inactive" && req.headers.authorization === `Bearer ${OAUTH_TOKEN}`) {
+                    return answer(401, { detail: "Invalid credential" });
+                }
+                if (path === "/api/v1/templates") return answer(200, []);
+                if (path === "/api/v1/me") return answer(200, profile);
+                if (path === "/api/v1/schedules") {
+                    await state.holdSchedules;
+                    return answer(req.method === "POST" ? 201 : 200, req.method === "POST" ? schedule : [schedule]);
+                }
+                answer(404, { detail: "Not Found" });
+            })();
+        });
+    });
+    const url = await listen(server);
+    closers.push(() => closeServer(server));
+    return { url, calls, state, profile, schedule };
+}
+
+describe("hosted OAuth", () => {
+    it("serves both protected-resource documents with credentialless CORS and no header-derived hosts", async () => {
+        const { url } = await startMcp("http://127.0.0.1:1", OAUTH_OPTIONS);
+        const origin = "https://browser-client.test";
+        const assertCors = (response: Response) => {
+            assert.equal(response.headers.get("access-control-allow-origin"), "*");
+            assert.equal(response.headers.get("access-control-allow-methods"), "GET, HEAD, OPTIONS");
+            assert.equal(response.headers.has("access-control-allow-credentials"), false);
+            assert.equal(response.headers.has("set-cookie"), false);
+        };
+        for (const path of [PROTECTED_RESOURCE_PATH, "/.well-known/oauth-protected-resource"]) {
+            const response = await fetch(`${url}${path}`, { headers: { Origin: origin, "X-Forwarded-Host": "attacker.test" } });
+            assert.equal(response.status, 200);
+            assertCors(response);
+            assert.deepEqual(await response.json(), {
+                resource: OAUTH_OPTIONS.publicUrl,
+                authorization_servers: [OAUTH_OPTIONS.oauthIssuer],
+                scopes_supported: ["profile", "render", "design", "jobs"],
+                bearer_methods_supported: ["header"],
+            });
+            const head = await fetch(`${url}${path}`, { method: "HEAD", headers: { Origin: origin } });
+            assert.equal(head.status, 200);
+            assertCors(head);
+            assert.equal(await head.text(), "");
+            const preflight = await fetch(`${url}${path}`, {
+                method: "OPTIONS", headers: { Origin: origin, "Access-Control-Request-Method": "GET" },
+            });
+            assert.equal(preflight.status, 204);
+            assertCors(preflight);
+            assert.equal(await preflight.text(), "");
+            const rejected = await fetch(`${url}${path}`, { method: "POST", headers: { Origin: origin } });
+            assert.equal(rejected.status, 405);
+            assert.equal(rejected.headers.get("allow"), "GET, HEAD, OPTIONS");
+            assertCors(rejected);
+            await rejected.text();
+        }
+        for (const path of ["/healthz", "/mcp"]) {
+            const response = await fetch(`${url}${path}`, { method: "OPTIONS", headers: { Origin: origin } });
+            assert.equal(response.status, 405);
+            assert.equal(response.headers.has("access-control-allow-origin"), false);
+            await response.text();
+        }
+        const config = loadHttpConfig({
+            OAUTH_ISSUER: OAUTH_OPTIONS.oauthIssuer,
+            MCP_INTROSPECT_SECRET: OAUTH_OPTIONS.introspectSecret,
+            MCP_PUBLIC_URL: OAUTH_OPTIONS.publicUrl,
+        });
+        assert.equal(config.oauthIssuer, OAUTH_OPTIONS.oauthIssuer);
+        assert.equal(config.introspectSecret, OAUTH_OPTIONS.introspectSecret);
+    });
+
+    it("keeps the old registry and rejection behavior whenever either OAuth setting is absent", async () => {
+        for (const settings of [{ oauthIssuer: undefined }, { introspectSecret: undefined }]) {
+            const { url } = await startMcp("http://127.0.0.1:1", { ...OAUTH_OPTIONS, ...settings });
+            for (const path of [PROTECTED_RESOURCE_PATH, "/.well-known/oauth-protected-resource"]) {
+                for (const method of ["GET", "OPTIONS"]) {
+                    const response = await fetch(`${url}${path}`, { method, headers: { Origin: "https://browser-client.test" } });
+                    assert.equal(response.status, 404);
+                    assert.equal(response.headers.has("access-control-allow-origin"), false);
+                    await response.text();
+                }
+            }
+            const anon = await connectAnon(url);
+            assert.deepEqual((await anon.listTools()).tools.map((tool) => tool.name).sort(), [
+                "create_continue_link", "list_document_templates", "render_documents",
+            ]);
+            const refused = await rawRpc(url, PROFILE_CALL, OAUTH_HEADERS);
+            assert.equal(refused.status, 401);
+            assert.equal(refused.headers.get("www-authenticate"), 'Bearer realm="sheetrender"');
+            const keyed = await connect(url, "sr_live_real");
+            assert.ok((await keyed.listTools()).tools.some((tool) => tool.name === "render_pdf"));
+        }
+    });
+
+    it("challenges every account tool before the SDK, preserving the request id and all four scopes", async () => {
+        const backend = await oauthBackend();
+        const { url } = await startMcp(backend.url, OAUTH_OPTIONS);
+        for (const name of Object.keys(PROTECTED_TOOL_SCOPES)) {
+            const response = await rawRpc(url, { ...PROFILE_CALL, params: { name, arguments: {} } }, { "User-Agent": "Claude" });
+            assert.equal(response.status, 401, name);
+            assert.equal(response.headers.get("www-authenticate"), SIGN_IN_CHALLENGE);
+            const body = response.json as { id: number; error: { code: number; data: { error: string } } };
+            assert.equal(body.id, PROFILE_CALL.id);
+            assert.equal(body.error.code, -32001);
+            assert.equal(body.error.data.error, "invalid_token");
+        }
+        assert.equal(backend.calls.length, 0);
+    });
+
+    it("returns ChatGPT's tool error for metadata or User-Agent, without trusting either or a session id", async () => {
+        const backend = await oauthBackend();
+        const { url } = await startMcp(backend.url, OAUTH_OPTIONS);
+        for (const caller of [
+            { meta: { "openai/subject": "forged" }, agent: "Claude" },
+            { meta: {}, agent: "ChatGPT/1.0" },
+        ]) {
+            const response = await rawRpc(url, { ...PROFILE_CALL, params: { ...PROFILE_CALL.params, _meta: caller.meta } }, {
+                "User-Agent": caller.agent, "Mcp-Session-Id": "forged-session", "X-Forwarded-For": "198.51.100.1",
+            });
+            assert.equal(response.status, 200);
+            const body = response.json as { id: number; result: { isError: boolean; _meta: Record<string, unknown> } };
+            assert.equal(body.id, PROFILE_CALL.id);
+            assert.equal(body.result.isError, true);
+            assert.deepEqual(body.result._meta["mcp/www_authenticate"], [SIGN_IN_CHALLENGE]);
+        }
+        assert.equal(backend.calls.length, 0);
+    });
+
+    it("returns insufficient_scope as HTTP 403 or ChatGPT metadata, without calling the protected API", async () => {
+        const backend = await oauthBackend();
+        backend.state.scope = "render";
+        const { url } = await startMcp(backend.url, OAUTH_OPTIONS);
+        const response = await rawRpc(url, PROFILE_CALL, OAUTH_HEADERS);
+        assert.equal(response.status, 403);
+        assert.match(response.headers.get("www-authenticate") ?? "", /error="insufficient_scope", scope="profile"/);
+        assert.equal((response.json as { error: { data: { error: string } } }).error.data.error, "insufficient_scope");
+        const chatgpt = await rawRpc(url, { ...PROFILE_CALL, params: { name: "list_schedules", arguments: {}, _meta: { "openai/locale": "en" } } }, OAUTH_HEADERS);
+        assert.equal(chatgpt.status, 200);
+        const result = (chatgpt.json as { result: { isError: boolean; _meta: Record<string, string[]> } }).result;
+        assert.equal(result.isError, true);
+        assert.deepEqual(result._meta["mcp/www_authenticate"], [
+            `Bearer resource_metadata="https://mcp.staging.sheetrender.test${PROTECTED_RESOURCE_PATH}", error="insufficient_scope", scope="jobs", error_description="SheetRender sign-in needs the jobs scope for this tool."`,
+        ]);
+        assert.equal(backend.calls.length, 1);
+        assert.equal(backend.calls[0].path, "/api/oauth/introspect");
+        assert.equal((await rawRpc(url, LIST_TEMPLATES_CALL, OAUTH_HEADERS)).status, 200);
+    });
+
+    it("keeps all 15 tool definitions identical before and after sign-in and declares their scopes", async () => {
+        const backend = await oauthBackend();
+        const { url } = await startMcp(backend.url, OAUTH_OPTIONS);
+        type Tool = { name: string; description: string; securitySchemes: unknown; _meta: Record<string, unknown>; annotations: { readOnlyHint: boolean; destructiveHint: boolean } };
+        const listing = async (headers: Record<string, string>) => {
+            const result = await rawRpc(url, TOOLS_LIST, headers);
+            assert.equal(result.status, 200);
+            return (result.json as { result: { tools: Tool[] } }).result.tools;
+        };
+        const before = await listing({});
+        assert.deepEqual(await listing(OAUTH_HEADERS), before);
+        assert.deepEqual(await listing({ Authorization: `Bearer ${FAKE_OAUTH_TOKEN}` }), before);
+        assert.equal(backend.calls.length, 0, "discovery must not depend on introspection");
+        await rawRpc(url, PROFILE_CALL, OAUTH_HEADERS);
+        assert.deepEqual(await listing(OAUTH_HEADERS), before);
+        backend.state.mode = "down";
+        assert.deepEqual(await listing({ Authorization: `Bearer ${FAKE_OAUTH_TOKEN}` }), before);
+        assert.deepEqual(before.map((tool) => tool.name).sort(), [
+            ...Object.keys(PROTECTED_TOOL_SCOPES), "list_document_templates", "render_documents", "create_continue_link",
+        ].sort());
+        for (const tool of before) {
+            const scope = PROTECTED_TOOL_SCOPES[tool.name as keyof typeof PROTECTED_TOOL_SCOPES];
+            assert.deepEqual(tool.securitySchemes, scope ? [{ type: "oauth2", scopes: [scope] }] : [{ type: "noauth" }]);
+            assert.deepEqual(tool._meta.securitySchemes, tool.securitySchemes);
+            if (scope) assert.ok(tool.description.startsWith("Requires a signed-in SheetRender account."));
+            assert.equal(typeof tool.annotations.readOnlyHint, "boolean");
+            assert.equal(tool.annotations.destructiveHint, false);
+            assert.equal(BANNED_WORDS.test(tool.description), false, tool.name);
+        }
+        assert.equal(before.find((tool) => tool.name === "get_profile")?._meta["openai/profile"], true);
+        for (const text of Object.values(describeTools(true, true))) assert.equal(BANNED_WORDS.test(text), false);
+        for (const name of ["render_pdf", "upload_dataset"]) {
+            const denied = await rawRpc(url, { ...PROFILE_CALL, params: { name, arguments: {} } }, OAUTH_HEADERS);
+            assert.equal((denied.json as { result: { isError: boolean } }).result.isError, true);
+        }
+        assert.deepEqual(backend.calls.filter((entry) => entry.path !== "/api/oauth/introspect").map((entry) => entry.path), ["/api/v1/me"]);
+    });
+
+    it("forwards the OAuth bearer to profile and schedule endpoints and preserves schedule fields", async () => {
+        const backend = await oauthBackend();
+        const { url } = await startMcp(backend.url, OAUTH_OPTIONS);
+        const client = await connect(url, OAUTH_TOKEN);
+        const profile = await client.callTool({ name: "get_profile", arguments: {} });
+        assert.deepEqual(profile.structuredContent, backend.profile);
+        backend.profile.name = null;
+        backend.profile.email = null;
+        const unnamed = await client.callTool({ name: "get_profile", arguments: {} });
+        assert.deepEqual(unnamed.structuredContent, backend.profile);
+        const input = { template_id: "tpl_1", dataset_id: "ds_1", cadence: "weekly", name: "Weekly letters", hour_utc: 17, weekday: 4, delivery_email: "ada@example.test" };
+        const created = await client.callTool({ name: "create_schedule", arguments: input });
+        assert.deepEqual(created.structuredContent, backend.schedule);
+        const listed = await client.callTool({ name: "list_schedules", arguments: {} });
+        assert.deepEqual(listed.structuredContent, { schedules: [backend.schedule] });
+        assert.deepEqual(backend.calls.filter((entry) => entry.path !== "/api/oauth/introspect"), [
+            { method: "GET", path: "/api/v1/me", auth: `Bearer ${OAUTH_TOKEN}`, body: undefined },
+            { method: "GET", path: "/api/v1/me", auth: `Bearer ${OAUTH_TOKEN}`, body: undefined },
+            { method: "POST", path: "/api/v1/schedules", auth: `Bearer ${OAUTH_TOKEN}`, body: input },
+            { method: "GET", path: "/api/v1/schedules", auth: `Bearer ${OAUTH_TOKEN}`, body: undefined },
+        ]);
+        assert.equal(backend.calls.filter((entry) => entry.path === "/api/oauth/introspect").length, 1);
+        for (const patch of [{ cadence: "never" }, { hour_utc: 24 }, { weekday: 7 }, { day_of_month: 0 }, { recipient_column: "email" }]) {
+            const invalid = await client.callTool({ name: "create_schedule", arguments: { ...input, ...patch } });
+            assert.equal(invalid.isError, true);
+        }
+        assert.equal(backend.calls.filter((entry) => entry.method === "POST" && entry.path === "/api/v1/schedules").length, 1);
+    });
+
+    it("honors API re-validation of the forwarded bearer even while positive introspection is cached", async () => {
+        const backend = await oauthBackend();
+        const now = Date.now();
+        const { url } = await startMcp(backend.url, { ...OAUTH_OPTIONS, now: () => now });
+        const client = await connect(url, OAUTH_TOKEN);
+        const first = await client.callTool({ name: "get_profile", arguments: {} });
+        assert.deepEqual(first.structuredContent, backend.profile);
+        backend.state.mode = "inactive";
+        const revoked = await client.callTool({ name: "get_profile", arguments: {} });
+        assert.equal(revoked.isError, true);
+        assert.equal(revoked.structuredContent, undefined);
+        assert.equal(backend.calls.filter((entry) => entry.path === "/api/oauth/introspect").length, 1);
+        const forwarded = backend.calls.filter((entry) => entry.path !== "/api/oauth/introspect");
+        assert.deepEqual(forwarded.map((entry) => [entry.path, entry.auth]), [
+            ["/api/v1/me", `Bearer ${OAUTH_TOKEN}`],
+            ["/api/v1/me", `Bearer ${OAUTH_TOKEN}`],
+        ]);
+    });
+
+    it("fails closed when introspection goes down after cache expiry and keeps tokens out of logs", async () => {
+        const backend = await oauthBackend();
+        let now = Date.now();
+        const { url, logs } = await startMcp(backend.url, { ...OAUTH_OPTIONS, now: () => now });
+        assert.equal((await rawRpc(url, PROFILE_CALL, OAUTH_HEADERS)).status, 200);
+        backend.state.mode = "down";
+        now += 59_999;
+        assert.equal((await rawRpc(url, PROFILE_CALL, OAUTH_HEADERS)).status, 200);
+        now++;
+        const failed = await rawRpc(url, PROFILE_CALL, OAUTH_HEADERS);
+        assert.equal(failed.status, 503);
+        assert.equal(failed.headers.get("retry-after"), "5");
+        assert.match(JSON.stringify(failed.json), /temporarily unavailable/);
+        assert.equal(backend.calls.filter((entry) => entry.path === "/api/v1/me").length, 2);
+        backend.state.mode = "active";
+        assert.equal((await rawRpc(url, PROFILE_CALL, OAUTH_HEADERS)).status, 200);
+        const reflectedName = { ...PROFILE_CALL, params: { name: OAUTH_TOKEN, arguments: {} } };
+        await rawRpc(url, reflectedName, OAUTH_HEADERS);
+        await waitUntil(() => logs.some((entry) => entry.refused === "introspection_unavailable"));
+        for (const secret of [OAUTH_TOKEN, OAUTH_OPTIONS.introspectSecret]) {
+            assert.equal(JSON.stringify({ logs, error: failed.json }).includes(secret), false);
+        }
+    });
+
+    it("rejects inactive and wrong-audience tokens, and never accepts forged identity metadata", async () => {
+        for (const mode of ["inactive", "wrong-audience"] as const) {
+            const backend = await oauthBackend();
+            backend.state.mode = mode;
+            const { url } = await startMcp(backend.url, OAUTH_OPTIONS);
+            const denied = await rawRpc(url, PROFILE_CALL, { ...OAUTH_HEADERS, "Mcp-Session-Id": "known-user" });
+            assert.equal(denied.status, 401);
+            assert.equal(backend.calls.length, 1);
+            assert.equal(backend.calls[0].path, "/api/oauth/introspect");
+        }
+    });
+
+    it("keeps fake tokens under anonymous body and batch limits, lifting only cached active tokens", async () => {
+        const backend = await oauthBackend();
+        let now = Date.now();
+        const { url } = await startMcp(backend.url, { ...OAUTH_OPTIONS, now: () => now });
+        const large = { ...TOOLS_LIST, params: { _meta: { padding: "x".repeat(MAX_ANON_BODY_BYTES) } } };
+        const fake = { Authorization: `Bearer ${FAKE_OAUTH_TOKEN}` };
+        const batch = Array.from({ length: MAX_ANON_BATCH + 1 }, (_, id) => ({ ...TOOLS_LIST, id }));
+        const callers: Record<string, string>[] = [{}, fake, OAUTH_HEADERS];
+        for (const headers of callers) {
+            assert.equal((await postRaw(url, large, headers)).status, 413);
+            assert.equal((await postRaw(url, batch, headers)).status, 400);
+        }
+        assert.equal(backend.calls.length, 0, "admission runs before introspection");
+        assert.equal((await rawRpc(url, PROFILE_CALL, fake)).status, 401);
+        assert.equal((await postRaw(url, large, fake)).status, 413);
+        await rawRpc(url, PROFILE_CALL, OAUTH_HEADERS);
+        const accepted = await postRaw(url, large, OAUTH_HEADERS);
+        assert.equal(accepted.status, 200);
+        await accepted.text();
+        const acceptedBatch = await postRaw(url, batch, OAUTH_HEADERS);
+        assert.equal(acceptedBatch.status, 200);
+        await acceptedBatch.text();
+        assert.equal((await postRaw(url, Array.from({ length: MAX_KEYED_BATCH + 1 }, (_, id) => ({ ...TOOLS_LIST, id })), OAUTH_HEADERS)).status, 400);
+        now += 60_000;
+        assert.equal((await postRaw(url, large, OAUTH_HEADERS)).status, 413, "API success must not extend OAuth cache life");
+    });
+
+    it("charges rotating fake tokens and protected keyless calls to network budgets before introspection", async () => {
+        const backend = await oauthBackend();
+        const { url } = await startMcp(backend.url, { ...OAUTH_OPTIONS, anonRpcPerHour: 2 });
+        for (let i = 0; i < 2; i++) {
+            const result = await rawRpc(url, PROFILE_CALL, { Authorization: `Bearer sro_${String(i).repeat(43)}`, "X-Forwarded-For": "198.51.100.1" });
+            assert.equal(result.status, 401);
+        }
+        const refused = await rawRpc(url, PROFILE_CALL, { Authorization: `Bearer ${FAKE_OAUTH_TOKEN}`, "X-Forwarded-For": "198.51.100.2" });
+        assert.equal(refused.status, 429);
+        assert.equal(backend.calls.length, 2);
+        assert.equal((await rawRpc(url, PROFILE_CALL, { "X-Forwarded-For": "198.51.100.3" })).status, 429);
+        const real = { ...OAUTH_HEADERS, "X-Forwarded-For": "198.51.101.1" };
+        assert.equal((await rawRpc(url, PROFILE_CALL, real)).status, 200);
+        for (let i = 0; i < 4; i++) assert.equal((await rawRpc(url, TOOLS_LIST, real)).status, 200);
+    });
+
+    it("bounds introspection in flight and keeps active callers under the global cap", async () => {
+        const backend = await oauthBackend();
+        let release!: () => void;
+        backend.state.holdIntrospection = new Promise<void>((resolve) => { release = resolve; });
+        const { url } = await startMcp(backend.url, { ...OAUTH_OPTIONS, anonMaxInFlight: 2, anonNetworkMaxInFlight: 1 });
+        const first = rawRpc(url, PROFILE_CALL, { ...OAUTH_HEADERS, "X-Forwarded-For": "198.51.100.1" });
+        try {
+            await waitUntil(() => backend.calls.length === 1);
+            assert.equal((await rawRpc(url, TOOLS_LIST, { "X-Forwarded-For": "198.51.100.2" })).status, 429);
+            const second = rawRpc(url, PROFILE_CALL, { Authorization: `Bearer ${FAKE_OAUTH_TOKEN}`, "X-Forwarded-For": "198.51.101.1" });
+            await waitUntil(() => backend.calls.length === 2);
+            assert.equal((await rawRpc(url, TOOLS_LIST, { "X-Forwarded-For": "198.51.102.1" })).status, 503);
+            release();
+            assert.equal((await first).status, 200);
+            assert.equal((await second).status, 401);
+        } finally { release(); }
+        let finish!: () => void;
+        backend.state.holdSchedules = new Promise<void>((resolve) => { finish = resolve; });
+        const scheduleCall = { ...PROFILE_CALL, params: { name: "list_schedules", arguments: {} } };
+        const activeCalls = [rawRpc(url, scheduleCall, OAUTH_HEADERS), rawRpc(url, scheduleCall, OAUTH_HEADERS)];
+        try {
+            await waitUntil(() => backend.calls.filter((entry) => entry.path === "/api/v1/schedules").length === 2);
+            assert.equal((await rawRpc(url, TOOLS_LIST, OAUTH_HEADERS)).status, 503);
+        } finally { finish(); }
+        for (const pending of activeCalls) assert.equal((await pending).status, 200);
+    });
+
+    it("keeps demo credentials, the widget and per-subject limits on anonymous tools with an active token", async () => {
+        const backend = await oauthBackend();
+        const { url } = await startMcp(backend.url, { ...OAUTH_OPTIONS, anonCallsPerHour: 1 });
+        const client = await connect(url, OAUTH_TOKEN);
+        assert.notEqual((await client.callTool({ name: "get_profile", arguments: {} })).isError, true);
+        backend.state.mode = "down";
+        const first = await client.callTool({ name: "render_documents", arguments: { template: "letter", rows: [{ body: "hello" }] } });
+        assert.notEqual(first.isError, true);
+        const second = await client.callTool({ name: "render_documents", arguments: { template: "letter", rows: [{ body: "again" }] } });
+        assert.equal(second.isError, true);
+        assert.equal(backend.calls.filter((entry) => entry.path === "/api/v1/builtin-templates/letter/render").length, 1);
+        assert.ok(backend.calls.filter((entry) => entry.path.startsWith("/api/v1/builtin-templates")).every((entry) => entry.auth === "Bearer sr_live_demo"));
+        const widget = await client.readResource({ uri: "ui://sheetrender/documents.html" });
+        assert.equal(widget.contents[0].mimeType, "text/html;profile=mcp-app");
+    });
+
+    it("preserves the API-key path with OAuth enabled and never introspects API keys", async () => {
+        const backend = await oauthBackend();
+        const { url } = await startMcp(backend.url, OAUTH_OPTIONS);
+        const client = await connect(url, "sr_live_real");
+        const names = (await client.listTools()).tools.map((tool) => tool.name);
+        assert.ok(names.includes("render_pdf"));
+        assert.equal(names.includes("get_profile"), false);
+        assert.equal(names.includes("render_documents"), false);
+        const result = await client.callTool({ name: "list_templates", arguments: {} });
+        assert.notEqual(result.isError, true);
+        assert.deepEqual(backend.calls.map((entry) => [entry.path, entry.auth]), [["/api/v1/templates", "Bearer sr_live_real"]]);
+        const refused = await rawRpc(url, LIST_TEMPLATES_CALL, { Authorization: "Bearer sr_fake_key" });
+        assert.equal(refused.status, 200);
+        assert.equal((refused.json as { result: { isError: boolean } }).result.isError, true);
+    });
+
+    it("preflights a whole batch so an unauthenticated account call cannot execute alongside demo work", async () => {
+        const backend = await oauthBackend();
+        const { url } = await startMcp(backend.url, OAUTH_OPTIONS);
+        const response = await postRaw(url, [
+            { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "render_documents", arguments: { template: "letter", rows: [{ body: "hello" }] } } },
+            PROFILE_CALL,
+        ]);
+        assert.equal(response.status, 401);
+        assert.equal(backend.calls.length, 0);
+        const chatgpt = await postRaw(url, [TOOLS_LIST, PROFILE_CALL], { "User-Agent": "ChatGPT" });
+        assert.equal(chatgpt.status, 200);
+        const results = await chatgpt.json() as { id: number; result: { isError: boolean; _meta: Record<string, string[]> } }[];
+        assert.deepEqual(results.map((result) => result.id), [TOOLS_LIST.id, PROFILE_CALL.id]);
+        assert.ok(results.every((result) => result.result.isError));
+        assert.deepEqual(results[1].result._meta["mcp/www_authenticate"], [SIGN_IN_CHALLENGE]);
+        assert.equal(backend.calls.length, 0);
     });
 });

@@ -88,6 +88,42 @@ export interface CreatedJob {
     job_id: string;
 }
 
+export interface AccountProfile {
+    id: string;
+    name: string | null;
+    email: string | null;
+}
+
+export interface ScheduleInput {
+    template_id: string;
+    dataset_id: string;
+    cadence: "every_15_min" | "hourly" | "daily" | "weekly" | "monthly";
+    name?: string | null;
+    hour_utc?: number;
+    weekday?: number | null;
+    day_of_month?: number | null;
+    delivery_email?: string | null;
+}
+
+export interface ScheduleSummary {
+    id: string;
+    name: string;
+    template_id: string;
+    template_name: string;
+    dataset_id: string;
+    dataset_name: string | null;
+    cadence: ScheduleInput["cadence"];
+    hour_utc: number;
+    weekday: number | null;
+    day_of_month: number | null;
+    enabled: boolean;
+    paused_reason: string | null;
+    delivery_email: string | null;
+    next_run_at: string | null;
+    last_run_at: string | null;
+    created_at: string;
+}
+
 export interface DesignStatus {
     design_id: string;
     status: "running" | "succeeded" | "failed";
@@ -533,6 +569,32 @@ export class SheetRenderClient {
             throw new SheetRenderError(`${options.what} failed: the server returned an empty PDF.`);
         }
         return bytes;
+    }
+
+    /** Returns the account associated with this request's bearer credential. */
+    getProfile(): Promise<AccountProfile> {
+        return this.#json<AccountProfile>({
+            method: "GET", path: "/api/v1/me", what: "Reading the SheetRender profile", accept: "json",
+        });
+    }
+
+    /** Creates a schedule using only fields supported by the public API. */
+    createSchedule(input: ScheduleInput): Promise<ScheduleSummary> {
+        const { template_id, dataset_id, cadence, name, hour_utc, weekday, day_of_month, delivery_email } = input;
+        return this.#json<ScheduleSummary>({
+            method: "POST",
+            path: "/api/v1/schedules",
+            what: "Creating a schedule",
+            body: { template_id, dataset_id, cadence, name, hour_utc, weekday, day_of_month, delivery_email },
+            accept: "json",
+        });
+    }
+
+    /** Lists the account's schedules, without trigger credentials. */
+    listSchedules(): Promise<ScheduleSummary[]> {
+        return this.#json<ScheduleSummary[]>({
+            method: "GET", path: "/api/v1/schedules", what: "Listing schedules", accept: "json",
+        });
     }
 
     /** POST /api/v1/renders — render an ad-hoc HTML document to PDF bytes. */
