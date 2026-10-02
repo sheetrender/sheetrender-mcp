@@ -34,6 +34,7 @@ import {
     SlidingWindowLimiter,
     subjectKey,
     trustedOpenaiSubject,
+    subjectFingerprint,
 } from "../src/anon.js";
 import {
     ANON_TEXT,
@@ -1598,5 +1599,16 @@ describe("admission limiters", () => {
         (first as () => void)();
         assert.equal(inFlight.total, 1);
         assert.equal(typeof inFlight.enter("a"), "function");
+    });
+});
+
+describe("subjectFingerprint", () => {
+    it("is keyed, so a log tag is not the plain sha256 prefix of an IP subject", () => {
+        const subject = `ip:${createHash("sha256").update("203.0.113.0").digest("hex")}`;
+        const tag = subjectFingerprint(subject);
+        assert.match(tag, /^[0-9a-f]{12}$/);
+        assert.notEqual(tag, createHash("sha256").update(subject).digest("hex").slice(0, 12));
+        assert.equal(subjectFingerprint(subject), tag);
+        assert.notEqual(subjectFingerprint(`${subject}x`), tag);
     });
 });

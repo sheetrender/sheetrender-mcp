@@ -23,7 +23,7 @@
  * is configured.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import { BlockList, isIP } from "node:net";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -387,9 +387,16 @@ export function callerSource(
     return detectSource(meta, userAgent, clientIp, openaiEgress);
 }
 
-/** Short fingerprint of a subject for the request log. */
+/**
+ * Keys the log fingerprints. Random per process: a plain hash of an IP-based
+ * subject could be reversed by trying every address, and the tag only needs to
+ * correlate lines within one process's log.
+ */
+const FINGERPRINT_KEY = randomBytes(32);
+
+/** Short keyed fingerprint of a subject for the request log; stable for the life of the process. */
 export function subjectFingerprint(subject: string): string {
-    return sha256(subject).slice(0, 12);
+    return createHmac("sha256", FINGERPRINT_KEY).update(subject).digest("hex").slice(0, 12);
 }
 
 // ---------------------------------------------------------------------------

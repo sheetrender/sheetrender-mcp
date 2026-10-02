@@ -66,6 +66,8 @@ const DEFAULT_HOST = "0.0.0.0";
 const DEFAULT_MAX_BODY_BYTES = 25 * 1024 * 1024;
 /** Socket inactivity timeout. The transport's SSE keep-alive (15 s) resets it. */
 const DEFAULT_IDLE_TIMEOUT_MS = 60_000;
+/** The MCP-Protocol-Version header is logged as sent, cut to this length. */
+const MAX_LOGGED_HEADER_CHARS = 40;
 
 export interface HttpServerOptions {
     /** SheetRender API base URL every per-request client talks to. */
@@ -512,6 +514,8 @@ export function createHttpServer(options: HttpServerOptions): Server {
             return;
         }
         fields.path = url.pathname;
+        const protocolVersion = req.headers["mcp-protocol-version"];
+        if (typeof protocolVersion === "string") fields.protocol_version = protocolVersion.slice(0, MAX_LOGGED_HEADER_CHARS);
 
         handle(req, res, url, method, fields).catch((error: unknown) => {
             log({ level: "error", msg: "unhandled request error", ...fields,

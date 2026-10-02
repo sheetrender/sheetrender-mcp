@@ -164,8 +164,8 @@ h1 { font-size: 16px; font-weight: 600; margin: 0; }
 p { margin: 0; }
 .muted { color: var(--sr-muted); }
 .strip { display: flex; gap: 12px; overflow-x: auto; padding-bottom: 4px; scroll-snap-type: x proximity; }
-.doc { flex: 0 0 148px; scroll-snap-align: start; display: grid; gap: 6px; margin: 0; }
-.doc img { width: 148px; aspect-ratio: 1 / 1.414; object-fit: contain; background: #ffffff;
+.doc { flex: 0 0 auto; min-width: 140px; max-width: 296px; scroll-snap-align: start; display: grid; gap: 6px; margin: 0; }
+.doc img { height: 200px; width: auto; max-width: 296px; object-fit: contain; background: #ffffff;
   border: 1px solid var(--sr-border); border-radius: var(--sr-radius); display: block; }
 .doc figcaption { display: flex; justify-content: space-between; align-items: center; gap: 6px; min-width: 0; }
 .doc .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }

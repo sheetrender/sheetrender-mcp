@@ -9,7 +9,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { ClientRequestSchema, JSONRPCRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 
-import { CidrSet, MAX_ANON_BODY_BYTES, OPENAI_EGRESS_CIDRS } from "../src/anon.js";
+import { CidrSet, MAX_ANON_BODY_BYTES, OPENAI_EGRESS_CIDRS, subjectFingerprint } from "../src/anon.js";
 import { ANON_TEXT } from "../src/anon-descriptions.js";
 import {
     bearerToken,
@@ -657,7 +657,8 @@ describe("anonymous mode", () => {
         assert.equal(entry.anonymous, true);
         assert.equal(entry.source, "chatgpt");
         assert.equal(entry.rows, 1);
-        assert.equal(entry.subject_fp, createHash("sha256").update("subject-xyz").digest("hex").slice(0, 12));
+        assert.equal(entry.subject_fp, subjectFingerprint("subject-xyz"));
+        assert.notEqual(entry.subject_fp, createHash("sha256").update("subject-xyz").digest("hex").slice(0, 12));
         assert.equal("key_fp" in entry, false);
         const logged = JSON.stringify(logs);
         assert.equal(logged.includes("Ada Secret"), false);
