@@ -54,6 +54,12 @@ let input: RenderInput | undefined;
 let output: RenderOutput | undefined;
 let failure: string | undefined;
 let locale: string | undefined;
+/**
+ * The continue link made for the current rows. A second click reopens it
+ * instead of making a new one: the same signed-in account redeeming the same
+ * link lands on the same project, while a new link would make another.
+ */
+let continueLink: { key: string; url: string } | undefined;
 
 /** A URL on the API origin, or undefined. */
 function safeUrl(raw: unknown): string | undefined {
@@ -217,10 +223,14 @@ function render(): void {
             try {
                 const args: Record<string, unknown> = { template, rows };
                 if (input?.title) args.title = input.title;
-                const result = await app.callServerTool({ name: "create_continue_link", arguments: args });
-                const link = safeUrl((result.structuredContent as { continue_url?: unknown } | undefined)?.continue_url);
-                if (result.isError || !link) throw new Error("no link");
-                await open(link);
+                const key = JSON.stringify(args);
+                if (continueLink?.key !== key) {
+                    const result = await app.callServerTool({ name: "create_continue_link", arguments: args });
+                    const link = safeUrl((result.structuredContent as { continue_url?: unknown } | undefined)?.continue_url);
+                    if (result.isError || !link) throw new Error("no link");
+                    continueLink = { key, url: link };
+                }
+                await open(continueLink.url);
             } catch {
                 status.textContent = "The link could not be created. Try again in a moment.";
             } finally {

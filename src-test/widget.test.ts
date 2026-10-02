@@ -316,6 +316,29 @@ describe("widget resource", () => {
         assert.equal(h.calls.length, 1);
     });
 
+    it("reopens the same continue link on a second click instead of making another", async () => {
+        const h = await view();
+        h.app.ontoolinput({ arguments: { template: "letter", rows: [{ body: "A" }] } });
+        h.app.ontoolresult({ structuredContent: { template: "letter", documents: [], missing_fields: [] } });
+        const first = "https://sheetrender.com/templates/mail-merge-letter?ref=mcp#handoff=one&rows=1";
+        h.reply(first);
+        const click = async () => {
+            const button = h.root.all().find((node) => node.textContent === "Continue in SheetRender with these rows")!;
+            await button.listeners.get("click")!();
+        };
+        await click();
+        h.reply("https://sheetrender.com/templates/mail-merge-letter?ref=mcp#handoff=two&rows=1");
+        await click();
+        assert.equal(h.calls.length, 1);
+        assert.deepEqual(h.opened, [first, first]);
+        h.app.ontoolinput({ arguments: { template: "letter", rows: [{ body: "B" }] } });
+        h.app.ontoolresult({ structuredContent: { template: "letter", documents: [], missing_fields: [] } });
+        await click();
+        assert.equal(h.calls.length, 2);
+        assert.equal(h.opened.length, 3);
+        assert.notEqual(h.opened[2], first);
+    });
+
     it("validates continue links and honours host link refusals", async () => {
         const h = await view();
         h.app.ontoolinput({ arguments: { template: "letter", rows: [{ body: "x" }] } });
