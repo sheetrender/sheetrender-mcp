@@ -707,7 +707,6 @@ const listOutputShape = {
         description: z.string(),
         page: z.string(),
         orientation: z.string(),
-        guide_url: z.string(),
         fields: z.array(fieldOutput),
     })),
 };
@@ -733,7 +732,7 @@ const renderOutputShape = {
     expires_at: z.string().nullable(),
     missing_fields: z.array(z.object({ row_index: z.number(), fields: z.array(z.string()) })),
     volume: volumeOutput.nullable(),
-    continue: z.object({ guide_url: z.string(), how: z.string() }),
+    continue: z.object({ how: z.string() }),
     status: z.string().optional(),
     message: z.string().optional(),
 };
@@ -967,7 +966,6 @@ export function buildRenderResult(
         .map((entry) => ({ row_index: entry.row_index, fields: entry.fields.filter((f) => typeof f === "string") }));
     const volume = readVolume(result);
     const expiresAt = typeof result.expires_at === "string" ? result.expires_at : null;
-    const guide = guideUrl(apiUrl, key);
     const name = TEMPLATE_NAMES[key];
     const message = typeof result.message === "string" ? result.message : undefined;
 
@@ -980,7 +978,7 @@ export function buildRenderResult(
         expires_at: expiresAt,
         missing_fields: missing,
         volume,
-        continue: { guide_url: guide, how: ANON_TEXT.continueHow },
+        continue: { how: ANON_TEXT.continueHow },
         ...(typeof result.status === "string" ? { status: result.status } : {}),
         ...(message !== undefined ? { message } : {}),
     };
@@ -1207,12 +1205,13 @@ export function createAnonServer(options: AnonServerOptions): McpServer {
                         `${template.key}: ${template.name} (${template.page}, ${template.orientation}). ` +
                         template.description,
                         ...fields,
-                        `  guide: ${template.guide_url}`,
                     ].join("\n").replace(/ +\n/g, "\n");
                 }).join("\n\n");
                 return safeResult(structuredResult(
                     `${plural(templates.length, "template", "templates")}:\n${text}`,
-                    { templates },
+                    // The page link stays out of the output: hosts unfurl it into a
+                    // preview card of the website's own, different design.
+                    { templates: templates.map(({ guide_url: _guide, ...template }) => template) },
                 ));
             } catch (error) {
                 return failure(error, "Listing document templates");

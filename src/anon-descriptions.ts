@@ -57,8 +57,8 @@ export const ANON_TEXT = {
     list:
         "List the document templates this server can fill from rows of data: certificate of " +
         "completion, letter, donation receipt and job offer letter. Returns each template's " +
-        "key, name, a one-line description, page size and orientation, the link to its guide " +
-        "page, and its fields (key, label, whether it is required, an example value, and how " +
+        "key, name, a one-line description, page size and orientation, " +
+        "and its fields (key, label, whether it is required, an example value, and how " +
         "the value is printed). Call this first " +
         "when the user wants PDFs made from a spreadsheet, a table, a CSV or a list of people, " +
         "so you can map their columns onto a template's field keys before calling " +
@@ -94,7 +94,7 @@ export const ANON_TEXT = {
      * The `continue.how` field in render_documents' structured output. Plain
      * fact only: the model text carries no sentence about the website.
      */
-    continueHow: "create_continue_link loads these rows on the template page at guide_url.",
+    continueHow: "create_continue_link loads these rows on the template's page on the SheetRender website.",
 
     /** Describes a text cell in the tools' input schema. */
     cellText:

@@ -251,14 +251,13 @@ describe("anonymous tool list", () => {
 });
 
 describe("list_document_templates", () => {
-    it("returns the four templates in a fixed order with guide links on the API's origin", async () => {
+    it("returns the four templates in a fixed order, without page links a host would unfurl", async () => {
         const { client } = await connect();
         const result = await client.callTool({ name: "list_document_templates", arguments: {} });
         assert.equal(result.isError, undefined);
-        const templates = (result.structuredContent as { templates: { key: string; guide_url: string; fields: unknown[] }[] }).templates;
+        const templates = (result.structuredContent as { templates: { key: string; guide_url?: string; fields: unknown[] }[] }).templates;
         assert.deepEqual(templates.map((t) => t.key), ["certificate", "letter", "donation_receipt", "job_offer_letter"]);
-        assert.equal(templates[0]!.guide_url, `${API_URL}/templates/certificate-of-completion`);
-        assert.equal(templates[1]!.guide_url, `${API_URL}/templates/mail-merge-letter`);
+        assert.ok(templates.every((t) => t.guide_url === undefined));
         assert.deepEqual(templates[0]!.fields[3], {
             key: "issuer",
             label: "Issued by",
@@ -271,7 +270,7 @@ describe("list_document_templates", () => {
         const text = textOf(result);
         assert.match(text, /^4 templates:\ncertificate: Certificate of completion \(A4, landscape\)\. A landscape certificate/);
         assert.match(text, /  - recipient_name \(required\): The person receiving the certificate/);
-        assert.match(text, /  guide: https:\/\/staging\.sheetrender\.test\/templates\/certificate-of-completion/);
+        assert.doesNotMatch(text, /\/templates\//);
         assert.doesNotMatch(text, /invoice/i);
         assert.doesNotMatch(JSON.stringify(result), BANNED_WORDS);
     });
@@ -559,7 +558,7 @@ describe("render_documents", () => {
             expires_at: "2026-10-01T14:00:00Z",
             missing_fields: [{ row_index: 2, fields: ["course"] }],
             volume: { used: 12, limit: 50, resets_at: "2026-11-01T00:00:00Z" },
-            continue: { guide_url: `${API_URL}/templates/certificate-of-completion`, how: ANON_TEXT.continueHow },
+            continue: { how: ANON_TEXT.continueHow },
         });
         const text = textOf(result);
         assert.match(text, /Rendered 2 documents from 3 rows with the Certificate of completion template\./);
@@ -639,7 +638,7 @@ describe("render_documents", () => {
                 expires_at: null,
                 missing_fields: [],
                 volume,
-                continue: { guide_url: `${API_URL}/templates/mail-merge-letter`, how: ANON_TEXT.continueHow },
+                continue: { how: ANON_TEXT.continueHow },
                 status,
                 message,
             });
