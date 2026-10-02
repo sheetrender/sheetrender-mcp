@@ -96,6 +96,7 @@ async function view() {
     const browserOpened: string[] = [];
     const calls: unknown[] = [];
     let replyUrl = "https://sheetrender.com/templates/mail-merge-letter#handoff=abc";
+    let replyExpires: string | null = new Date(Date.now() + 7 * 86_400_000).toISOString();
     const app = {
         deny: false,
         ontoolinput: (_params: { arguments: Record<string, unknown> }) => {},
@@ -103,7 +104,7 @@ async function view() {
         connect: async () => {},
         getHostContext: () => undefined,
         openLink: async ({ url }: { url: string }) => { opened.push(url); return { isError: app.deny }; },
-        callServerTool: async (args: unknown) => { calls.push(args); return { structuredContent: { continue_url: replyUrl } }; },
+        callServerTool: async (args: unknown) => { calls.push(args); return { structuredContent: { continue_url: replyUrl, expires_at: replyExpires } }; },
     };
     const source = readFileSync(new URL("../../src/widget/documents.ts", import.meta.url), "utf8");
     const script = stripTypeScriptTypes(source).replace(/^import\s*\{[\s\S]*?\}\s*from\s*"@modelcontextprotocol\/ext-apps";/m, "");
@@ -114,7 +115,7 @@ async function view() {
         applyDocumentTheme: () => {}, applyHostFonts: () => {}, applyHostStyleVariables: () => {},
     });
     await Promise.resolve();
-    return { root, app, opened, browserOpened, calls, reply: (url: string) => { replyUrl = url; } };
+    return { root, app, opened, browserOpened, calls, reply: (url: string) => { replyUrl = url; }, expires: (iso: string | null) => { replyExpires = iso; } };
 }
 
 describe("widget resource", () => {
@@ -337,6 +338,25 @@ describe("widget resource", () => {
         assert.equal(h.calls.length, 2);
         assert.equal(h.opened.length, 3);
         assert.notEqual(h.opened[2], first);
+    });
+
+    it("makes a new continue link once the remembered one has expired, and never remembers one without an expiry", async () => {
+        const h = await view();
+        h.app.ontoolinput({ arguments: { template: "letter", rows: [{ body: "A" }] } });
+        h.app.ontoolresult({ structuredContent: { template: "letter", documents: [], missing_fields: [] } });
+        const click = async () => {
+            const button = h.root.all().find((node) => node.textContent === "Continue in SheetRender with these rows")!;
+            await button.listeners.get("click")!();
+        };
+        h.expires(new Date(Date.now() - 1000).toISOString());
+        await click();
+        await click();
+        assert.equal(h.calls.length, 2);
+        h.expires(null);
+        await click();
+        await click();
+        assert.equal(h.calls.length, 4);
+        assert.equal(h.opened.length, 4);
     });
 
     it("validates continue links and honours host link refusals", async () => {

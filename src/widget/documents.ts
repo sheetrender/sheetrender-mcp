@@ -59,7 +59,7 @@ let locale: string | undefined;
  * instead of making a new one: the same signed-in account redeeming the same
  * link lands on the same project, while a new link would make another.
  */
-let continueLink: { key: string; url: string } | undefined;
+let continueLink: { key: string; url: string; expires: number } | undefined;
 
 /** A URL on the API origin, or undefined. */
 function safeUrl(raw: unknown): string | undefined {
@@ -224,11 +224,18 @@ function render(): void {
                 const args: Record<string, unknown> = { template, rows };
                 if (input?.title) args.title = input.title;
                 const key = JSON.stringify(args);
-                if (continueLink?.key !== key) {
+                // Reused only for the same rows and while it is valid; an expired link would land on a dead page.
+                if (continueLink?.key !== key || Date.now() >= continueLink.expires) {
+                    continueLink = undefined;
                     const result = await app.callServerTool({ name: "create_continue_link", arguments: args });
-                    const link = safeUrl((result.structuredContent as { continue_url?: unknown } | undefined)?.continue_url);
+                    const content = result.structuredContent as { continue_url?: unknown; expires_at?: unknown } | undefined;
+                    const link = safeUrl(content?.continue_url);
                     if (result.isError || !link) throw new Error("no link");
-                    continueLink = { key, url: link };
+                    const expires = typeof content?.expires_at === "string" ? Date.parse(content.expires_at) : NaN;
+                    // A minute's margin, so a link isn't reopened just as it runs out.
+                    if (Number.isFinite(expires)) continueLink = { key, url: link, expires: expires - 60_000 };
+                    await open(link);
+                    return;
                 }
                 await open(continueLink.url);
             } catch {
