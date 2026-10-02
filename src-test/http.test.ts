@@ -1483,7 +1483,7 @@ const OAUTH_OPTIONS = {
     publicUrl: "https://mcp.staging.sheetrender.test/mcp",
     demoApiKey: "sr_live_demo",
 };
-const SIGN_IN_CHALLENGE = `Bearer resource_metadata="https://mcp.staging.sheetrender.test${PROTECTED_RESOURCE_PATH}", scope="profile render design jobs"`;
+const SIGN_IN_CHALLENGE = `Bearer resource_metadata="https://mcp.staging.sheetrender.test${PROTECTED_RESOURCE_PATH}", scope="profile render design jobs", error="invalid_token", error_description="Requires a signed-in SheetRender account."`;
 const OAUTH_HEADERS = { Authorization: `Bearer ${OAUTH_TOKEN}` };
 const TOOLS_LIST = { jsonrpc: "2.0", id: 1, method: "tools/list" };
 const PROFILE_CALL = { jsonrpc: "2.0", id: 12, method: "tools/call", params: { name: "get_profile", arguments: {} } };
@@ -1528,7 +1528,7 @@ async function oauthBackend() {
                     return answer(200, {
                         active: true, scope: state.scope, client_id: "test-client", sub: profile.id,
                         aud: [state.mode === "wrong-audience" ? "https://other.test/mcp" : OAUTH_OPTIONS.publicUrl, `${OAUTH_OPTIONS.oauthIssuer}/api`],
-                        exp: Math.floor(Date.now() / 1000) + 3600, token_type: "access_token",
+                        exp: Math.floor(Date.now() / 1000) + 3600, token_type: "Bearer",
                     });
                 }
                 if (path === "/api/v1/builtin-templates") return answer(200, JSON.parse(CATALOGUE_JSON));
@@ -1537,6 +1537,9 @@ async function oauthBackend() {
                     return answer(200, { documents: [], volume: { used: 1, limit: 50, resets_at: null } });
                 }
                 if (![ `Bearer ${OAUTH_TOKEN}`, "Bearer sr_live_real" ].includes(req.headers.authorization ?? "")) {
+                    return answer(401, { detail: "Invalid credential" });
+                }
+                if (state.mode === "inactive" && req.headers.authorization === `Bearer ${OAUTH_TOKEN}`) {
                     return answer(401, { detail: "Invalid credential" });
                 }
                 if (path === "/api/v1/templates") return answer(200, []);
@@ -1555,21 +1558,46 @@ async function oauthBackend() {
 }
 
 describe("hosted OAuth", () => {
-    it("serves both protected-resource documents from configuration, with no header-derived hosts", async () => {
+    it("serves both protected-resource documents with credentialless CORS and no header-derived hosts", async () => {
         const { url } = await startMcp("http://127.0.0.1:1", OAUTH_OPTIONS);
+        const origin = "https://browser-client.test";
+        const assertCors = (response: Response) => {
+            assert.equal(response.headers.get("access-control-allow-origin"), "*");
+            assert.equal(response.headers.get("access-control-allow-methods"), "GET, HEAD, OPTIONS");
+            assert.equal(response.headers.has("access-control-allow-credentials"), false);
+            assert.equal(response.headers.has("set-cookie"), false);
+        };
         for (const path of [PROTECTED_RESOURCE_PATH, "/.well-known/oauth-protected-resource"]) {
-            const response = await fetch(`${url}${path}`, { headers: { "X-Forwarded-Host": "attacker.test" } });
+            const response = await fetch(`${url}${path}`, { headers: { Origin: origin, "X-Forwarded-Host": "attacker.test" } });
             assert.equal(response.status, 200);
+            assertCors(response);
             assert.deepEqual(await response.json(), {
                 resource: OAUTH_OPTIONS.publicUrl,
                 authorization_servers: [OAUTH_OPTIONS.oauthIssuer],
                 scopes_supported: ["profile", "render", "design", "jobs"],
                 bearer_methods_supported: ["header"],
             });
-            const head = await fetch(`${url}${path}`, { method: "HEAD" });
+            const head = await fetch(`${url}${path}`, { method: "HEAD", headers: { Origin: origin } });
             assert.equal(head.status, 200);
+            assertCors(head);
             assert.equal(await head.text(), "");
-            assert.equal((await fetch(`${url}${path}`, { method: "POST" })).status, 405);
+            const preflight = await fetch(`${url}${path}`, {
+                method: "OPTIONS", headers: { Origin: origin, "Access-Control-Request-Method": "GET" },
+            });
+            assert.equal(preflight.status, 204);
+            assertCors(preflight);
+            assert.equal(await preflight.text(), "");
+            const rejected = await fetch(`${url}${path}`, { method: "POST", headers: { Origin: origin } });
+            assert.equal(rejected.status, 405);
+            assert.equal(rejected.headers.get("allow"), "GET, HEAD, OPTIONS");
+            assertCors(rejected);
+            await rejected.text();
+        }
+        for (const path of ["/healthz", "/mcp"]) {
+            const response = await fetch(`${url}${path}`, { method: "OPTIONS", headers: { Origin: origin } });
+            assert.equal(response.status, 405);
+            assert.equal(response.headers.has("access-control-allow-origin"), false);
+            await response.text();
         }
         const config = loadHttpConfig({
             OAUTH_ISSUER: OAUTH_OPTIONS.oauthIssuer,
@@ -1584,7 +1612,12 @@ describe("hosted OAuth", () => {
         for (const settings of [{ oauthIssuer: undefined }, { introspectSecret: undefined }]) {
             const { url } = await startMcp("http://127.0.0.1:1", { ...OAUTH_OPTIONS, ...settings });
             for (const path of [PROTECTED_RESOURCE_PATH, "/.well-known/oauth-protected-resource"]) {
-                assert.equal((await fetch(`${url}${path}`)).status, 404);
+                for (const method of ["GET", "OPTIONS"]) {
+                    const response = await fetch(`${url}${path}`, { method, headers: { Origin: "https://browser-client.test" } });
+                    assert.equal(response.status, 404);
+                    assert.equal(response.headers.has("access-control-allow-origin"), false);
+                    await response.text();
+                }
             }
             const anon = await connectAnon(url);
             assert.deepEqual((await anon.listTools()).tools.map((tool) => tool.name).sort(), [
@@ -1644,7 +1677,9 @@ describe("hosted OAuth", () => {
         assert.equal(chatgpt.status, 200);
         const result = (chatgpt.json as { result: { isError: boolean; _meta: Record<string, string[]> } }).result;
         assert.equal(result.isError, true);
-        assert.match(result._meta["mcp/www_authenticate"][0], /error="insufficient_scope", scope="jobs"/);
+        assert.deepEqual(result._meta["mcp/www_authenticate"], [
+            `Bearer resource_metadata="https://mcp.staging.sheetrender.test${PROTECTED_RESOURCE_PATH}", error="insufficient_scope", scope="jobs", error_description="SheetRender sign-in needs the jobs scope for this tool."`,
+        ]);
         assert.equal(backend.calls.length, 1);
         assert.equal(backend.calls[0].path, "/api/oauth/introspect");
         assert.equal((await rawRpc(url, LIST_TEMPLATES_CALL, OAUTH_HEADERS)).status, 200);
@@ -1715,6 +1750,25 @@ describe("hosted OAuth", () => {
             assert.equal(invalid.isError, true);
         }
         assert.equal(backend.calls.filter((entry) => entry.method === "POST" && entry.path === "/api/v1/schedules").length, 1);
+    });
+
+    it("honors API re-validation of the forwarded bearer even while positive introspection is cached", async () => {
+        const backend = await oauthBackend();
+        const now = Date.now();
+        const { url } = await startMcp(backend.url, { ...OAUTH_OPTIONS, now: () => now });
+        const client = await connect(url, OAUTH_TOKEN);
+        const first = await client.callTool({ name: "get_profile", arguments: {} });
+        assert.deepEqual(first.structuredContent, backend.profile);
+        backend.state.mode = "inactive";
+        const revoked = await client.callTool({ name: "get_profile", arguments: {} });
+        assert.equal(revoked.isError, true);
+        assert.equal(revoked.structuredContent, undefined);
+        assert.equal(backend.calls.filter((entry) => entry.path === "/api/oauth/introspect").length, 1);
+        const forwarded = backend.calls.filter((entry) => entry.path !== "/api/oauth/introspect");
+        assert.deepEqual(forwarded.map((entry) => [entry.path, entry.auth]), [
+            ["/api/v1/me", `Bearer ${OAUTH_TOKEN}`],
+            ["/api/v1/me", `Bearer ${OAUTH_TOKEN}`],
+        ]);
     });
 
     it("fails closed when introspection goes down after cache expiry and keeps tokens out of logs", async () => {

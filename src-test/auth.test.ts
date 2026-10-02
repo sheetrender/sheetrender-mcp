@@ -28,7 +28,7 @@ const CONFIG: OAuthConfig = {
 function active(now = 0) {
     return {
         active: true, scope: "profile render design jobs", client_id: "test-client", sub: "account-id",
-        aud: [CONFIG.resource, `${CONFIG.issuer}/api`], exp: now / 1000 + 3600, token_type: "access_token",
+        aud: [CONFIG.resource, `${CONFIG.issuer}/api`], exp: now / 1000 + 3600, token_type: "Bearer",
     };
 }
 
@@ -61,6 +61,17 @@ describe("OAuth configuration and discovery", () => {
 });
 
 describe("token introspection", () => {
+    it("accepts Bearer case-insensitively and the legacy access_token type", async () => {
+        for (const token_type of ["Bearer", "bearer", "BEARER", "bEaReR", "access_token"]) {
+            const introspector = new TokenIntrospector("https://api.test", CONFIG, {
+                now: () => 0, fetch: async () => response({ ...active(), token_type }),
+            });
+            const expected = { active: true, scopes: ["profile", "render", "design", "jobs"], expiresAt: 3600000 };
+            assert.deepEqual(await introspector.introspect(TOKEN), expected, token_type);
+            assert.deepEqual(introspector.peek(TOKEN), expected, token_type);
+        }
+    });
+
     it("uses the fixed form request and secret, caches for 60 seconds, and uses only hashed keys", async (t) => {
         let now = 0;
         const requests: Request[] = [];
@@ -145,7 +156,9 @@ describe("token introspection", () => {
         for (const patch of [
             { aud: ["https://another-mcp.test/mcp"] }, { aud: [`${CONFIG.resource}/`] },
             { aud: [`${CONFIG.issuer}/api`] }, { exp: 0 }, { exp: "3600" },
-            { token_type: "refresh_token" }, { scope: undefined },
+            { token_type: "refresh_token" }, { token_type: "Basic" }, { token_type: "" },
+            { token_type: undefined }, { token_type: null }, { token_type: 1 },
+            { token_type: ["Bearer"] }, { token_type: {} }, { scope: undefined },
         ]) {
             const introspector = new TokenIntrospector("https://api.test", CONFIG, {
                 now: () => 0, fetch: async () => response({ ...active(), ...patch }),
@@ -186,7 +199,7 @@ describe("per-tool auth responses", () => {
         const request = call("get_profile");
         const missing = authorizeTool(request, undefined, CONFIG)!;
         assert.equal(missing.status, 401);
-        assert.equal(missing.challenge, `Bearer resource_metadata="${CONFIG.metadataUrl}", scope="profile render design jobs"`);
+        assert.equal(missing.challenge, `Bearer resource_metadata="${CONFIG.metadataUrl}", scope="profile render design jobs", error="invalid_token", error_description="Requires a signed-in SheetRender account."`);
         assert.deepEqual(authFailureResponse(request, missing, false), {
             jsonrpc: "2.0", id: 42,
             error: { code: -32001, message: "Requires a signed-in SheetRender account.", data: { error: "invalid_token" } },
@@ -194,9 +207,25 @@ describe("per-tool auth responses", () => {
         const limited = { active: true as const, scopes: ["render"], expiresAt: 3600000 };
         const denied = authorizeTool(request, limited, CONFIG)!;
         assert.equal(denied.status, 403);
-        assert.match(denied.challenge, /error="insufficient_scope", scope="profile"/);
+        assert.equal(denied.challenge, `Bearer resource_metadata="${CONFIG.metadataUrl}", error="insufficient_scope", scope="profile", error_description="SheetRender sign-in needs the profile scope for this tool."`);
         assert.equal(authorizeTool(call("list_templates"), limited, CONFIG), undefined);
         assert.equal(authorizeTool(call("render_documents"), undefined, CONFIG), undefined);
+    });
+
+    it("includes both error parameters in ChatGPT challenges for missing, invalid and insufficient-scope tokens", () => {
+        const request = call("get_profile");
+        for (const token of [undefined, { active: false as const }, { active: true as const, scopes: ["render"], expiresAt: 3600000 }]) {
+            const failure = authorizeTool(request, token, CONFIG)!;
+            const shaped = authFailureResponse(request, failure, true);
+            assert.ok("result" in shaped);
+            assert.ok(shaped.result.isError);
+            const challenges = shaped.result._meta["mcp/www_authenticate"];
+            assert.equal(challenges.length, 1);
+            assert.equal(typeof challenges[0], "string");
+            assert.ok(challenges[0].startsWith("Bearer "));
+            assert.ok(challenges[0].includes(`error="${token?.active ? "insufficient_scope" : "invalid_token"}"`));
+            assert.ok(challenges[0].includes(`error_description="${shaped.result.content[0].text}"`));
+        }
     });
 
     it("uses OpenAI metadata or User-Agent only to select the tool-error shape", () => {

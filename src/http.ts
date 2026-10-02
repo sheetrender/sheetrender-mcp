@@ -725,11 +725,22 @@ export function createHttpServer(options: HttpServerOptions): Server {
                 sendJson(res, 404, { error: "not found" });
                 return;
             }
-            if (method !== "GET" && method !== "HEAD") {
-                sendJson(res, 405, { error: "method not allowed" }, { Allow: "GET, HEAD" });
+            const methods = "GET, HEAD, OPTIONS";
+            const headers = {
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": methods,
+                "Cache-Control": "no-store",
+            };
+            if (method === "OPTIONS") {
+                res.writeHead(204, headers);
+                res.end();
                 return;
             }
-            sendJson(res, 200, protectedResourceMetadata(oauth), { "Cache-Control": "no-store" });
+            if (method !== "GET" && method !== "HEAD") {
+                sendJson(res, 405, { error: "method not allowed" }, { ...headers, Allow: methods });
+                return;
+            }
+            sendJson(res, 200, protectedResourceMetadata(oauth), headers);
             return;
         }
 

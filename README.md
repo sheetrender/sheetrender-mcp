@@ -39,10 +39,16 @@ Authorization: Bearer sr_live_...
 ```
 
 The key goes straight through to the SheetRender API for that one request.
-OAuth access tokens are introspected before account calls, then sent unchanged
-to the same operator's public API, which validates them again. Tokens are
-issued for both the MCP URL and the API audience. Only SHA-256 digests key the
-in-memory credential caches; raw credentials are never logged or persisted.
+
+OAuth access tokens deliberately carry both the MCP URL and API audiences.
+Forwarding them unchanged to the same operator's public API is an intentional
+exception to the [MCP token-forwarding restriction](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization#access-token-privilege-restriction).
+The MCP server introspects them before account calls, and the API independently
+re-validates each forwarded token, including its audience, expiry, revocation
+and required scopes.
+
+Only SHA-256 digests key the in-memory credential caches; raw credentials are
+never logged or persisted.
 There are no authenticated MCP sessions: every request stands alone.
 
 Where the key goes depends on the client:
@@ -196,11 +202,12 @@ security scheme; built-in tools declare `noauth`.
 | `jobs` | `create_batch_job`, `get_job`, `get_document`, `create_schedule`, `list_schedules`. |
 
 Protected calls without an active token receive HTTP 401 before the MCP SDK,
-with `WWW-Authenticate: Bearer resource_metadata="<MCP origin>/.well-known/oauth-protected-resource/mcp", scope="profile render design jobs"`.
+with `WWW-Authenticate: Bearer resource_metadata="<MCP origin>/.well-known/oauth-protected-resource/mcp", scope="profile render design jobs", error="invalid_token", error_description="Requires a signed-in SheetRender account."`.
 Tokens missing a tool's scope receive HTTP 403 with `error="insufficient_scope"`
-and that scope. ChatGPT callers receive the corresponding HTTP 200 tool error
-with `_meta["mcp/www_authenticate"]` instead. `openai/*` request metadata and
-User-Agent select this response format only; they grant no access or limits.
+and that scope. Both challenges include an `error_description`. ChatGPT callers
+receive the corresponding HTTP 200 tool error with `_meta["mcp/www_authenticate"]`
+instead. `openai/*` request metadata and User-Agent select this response format
+only; they grant no access or limits.
 
 The resource documents at `/.well-known/oauth-protected-resource/mcp` and
 `/.well-known/oauth-protected-resource` name the configured issuer and exact

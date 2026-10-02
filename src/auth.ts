@@ -172,9 +172,11 @@ export class TokenIntrospector {
             const result = body as Record<string, unknown>;
             if (result.active === false) return INACTIVE;
             if (result.active !== true) throw new IntrospectionUnavailable();
+            const tokenType = typeof result.token_type === "string" ? result.token_type.toLowerCase() : undefined;
+            // Keep the original backend value compatible while it switches to Bearer.
             if (!Array.isArray(result.aud) || !result.aud.includes(this.#config.resource) ||
                 typeof result.exp !== "number" || !Number.isFinite(result.exp) || result.exp * 1000 <= this.#now() ||
-                result.token_type !== "access_token" || typeof result.scope !== "string") return INACTIVE;
+                (tokenType !== "bearer" && tokenType !== "access_token") || typeof result.scope !== "string") return INACTIVE;
             return { active: true, scopes: result.scope.split(/\s+/).filter(Boolean), expiresAt: result.exp * 1000 };
         } catch {
             // Do not retain stale positives or cache an outage as a bad credential.
@@ -213,18 +215,20 @@ export function authorizeTool(message: unknown, token: TokenStatus | undefined, 
     if (!name || !PROTECTED_TOOLS.has(name)) return undefined;
     const scope = PROTECTED_TOOL_SCOPES[name as keyof typeof PROTECTED_TOOL_SCOPES];
     if (!token?.active) {
+        const message = "Requires a signed-in SheetRender account.";
         return {
             status: 401,
-            challenge: `Bearer resource_metadata="${config.metadataUrl}", scope="${OAUTH_SCOPES.join(" ")}"`,
-            message: "Requires a signed-in SheetRender account.",
+            challenge: `Bearer resource_metadata="${config.metadataUrl}", scope="${OAUTH_SCOPES.join(" ")}", error="invalid_token", error_description="${message}"`,
+            message,
             error: "invalid_token",
         };
     }
     if (!token.scopes.includes(scope)) {
+        const message = `SheetRender sign-in needs the ${scope} scope for this tool.`;
         return {
             status: 403,
-            challenge: `Bearer resource_metadata="${config.metadataUrl}", error="insufficient_scope", scope="${scope}"`,
-            message: `SheetRender sign-in needs the ${scope} scope for this tool.`,
+            challenge: `Bearer resource_metadata="${config.metadataUrl}", error="insufficient_scope", scope="${scope}", error_description="${message}"`,
+            message,
             error: "insufficient_scope",
         };
     }
