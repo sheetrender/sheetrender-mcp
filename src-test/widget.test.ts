@@ -90,7 +90,7 @@ class Element {
 }
 
 /** Execute the actual view with a small host/DOM double, without a browser. */
-async function view() {
+async function view(hostBridge?: { toolInput?: unknown }) {
     const root = new Element("main");
     const opened: string[] = [];
     const browserOpened: string[] = [];
@@ -112,6 +112,7 @@ async function view() {
         App: function () { return app; }, URL,
         document: { getElementById: () => root, createElement: (tag: string) => new Element(tag) },
         window: { open: (url: string) => browserOpened.push(url) },
+        openai: hostBridge,
         applyDocumentTheme: () => {}, applyHostFonts: () => {}, applyHostStyleVariables: () => {},
     });
     await Promise.resolve();
@@ -357,6 +358,15 @@ describe("widget resource", () => {
         await click();
         assert.equal(h.calls.length, 4);
         assert.equal(h.opened.length, 4);
+    });
+
+    it("offers Continue from ChatGPT's own tool input when no tool-input notification arrives", async () => {
+        const h = await view({ toolInput: { template: "letter", rows: [{ body: "A" }] } });
+        h.app.ontoolresult({ structuredContent: { template: "letter", documents: [], missing_fields: [] } });
+        const button = h.root.all().find((node) => node.textContent === "Continue in SheetRender with these rows")!;
+        assert.ok(button);
+        await button.listeners.get("click")!();
+        assert.equal(JSON.stringify(h.calls), JSON.stringify([{ name: "create_continue_link", arguments: { template: "letter", rows: [{ body: "A" }] } }]));
     });
 
     it("validates continue links and honours host link refusals", async () => {

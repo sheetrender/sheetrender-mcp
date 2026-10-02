@@ -209,8 +209,11 @@ function render(): void {
         ));
     }
 
-    const rows = Array.isArray(input?.rows) ? input.rows : undefined;
-    const template = input?.template ?? output.template;
+    // Some ChatGPT turns never send ui/notifications/tool-input; its own bridge
+    // still carries the call's arguments, so fall back to that.
+    const source = input ?? hostToolInput();
+    const rows = Array.isArray(source?.rows) ? source.rows : undefined;
+    const template = source?.template ?? output.template;
     if (rows && rows.length > 0 && template) {
         const section = el("div", undefined, "continue");
         const button = el("button", "Continue in SheetRender with these rows");
@@ -222,7 +225,7 @@ function render(): void {
             status.textContent = "";
             try {
                 const args: Record<string, unknown> = { template, rows };
-                if (input?.title) args.title = input.title;
+                if (source?.title) args.title = source.title;
                 const key = JSON.stringify(args);
                 // Reused only for the same rows and while it is valid; an expired link would land on a dead page.
                 if (continueLink?.key !== key || Date.now() >= continueLink.expires) {
@@ -256,6 +259,16 @@ function applyContext(context: McpUiHostContext | undefined): void {
     if (context.styles?.css?.fonts) applyHostFonts(context.styles.css.fonts);
     if (context.locale) locale = context.locale;
 }
+
+/** ChatGPT's window.openai.toolInput, when the host provides one. */
+function hostToolInput(): RenderInput | undefined {
+    const bridge = (globalThis as { openai?: { toolInput?: unknown } }).openai;
+    const value = bridge?.toolInput;
+    return value && typeof value === "object" ? value as RenderInput : undefined;
+}
+
+// ChatGPT announces late-arriving globals (toolInput among them) with this event.
+globalThis.addEventListener?.("openai:set_globals", () => { if (!input) render(); });
 
 app.ontoolinput = (params) => {
     input = (params.arguments ?? {}) as RenderInput;
