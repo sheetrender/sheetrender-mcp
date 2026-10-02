@@ -92,6 +92,45 @@ const LIST_TEMPLATES_CALL = {
     jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "list_templates", arguments: {} },
 };
 
+/**
+ * A stand-in API for the large-body tests: 401 to every key but sr_live_real,
+ * and every dataset upload held until release(), so its request stays in flight.
+ */
+async function heldUploadBackend(): Promise<{ url: string; release: () => void; uploads: () => number }> {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let uploads = 0;
+    const server = createNodeServer((req, res) => {
+        req.resume();
+        const answer = (status: number, body: unknown) => {
+            res.writeHead(status, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(body));
+        };
+        if (req.headers.authorization !== "Bearer sr_live_real") answer(401, { detail: "Invalid API key" });
+        else if (!req.url?.endsWith("/datasets/rows")) answer(200, []);
+        else {
+            uploads++;
+            void held.then(() => answer(201, { id: "ds_1", name: "rows", row_count: 40, columns: ["text"] }));
+        }
+    });
+    const url = await listen(server);
+    closers.push(() => closeServer(server));
+    return { url, release, uploads: () => uploads };
+}
+
+/** A create_dataset call whose body is over 2 MB: 40 rows of 64 KB. */
+function largeUpload(mcpUrl: string, apiKey: string): Promise<Response> {
+    const rows = Array.from({ length: 40 }, () => ({ text: "x".repeat(64 * 1024) }));
+    return fetch(`${mcpUrl}/mcp`, {
+        method: "POST",
+        headers: { ...MCP_HEADERS, Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({
+            jsonrpc: "2.0", id: 1, method: "tools/call",
+            params: { name: "create_dataset", arguments: { template_id: "tpl_1", rows } },
+        }),
+    });
+}
+
 async function startMcp(
     apiUrl: string,
     extra: Partial<Parameters<typeof createHttpServer>[0]> = {},
@@ -986,6 +1025,75 @@ describe("anonymous mode", () => {
         assert.equal(events(await fits.text()), MAX_ANON_BATCH);
     });
 
+    it("handles one body over 2 MB at a time, refusing the next with 503 before reading it", async () => {
+        const backend = await heldUploadBackend();
+        const { url, logs } = await startMcp(backend.url);
+        const real = { Authorization: "Bearer sr_live_real" };
+        await rawRpc(url, LIST_TEMPLATES_CALL, real);
+        const upload = largeUpload(url, "sr_live_real");
+        await waitUntil(() => backend.uploads() === 1);
+
+        const padded = (bytes: number) => {
+            const body = { jsonrpc: "2.0", id: 1, method: "tools/list", params: { _meta: { "test/padding": "" } } };
+            body.params._meta["test/padding"] = "x".repeat(bytes - Buffer.byteLength(JSON.stringify(body)));
+            return JSON.stringify(body);
+        };
+        const large = padded(MAX_ANON_BODY_BYTES + 1024);
+        const sendLarge = () => fetch(`${url}/mcp`, { method: "POST", headers: { ...MCP_HEADERS, ...real }, body: large });
+        // Declared by Content-Length: refused before any of it is read.
+        const declared = await sendLarge();
+        assert.equal(declared.status, 503);
+        assert.equal(declared.headers.get("retry-after"), "5");
+        assert.equal((await declared.json() as { error: { message: string } }).error.message, ANON_TEXT.serverBusy);
+        // Streamed with no Content-Length: refused as it passes 2 MB.
+        const chunk = new TextEncoder().encode("x".repeat(64 * 1024));
+        let sent = 0;
+        const stream = new ReadableStream<Uint8Array>({
+            pull(controller) {
+                if (sent++ < 64) controller.enqueue(chunk);
+                else controller.close();
+            },
+        });
+        const streamed = await fetch(`${url}/mcp`, {
+            method: "POST", headers: { ...MCP_HEADERS, ...real }, body: stream, duplex: "half",
+        } as RequestInit);
+        assert.equal(streamed.status, 503);
+        await streamed.text();
+        // Small requests are not held up.
+        assert.equal((await rawRpc(url, { jsonrpc: "2.0", id: 1, method: "tools/list" }, real)).status, 200);
+        assert.equal(backend.uploads(), 1);
+
+        backend.release();
+        const done = await upload;
+        assert.equal(done.status, 200);
+        await done.text();
+        // The slot is back once that response has ended.
+        await waitUntil(async () => {
+            const response = await sendLarge();
+            await response.text();
+            return response.status === 200;
+        });
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        assert.equal(logs.filter((entry) => entry.msg === "request" && entry.refused === "large_body_in_flight").length, 2);
+    });
+
+    it("lets LARGE_BODY_MAX_IN_FLIGHT allow more large bodies at once", async () => {
+        const backend = await heldUploadBackend();
+        const { url } = await startMcp(backend.url, { largeBodyMaxInFlight: 2 });
+        await rawRpc(url, LIST_TEMPLATES_CALL, { Authorization: "Bearer sr_live_real" });
+        const uploads = [largeUpload(url, "sr_live_real"), largeUpload(url, "sr_live_real")];
+        await waitUntil(() => backend.uploads() === 2);
+        const third = await largeUpload(url, "sr_live_real");
+        assert.equal(third.status, 503);
+        await third.text();
+        backend.release();
+        for (const pending of uploads) {
+            const response = await pending;
+            assert.equal(response.status, 200);
+            await response.text();
+        }
+    });
+
     it("lets a key the API accepted batch up to 20 messages, and no further", async () => {
         assert.equal(MAX_KEYED_BATCH, 20);
         const backend = await keyCheckingBackend("sr_live_real");
@@ -1281,6 +1389,9 @@ describe("loadHttpConfig", () => {
         assert.equal(loadHttpConfig({ ANON_RPC_PER_HOUR: "50" }).anonRpcPerHour, 50);
         assert.equal(loadHttpConfig({ ANON_MAX_IN_FLIGHT: "16" }).anonMaxInFlight, 16);
         assert.equal(loadHttpConfig({ ANON_NETWORK_MAX_IN_FLIGHT: "2" }).anonNetworkMaxInFlight, 2);
+        assert.equal(config.largeBodyMaxInFlight, 1);
+        assert.equal(loadHttpConfig({ LARGE_BODY_MAX_IN_FLIGHT: "3" }).largeBodyMaxInFlight, 3);
+        assert.throws(() => loadHttpConfig({ LARGE_BODY_MAX_IN_FLIGHT: "0" }), /LARGE_BODY_MAX_IN_FLIGHT/);
         for (const value of ["0", "-1", "1.5", "not a number"]) {
             assert.throws(() => loadHttpConfig({ CLAUDE_CALLS_PER_HOUR: value }), /CLAUDE_CALLS_PER_HOUR/);
             assert.throws(() => loadHttpConfig({ ANON_NETWORK_CALLS_PER_HOUR: value }), /ANON_NETWORK_CALLS_PER_HOUR/);

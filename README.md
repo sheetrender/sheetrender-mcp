@@ -86,6 +86,15 @@ matter to hand-written clients. If the very first call is a body over 2 MB
 first and retry. Every request, with a key or without, counts toward the
 server-wide in-flight cap.
 
+Bodies over 2 MB also take one of a few server-wide large-body slots, 1 by
+default (`LARGE_BODY_MAX_IN_FLIGHT`). A slot is taken before reading when
+`Content-Length` declares such a body, or as soon as a streamed body passes
+2 MB, and is held until the response ends. When all are taken, the request
+gets a 503 with `Retry-After: 5` and the rest of its body is not read. One 25 MB
+body can take around 100 MB of heap while it is decoded, parsed and passed
+on, so raise this only with the heap (the hosted container runs a 192 MB
+heap).
+
 ### Without a key (ChatGPT and Claude directory listings)
 
 When the server runs with `SHEETRENDER_DEMO_API_KEY` set, a request that
@@ -189,6 +198,7 @@ keyed requests when no demo key is set), it also reads:
 | `ANON_RPC_PER_HOUR` | Anonymous messages other than tool calls, plus every message sent with a key the API has not yet accepted, per hour per IPv4 /24 or IPv6 /48, outside the OpenAI and Claude ranges, default 600. |
 | `ANON_MAX_IN_FLIGHT` | Requests answered at once, all callers together (with a key or without), default 64. |
 | `ANON_NETWORK_MAX_IN_FLIGHT` | Anonymous requests, and requests with a key the API has not yet accepted, answered at once per IPv4 /24 or IPv6 /48, outside the OpenAI and Claude ranges, default 8. |
+| `LARGE_BODY_MAX_IN_FLIGHT` | Requests with a body over 2 MB handled at once, server-wide, default 1. Only keys the API has accepted can send such a body. |
 | `OPENAI_EGRESS_CIDRS` | Comma- or space-separated CIDRs whose `openai/subject` is believed, replacing both the built-in copy and the live fetch of [chatgpt-connectors.json](https://openai.com/chatgpt-connectors.json); `none` believes no subject. |
 
 With `SHEETRENDER_DEMO_API_KEY` set, the server refuses to start if the view

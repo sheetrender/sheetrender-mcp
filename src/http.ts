@@ -64,6 +64,15 @@ const DEFAULT_HOST = "0.0.0.0";
  * the hosted deployment, so the two limits never disagree about a request.
  */
 const DEFAULT_MAX_BODY_BYTES = 25 * 1024 * 1024;
+/**
+ * Requests with a body over MAX_ANON_BODY_BYTES being handled at once, server
+ * wide. Measured: one 25 MiB body peaks at ~50 MiB of heap when it is ASCII
+ * and ~100 MiB when one character outside Latin-1 makes V8 store its text as
+ * two-byte strings (the decoded string and the parsed copy, then the parsed
+ * copy and the JSON re-serialised for the API). Two of those would not fit in
+ * the hosted container's 192 MiB heap beside everything else, so one.
+ */
+const DEFAULT_LARGE_BODY_MAX_IN_FLIGHT = 1;
 /** Socket inactivity timeout. The transport's SSE keep-alive (15 s) resets it. */
 const DEFAULT_IDLE_TIMEOUT_MS = 60_000;
 /** The MCP-Protocol-Version header is logged as sent, cut to this length. */
@@ -121,6 +130,8 @@ export interface HttpServerOptions {
     anonMaxInFlight?: number;
     /** Anonymous and not-yet-accepted-key requests being answered at once per IPv4 /24 or IPv6 /48. */
     anonNetworkMaxInFlight?: number;
+    /** Requests with a body over 2 MiB being handled at once, server wide. */
+    largeBodyMaxInFlight?: number;
     /** Ranges whose `openai/subject` is believed; OpenAI's published list by default. */
     openaiEgressCidrs?: readonly string[];
     /**
@@ -149,6 +160,7 @@ export interface HttpConfig {
     anonRpcPerHour: number;
     anonMaxInFlight: number;
     anonNetworkMaxInFlight: number;
+    largeBodyMaxInFlight: number;
     openaiEgressCidrs: readonly string[];
     /** True when OPENAI_EGRESS_CIDRS set the list; the live refresh is then off. */
     openaiEgressFromEnv: boolean;
@@ -173,6 +185,7 @@ export function loadHttpConfig(env: NodeJS.ProcessEnv = process.env): HttpConfig
         anonRpcPerHour: readInteger(env, "ANON_RPC_PER_HOUR", DEFAULT_RPC_PER_HOUR, 1),
         anonMaxInFlight: readInteger(env, "ANON_MAX_IN_FLIGHT", DEFAULT_MAX_IN_FLIGHT, 1),
         anonNetworkMaxInFlight: readInteger(env, "ANON_NETWORK_MAX_IN_FLIGHT", DEFAULT_NETWORK_MAX_IN_FLIGHT, 1),
+        largeBodyMaxInFlight: readInteger(env, "LARGE_BODY_MAX_IN_FLIGHT", DEFAULT_LARGE_BODY_MAX_IN_FLIGHT, 1),
         openaiEgressCidrs: readCidrs(env, "OPENAI_EGRESS_CIDRS", OPENAI_EGRESS_CIDRS),
         openaiEgressFromEnv: Boolean(env.OPENAI_EGRESS_CIDRS?.trim()),
     };
@@ -252,32 +265,63 @@ export function logJson(entry: LogEntry): void {
 // ---------------------------------------------------------------------------
 
 class BodyTooLarge extends Error {}
+const EMPTY_BODY = Buffer.alloc(0);
+/** A streamed body grew past the large-body threshold with no large-body slot free. */
+class LargeBodyBusy extends Error {}
 
-/** Reads the whole body, failing fast once it passes `limit` bytes. */
-function readBody(req: IncomingMessage, limit: number): Promise<Buffer> {
+/** Asked for a large-body slot once a streamed body passes `threshold` bytes. */
+interface LargeBodyGate {
+    threshold: number;
+    enter: () => boolean;
+}
+
+/** The declared Content-Length, or undefined when there is none usable. */
+function declaredLength(req: IncomingMessage): number | undefined {
+    const declared = Number(req.headers["content-length"]);
+    return req.headers["content-length"] !== undefined && Number.isSafeInteger(declared) && declared >= 0
+        ? declared
+        : undefined;
+}
+
+/**
+ * Reads the whole body, failing fast once it passes `limit` bytes, or once it
+ * passes `gate.threshold` without a large-body slot. A declared length is read
+ * straight into one buffer of that size, so the body is held once, not twice.
+ */
+function readBody(req: IncomingMessage, limit: number, gate?: LargeBodyGate): Promise<Buffer> {
     return new Promise((resolve, reject) => {
-        const declared = Number(req.headers["content-length"]);
-        if (Number.isFinite(declared) && declared > limit) {
+        const declared = declaredLength(req);
+        if (declared !== undefined && declared > limit) {
             reject(new BodyTooLarge());
             return;
         }
+        const into = declared !== undefined ? Buffer.allocUnsafe(declared) : undefined;
         const chunks: Buffer[] = [];
         let received = 0;
+        const stop = (error: Error) => {
+            // Stop reading but leave the socket alone: req.destroy() here
+            // would reset the connection before the 413 or 503 could be
+            // written. Both carry `Connection: close`, which ends the upload.
+            req.off("data", onData);
+            req.pause();
+            reject(error);
+        };
         const onData = (chunk: Buffer) => {
+            const before = received;
             received += chunk.length;
-            if (received > limit) {
-                // Stop reading but leave the socket alone: req.destroy() here
-                // would reset the connection before the 413 could be written.
-                // The 413 carries `Connection: close`, which ends the upload.
-                req.off("data", onData);
-                req.pause();
-                reject(new BodyTooLarge());
+            if (received > limit || (into !== undefined && received > into.length)) {
+                stop(new BodyTooLarge());
                 return;
             }
-            chunks.push(chunk);
+            if (gate && received > gate.threshold && before <= gate.threshold && !gate.enter()) {
+                stop(new LargeBodyBusy());
+                return;
+            }
+            if (into) chunk.copy(into, before);
+            else chunks.push(chunk);
         };
         req.on("data", onData);
-        req.on("end", () => resolve(Buffer.concat(chunks)));
+        req.on("end", () => resolve(into ? into.subarray(0, received) : Buffer.concat(chunks)));
         req.on("error", reject);
     });
 }
@@ -546,6 +590,10 @@ export function createHttpServer(options: HttpServerOptions): Server {
         options.anonMaxInFlight ?? DEFAULT_MAX_IN_FLIGHT,
         options.anonNetworkMaxInFlight ?? DEFAULT_NETWORK_MAX_IN_FLIGHT,
     );
+    // Bodies over the anonymous cap are what can fill the heap: at most this
+    // many are read, parsed and passed on at once.
+    const largeBodyMax = options.largeBodyMaxInFlight ?? DEFAULT_LARGE_BODY_MAX_IN_FLIGHT;
+    const largeBodies = new InFlightLimiter(largeBodyMax, largeBodyMax);
     const verifiedKeys = new VerifiedKeys(undefined, undefined, options.now);
     const catalogue = new CatalogueCache(undefined, options.now);
     const openaiEgress = options.openaiEgress ?? new CidrSet(options.openaiEgressCidrs ?? OPENAI_EGRESS_CIDRS);
@@ -690,10 +738,36 @@ export function createHttpServer(options: HttpServerOptions): Server {
         // not yet accepted gets the same; the full allowance (render_pdf's HTML,
         // create_dataset's rows) comes with the first call the API accepts.
         const limit = bounded ? Math.min(maxBodyBytes, MAX_ANON_BODY_BYTES) : maxBodyBytes;
+        // A body over the anonymous cap holds one of a few large-body slots
+        // until the response ends: taken before reading when Content-Length
+        // declares it, or the moment a streamed body grows past the cap.
+        let largeSlot: (() => void) | undefined;
+        const enterLarge = (): boolean => {
+            if (largeSlot) return true;
+            const entered = largeBodies.enter(undefined);
+            if (typeof entered === "string") return false;
+            largeSlot = entered;
+            res.on("close", entered);
+            return true;
+        };
+        const refuseLarge = () => {
+            fields.refused = "large_body_in_flight";
+            sendRpcError(res, 503, -32000, ANON_TEXT.serverBusy, { "Retry-After": "5", Connection: "close" });
+        };
+        const declared = declaredLength(req);
+        if (declared !== undefined && declared > MAX_ANON_BODY_BYTES && declared <= limit && !enterLarge()) {
+            refuseLarge();
+            return;
+        }
+        const gate = limit > MAX_ANON_BODY_BYTES ? { threshold: MAX_ANON_BODY_BYTES, enter: enterLarge } : undefined;
         let raw: Buffer;
         try {
-            raw = await readBody(req, limit);
+            raw = await readBody(req, limit, gate);
         } catch (error) {
+            if (error instanceof LargeBodyBusy) {
+                refuseLarge();
+                return;
+            }
             if (error instanceof BodyTooLarge) {
                 fields.refused = "body";
                 const message = !anonymous && limit < maxBodyBytes
@@ -714,6 +788,10 @@ export function createHttpServer(options: HttpServerOptions): Server {
         } catch {
             sendRpcError(res, 400, -32700, "Parse error: Invalid JSON");
             return;
+        } finally {
+            // This function stays suspended until the response ends, and its
+            // locals with it: let the bytes go now that they are parsed.
+            raw = EMPTY_BODY;
         }
         Object.assign(fields, describeRpc(parsedBody));
         const messages: unknown[] = Array.isArray(parsedBody) ? parsedBody : [parsedBody];
@@ -883,6 +961,7 @@ async function main(): Promise<void> {
         anon_rpc_per_hour: config.anonRpcPerHour,
         anon_max_in_flight: config.anonMaxInFlight,
         anon_network_max_in_flight: config.anonNetworkMaxInFlight,
+        large_body_max_in_flight: config.largeBodyMaxInFlight,
         openai_egress_cidrs: config.openaiEgressCidrs.length,
         openai_egress_source: config.openaiEgressFromEnv ? "env" : config.demoApiKey ? "live" : "built-in",
     });
