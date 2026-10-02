@@ -16,6 +16,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
+import { ANON_TEXT } from "./anon-descriptions.js";
+import { PROTECTED_TOOL_SCOPES } from "./auth.js";
 import {
     loadConfig,
     SheetRenderClient,
@@ -149,6 +151,8 @@ async function deliverPdf(bytes: Uint8Array, label: string): Promise<CallToolRes
 }
 
 export interface ServerOptions {
+    /** Registers the hosted account tools for the combined OAuth listing. */
+    oauth?: boolean;
     /**
      * True for the Streamable HTTP server at mcp.sheetrender.com, where the
      * process runs on SheetRender's side rather than the user's machine. That
@@ -168,18 +172,35 @@ export function createServer(
     client: SheetRenderClient,
     options: ServerOptions = {},
 ): McpServer {
-    const hosted = options.hosted === true;
+    const oauth = options.oauth === true;
+    const hosted = options.hosted === true || oauth;
     const deliver = hosted
         ? async (bytes: Uint8Array, label: string) => buildInlinePdfResult(label, bytes)
         : deliverPdf;
-    const text = describeTools(hosted);
+    const text = describeTools(hosted, oauth);
+
+    function accountMetadata(name: keyof typeof PROTECTED_TOOL_SCOPES, readOnly: boolean) {
+        if (!oauth) return {};
+        return {
+            annotations: {
+                readOnlyHint: readOnly,
+                destructiveHint: false,
+                idempotentHint: readOnly && name !== "render_template",
+                openWorldHint: name === "create_schedule",
+            },
+            _meta: {
+                securitySchemes: [{ type: "oauth2", scopes: [PROTECTED_TOOL_SCOPES[name]] }],
+                ...(name === "get_profile" ? { "openai/profile": true } : {}),
+            },
+        };
+    }
 
     const server = new McpServer(
         { name: SERVER_NAME, version: SERVER_VERSION },
-        { instructions: text.instructions },
+        { instructions: oauth ? `${ANON_TEXT.instructions}\n\n${text.instructions}` : text.instructions },
     );
 
-    server.registerTool(
+    if (!oauth) server.registerTool(
         "render_pdf",
         {
             title: "Render HTML to PDF",
@@ -213,6 +234,7 @@ export function createServer(
     server.registerTool(
         "list_templates",
         {
+            ...accountMetadata("list_templates", true),
             title: "List SheetRender templates",
             description: text.listTemplates,
             inputSchema: {},
@@ -229,6 +251,7 @@ export function createServer(
     server.registerTool(
         "design_template",
         {
+            ...accountMetadata("design_template", false),
             title: "Design a template",
             description: text.designTemplate,
             inputSchema: {
@@ -297,6 +320,7 @@ export function createServer(
     server.registerTool(
         "get_design",
         {
+            ...accountMetadata("get_design", true),
             title: "Check a template design",
             description: text.getDesign,
             inputSchema: {
@@ -317,6 +341,7 @@ export function createServer(
     server.registerTool(
         "render_template",
         {
+            ...accountMetadata("render_template", true),
             title: "Render a saved template to PDF",
             description: text.renderTemplate,
             inputSchema: {
@@ -345,6 +370,7 @@ export function createServer(
     server.registerTool(
         "create_dataset",
         {
+            ...accountMetadata("create_dataset", false),
             title: "Create a dataset from JSON rows",
             description: text.createDataset,
             inputSchema: {
@@ -391,7 +417,7 @@ export function createServer(
     );
 
     // Reads a file off the local disk, which the hosted server does not have.
-    if (!hosted) {
+    if (!hosted && !oauth) {
         server.registerTool(
             "upload_dataset",
             {
@@ -433,6 +459,7 @@ export function createServer(
     server.registerTool(
         "list_datasets",
         {
+            ...accountMetadata("list_datasets", true),
             title: "List datasets for a template",
             description: text.listDatasets,
             inputSchema: {
@@ -454,6 +481,7 @@ export function createServer(
     server.registerTool(
         "create_batch_job",
         {
+            ...accountMetadata("create_batch_job", false),
             title: "Start a batch PDF job",
             description: text.createBatchJob,
             inputSchema: {
@@ -511,6 +539,7 @@ export function createServer(
     server.registerTool(
         "get_job",
         {
+            ...accountMetadata("get_job", true),
             title: "Check a batch PDF job",
             description: text.getJob,
             inputSchema: {
@@ -529,6 +558,7 @@ export function createServer(
     server.registerTool(
         "get_document",
         {
+            ...accountMetadata("get_document", true),
             title: "Download a rendered document",
             description: text.getDocument,
             inputSchema: {
@@ -547,6 +577,60 @@ export function createServer(
             }
         },
     );
+
+    if (oauth) {
+        server.registerTool("get_profile", {
+            ...accountMetadata("get_profile", true),
+            title: "Read SheetRender profile",
+            description: text.getProfile,
+            inputSchema: {},
+            outputSchema: { id: z.string(), name: z.string().nullable(), email: z.string().nullable() },
+        }, async () => {
+            try {
+                const profile = await client.getProfile();
+                return { ...textResult(JSON.stringify(profile)), structuredContent: { ...profile } };
+            } catch (error) {
+                return toToolError(error);
+            }
+        });
+
+        server.registerTool("create_schedule", {
+            ...accountMetadata("create_schedule", false),
+            title: "Create a recurring document schedule",
+            description: text.createSchedule,
+            inputSchema: z.strictObject({
+                template_id: z.string().min(1).describe("Template id from list_templates."),
+                dataset_id: z.string().min(1).describe("Dataset id in the template's project, from list_datasets or create_dataset."),
+                cadence: z.enum(["every_15_min", "hourly", "daily", "weekly", "monthly"]),
+                name: z.string().max(200).nullable().optional().describe("Schedule label; omitted or blank uses the template and cadence."),
+                hour_utc: z.number().int().min(0).max(23).optional().describe("UTC hour, 0–23. Defaults to 9."),
+                weekday: z.number().int().min(0).max(6).nullable().optional().describe("Weekly day: Monday is 0, Sunday is 6. Defaults to Monday."),
+                day_of_month: z.number().int().min(1).max(31).nullable().optional().describe("Monthly day, 1–31; shortened months use their last day. Omit to use the creation day."),
+                delivery_email: z.string().max(320).nullable().optional().describe("One email address to receive each run's merged PDF."),
+            }),
+        }, async (input) => {
+            try {
+                const schedule = await client.createSchedule(input);
+                return { ...textResult(JSON.stringify(schedule)), structuredContent: { ...schedule } };
+            } catch (error) {
+                return toToolError(error);
+            }
+        });
+
+        server.registerTool("list_schedules", {
+            ...accountMetadata("list_schedules", true),
+            title: "List document schedules",
+            description: text.listSchedules,
+            inputSchema: {},
+        }, async () => {
+            try {
+                const schedules = await client.listSchedules();
+                return { ...textResult(JSON.stringify(schedules)), structuredContent: { schedules } };
+            } catch (error) {
+                return toToolError(error);
+            }
+        });
+    }
 
     return server;
 }

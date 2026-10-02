@@ -27,15 +27,23 @@ Set it only if you're pointing at a self-hosted or staging instance.
 
 The same server runs at **`https://mcp.sheetrender.com/mcp`** over Streamable
 HTTP, so clients that can't spawn a local process can use it too. Nothing is
-installed; each request carries your API key:
+installed. It supports **OAuth sign-in for account tools** in ChatGPT and
+Claude connectors. Add the server URL; the three built-in document tools work
+without signing in, and calling an account tool prompts for sign-in. Discovery
+lists all 15 tools both before and after OAuth sign-in.
+
+Existing clients can continue sending an API key on each request:
 
 ```
 Authorization: Bearer sr_live_...
 ```
 
-Requests without that header get a 401. The key goes straight through to the
-SheetRender API for that one request and is never stored — the server keeps no
-sessions, so every request stands alone.
+The key goes straight through to the SheetRender API for that one request.
+OAuth access tokens are introspected before account calls, then sent unchanged
+to the same operator's public API, which validates them again. Tokens are
+issued for both the MCP URL and the API audience. Only SHA-256 digests key the
+in-memory credential caches; raw credentials are never logged or persisted.
+There are no authenticated MCP sessions: every request stands alone.
 
 Where the key goes depends on the client:
 
@@ -57,17 +65,19 @@ Where the key goes depends on the client:
 - **Claude API** (the Messages API's MCP connector): add
   `{"type": "url", "url": "https://mcp.sheetrender.com/mcp", "name": "sheetrender", "authorization_token": "sr_live_..."}`
   to `mcp_servers`.
-- **claude.ai, Claude Desktop and ChatGPT custom connectors** take a server URL
-  and an OAuth client, not a static header. Until the endpoint speaks OAuth,
-  use the stdio package above there — it's the same tools, with the key in
-  `env` — or bridge with `npx mcp-remote https://mcp.sheetrender.com/mcp --header "Authorization: Bearer sr_live_..."`
-  as the command.
+- **claude.ai, Claude Desktop and ChatGPT custom connectors**: add
+  `https://mcp.sheetrender.com/mcp` and use OAuth sign-in when an account tool
+  asks to connect. The staging verification of each host's per-tool sign-in
+  prompt is still required before directory rollout.
 
 Two differences from the stdio server follow from the process not running on
 your machine. Rendered PDFs come back inline as a base64 resource (up to 8 MB;
 larger ones are reported with their size and left for the web app) instead of
 as a temp-file path, and `upload_dataset` is not offered because there is no
-local file to read — send rows with `create_dataset` instead.
+local file to read — send rows with `create_dataset` instead. OAuth discovery
+also omits `render_pdf`; it remains available with an API key or over stdio.
+The legacy API-key and stdio registries retain their existing tools and
+behavior. The new profile and schedule tools are in the hosted OAuth registry.
 
 `GET /healthz` answers 200 without credentials. Request bodies are capped at
 25 MB; anything larger is a 413.
@@ -95,11 +105,9 @@ body can take around 100 MB of heap while it is decoded, parsed and passed
 on, so raise this only with the heap (the hosted container runs a 192 MB
 heap).
 
-### Without a key (ChatGPT and Claude directory listings)
+### Built-in document tools (ChatGPT and Claude directory listings)
 
-When the server runs with `SHEETRENDER_DEMO_API_KEY` set, a request that
-sends **no** `Authorization` header gets a different, smaller tool set
-instead of a 401. These tools fill SheetRender's built-in templates
+With `SHEETRENDER_DEMO_API_KEY` set, these three tools fill SheetRender's built-in templates
 (certificate of completion, letter, donation receipt, job offer letter) from
 rows in the chat, through a dedicated rendering account:
 
@@ -172,8 +180,60 @@ count only toward the overall in-flight cap, and their batches may carry 20
 messages.
 
 A request carrying a SheetRender bearer key uses the API-key tools above.
-A malformed `Authorization` header is rejected. The stdio server never
-offers the anonymous tools.
+The stdio server never offers the anonymous tools.
+
+### OAuth account tools
+
+With OAuth enabled, keyless and OAuth callers see the same three built-in
+tools plus these account tools. Every account tool declares an `oauth2`
+security scheme; built-in tools declare `noauth`.
+
+| Scope | Account tools |
+| --- | --- |
+| `profile` | `get_profile` — account UUID, name and email (possibly null); marked `openai/profile`. |
+| `render` | `list_templates`, `render_template`, `create_dataset`, `list_datasets`. |
+| `design` | `design_template`, `get_design`. |
+| `jobs` | `create_batch_job`, `get_job`, `get_document`, `create_schedule`, `list_schedules`. |
+
+Protected calls without an active token receive HTTP 401 before the MCP SDK,
+with `WWW-Authenticate: Bearer resource_metadata="<MCP origin>/.well-known/oauth-protected-resource/mcp", scope="profile render design jobs"`.
+Tokens missing a tool's scope receive HTTP 403 with `error="insufficient_scope"`
+and that scope. ChatGPT callers receive the corresponding HTTP 200 tool error
+with `_meta["mcp/www_authenticate"]` instead. `openai/*` request metadata and
+User-Agent select this response format only; they grant no access or limits.
+
+The resource documents at `/.well-known/oauth-protected-resource/mcp` and
+`/.well-known/oauth-protected-resource` name the configured issuer and exact
+`MCP_PUBLIC_URL`, with all four scopes and header-only bearer authentication.
+
+An `sro_` prefix proves nothing. A token's first small account-tool call is admitted
+under the same 2 MB, four-message and network bounds as an unconfirmed API
+key, then checked at `POST /api/oauth/introspect`. Only `active: true` with
+the exact MCP audience, a future expiry and access-token type lifts those
+bounds for subsequent requests. Positive results last up to 60 seconds
+(never past token expiry), inactive results 5 seconds; concurrent checks
+of one token share a request. API success does not extend this OAuth cache.
+Network errors, invalid introspection responses and upstream failures return
+HTTP 503 with `Retry-After: 5`; expired cached results are never reused.
+Discovery and built-in tools do not require introspection and remain usable
+during sign-in outages. All callers remain subject to the global and
+large-body in-flight limits.
+
+**Built-in tools always use the demo account**, including calls carrying an
+active OAuth token. Their row caps, subject/network buckets, document volume,
+widget and continue link retain Phase 1 behavior. Sign-in enables account
+tools; it does not change a built-in tool into an account render.
+
+`create_schedule` accepts `template_id`, `dataset_id` (same project), and
+`cadence` (`every_15_min`, `hourly`, `daily`, `weekly`, `monthly`). Optional
+fields are `name` (200 characters), `hour_utc` (0–23, default 9), `weekday`
+(Monday 0 to Sunday 6, default Monday), `day_of_month` (1–31, default creation
+day, clamped in shorter months), and `delivery_email` (one recipient, up to
+320 characters). Hour is ignored for hourly and quarter-hour cadences.
+The tool creates an enabled schedule and returns its next run time.
+`list_schedules` returns schedule details and enabled/paused state.
+Both use `/api/v1/schedules`; neither exposes trigger credentials. Per-row
+email and Drive delivery are outside this public API.
 
 ### Running it yourself
 
@@ -181,16 +241,19 @@ offers the anonymous tools.
 (default 8080), `HOST` (default `0.0.0.0`), `SHEETRENDER_API_URL`,
 `MAX_BODY_BYTES` and `IDLE_TIMEOUT_MS` (default 60000), and logs one JSON
 line per request to stdout — method, path, status, duration, the JSON-RPC
-method and tool name, a fingerprint of the key (never the key), and
-`key_verified`, whether the API had accepted that key yet.
+method and tool name, a fingerprint of the credential (never the credential),
+and `key_verified`, whether that credential had already been accepted at
+admission (by the API for keys, or by cached introspection for OAuth tokens).
 
 For the anonymous tools, and the request bounds above (which also apply to
 keyed requests when no demo key is set), it also reads:
 
 | Variable | |
 | --- | --- |
-| `SHEETRENDER_DEMO_API_KEY` | The dedicated rendering account's `sr_` key. Unset: no anonymous tools, keyless requests get a 401. |
+| `SHEETRENDER_DEMO_API_KEY` | The dedicated rendering account's `sr_` key, needed to run the built-in document tools. With OAuth off and this unset, keyless requests get a 401. |
 | `MCP_PUBLIC_URL` | The URL users paste, byte for byte, e.g. `https://mcp.sheetrender.com/mcp`. Sets the view's sandbox origin (Claude hashes this exact string). |
+| `OAUTH_ISSUER` | Authorization server origin: `https://sheetrender.com` in production or `https://staging.sheetrender.com` in staging. No inferred host or default. |
+| `MCP_INTROSPECT_SECRET` | Shared secret for the backend's introspection endpoint. Must match the backend setting; sent only to that endpoint as a Bearer credential. |
 | `OPENAI_APPS_CHALLENGE` | OpenAI's domain-verification token, served as plain text at `GET /.well-known/openai-apps-challenge` (404 when unset). |
 | `ANON_CALLS_PER_HOUR` | Render and continue calls per subject or IP per hour, default 30. |
 | `ANON_NETWORK_CALLS_PER_HOUR` | Render and continue calls per hour per IPv4 /24 or IPv6 /48, for callers counted by IP, default 300. |
@@ -198,10 +261,21 @@ keyed requests when no demo key is set), it also reads:
 | `ANON_RPC_PER_HOUR` | Anonymous messages other than tool calls, plus every message sent with a key the API has not yet accepted, per hour per IPv4 /24 or IPv6 /48, outside the OpenAI and Claude ranges, default 600. |
 | `ANON_MAX_IN_FLIGHT` | Requests answered at once, all callers together (with a key or without), default 64. |
 | `ANON_NETWORK_MAX_IN_FLIGHT` | Anonymous requests, and requests with a key the API has not yet accepted, answered at once per IPv4 /24 or IPv6 /48, outside the OpenAI and Claude ranges, default 8. |
-| `LARGE_BODY_MAX_IN_FLIGHT` | Requests with a body over 2 MB handled at once, server-wide, default 1. Only keys the API has accepted can send such a body. |
+| `LARGE_BODY_MAX_IN_FLIGHT` | Requests with a body over 2 MB handled at once, server-wide, default 1. Requires a key the API accepted or a cached active OAuth token. |
 | `OPENAI_EGRESS_CIDRS` | Comma- or space-separated CIDRs whose `openai/subject` is believed, replacing both the built-in copy and the live fetch of [chatgpt-connectors.json](https://openai.com/chatgpt-connectors.json); `none` believes no subject. |
 
-With `SHEETRENDER_DEMO_API_KEY` set, the server refuses to start if the view
+OAuth is enabled only when both `OAUTH_ISSUER` and `MCP_INTROSPECT_SECRET` are
+set. Enabling it also requires `MCP_PUBLIC_URL`. If either OAuth setting is
+unset, resource metadata returns 404 and the v0.5.3 authentication and tool
+selection behavior is retained: keyless callers get only demo tools when a
+demo key is set, malformed Authorization is rejected, and API keys select
+the legacy tools. OAuth does not require a demo key for discovery or account
+tools, but built-in renders need the separately configured demo credential.
+The reverse proxy must route both protected-resource metadata paths to this
+server. Deployment must pass the new issuer variable as well as the shared
+secret to the MCP process.
+
+With `SHEETRENDER_DEMO_API_KEY` set or OAuth enabled, the server refuses to start if the view
 bundle (`dist/widget/documents.js`) is missing. The `Dockerfile` in this repo
 builds a non-root runtime image for it:
 

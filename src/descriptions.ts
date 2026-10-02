@@ -13,6 +13,9 @@ const WHAT_IS_SHEETRENDER =
 
 export interface ToolDescriptions {
     instructions: string;
+    getProfile: string;
+    createSchedule: string;
+    listSchedules: string;
     renderPdf: string;
     listTemplates: string;
     designTemplate: string;
@@ -29,7 +32,8 @@ export interface ToolDescriptions {
     getDocument: string;
 }
 
-export function describeTools(hosted: boolean): ToolDescriptions {
+export function describeTools(hosted: boolean, oauth = false): ToolDescriptions {
+    const signedIn = oauth ? "Requires a signed-in SheetRender account. " : "";
     const pdfReturns = hosted
         ? "Returns the PDF inline as a base64 resource (up to 8 MB) along with its size."
         : "Returns the temp-file path and size; PDFs under 512 KB are also attached inline.";
@@ -59,8 +63,9 @@ export function describeTools(hosted: boolean): ToolDescriptions {
 
     return {
         instructions:
-            `${WHAT_IS_SHEETRENDER} Use render_pdf for one-off documents built from ` +
-            "HTML you write, and render_template for documents from a template already " +
+            `${WHAT_IS_SHEETRENDER} ` +
+            (oauth ? "Sign in to use saved templates, datasets, designs, jobs and schedules. Use get_profile to read the signed-in account. Use render_template for documents from a template already "
+                : "Use render_pdf for one-off documents built from HTML you write, and render_template for documents from a template already ") +
             "saved in the user's account (list_templates finds their ids).\n\n" +
             "Use design_template to create a template from data and an example or brief.\n\n" +
             "For many documents at once, the whole batch runs from here without the web " +
@@ -68,7 +73,17 @@ export function describeTools(hosted: boolean): ToolDescriptions {
             "to poll -> get_document to download each PDF. list_datasets finds datasets that " +
             "already exist on a template's project.",
 
-        designTemplate:
+        getProfile: signedIn + "Read the account's stable id, name and email address.",
+        createSchedule: signedIn +
+            "Render every row of a saved dataset with a saved template on a repeating cadence. " +
+            "Use when the user asks for recurring documents. Times are UTC. The template and dataset " +
+            "must be in the same project. Optionally send each run's merged PDF to one delivery_email. " +
+            "Returns the enabled schedule and its next run time.",
+        listSchedules: signedIn +
+            "List the account's schedules, their templates and datasets, cadence, enabled state, " +
+            "delivery email, and next and last run times.",
+
+        designTemplate: signedIn +
             "Design a saved template from exactly one of dataset_id, inline rows, or " +
             "data_base64 with data_filename (CSV or XLSX, up to 10 MB), and an example, brief, " +
             "or style_id. Use an example alone, or a brief with optional style_id. " +
@@ -76,7 +91,7 @@ export function describeTools(hosted: boolean): ToolDescriptions {
             (hosted ? "" : "Local data_path can supply the data; example_path can supply the example. ") +
             "Waits up to 3 minutes; returns the design status, template id, mapping and preview URL.",
 
-        getDesign:
+        getDesign: signedIn +
             "Get a design's status and, when complete, its template id, name, mapping and preview URL.",
 
         renderPdf:
@@ -91,14 +106,14 @@ export function describeTools(hosted: boolean): ToolDescriptions {
             "`data` keys become Jinja template variables, so passing " +
             '{"total": "42.00"} lets the HTML say {{ total }}. Jinja loops and ' +
             "conditionals work too. Omit `data` if the HTML has no placeholders.\n\n" +
-            "Two server limits to plan for: HTML over 2 MB is rejected, measured both on " +
+            "Two server limits to allow for: HTML over 2 MB is rejected, measured both on " +
             "what you send and on the result after `data` is substituted in, so keep large " +
-            "tables paginated rather than emitting one enormous document; and accounts on " +
-            'the free plan get a "Made with SheetRender" footer added to every PDF, which ' +
+            "tables paginated rather than emitting one enormous document; and a " +
+            '"Made with SheetRender" footer is added when required by the account settings, which ' +
             "is expected, not a bug — mention it if the user seems surprised.\n\n" +
             pdfReturns,
 
-        listTemplates:
+        listTemplates: signedIn +
             `${WHAT_IS_SHEETRENDER} This tool lists the templates saved in the user's ` +
             "account, with the id each one needs.\n\n" +
             "Call it first whenever the user refers to a template by name (\"render the " +
@@ -106,23 +121,22 @@ export function describeTools(hosted: boolean): ToolDescriptions {
             "here takes a template_id, including create_dataset and list_datasets. Takes " +
             "no arguments.",
 
-        renderTemplate:
+        renderTemplate: signedIn +
             `${WHAT_IS_SHEETRENDER} This tool renders one PDF from a template already ` +
             `saved in the user's account ${pdfHandoff}\n\n` +
             "Use it when the user wants a document in their existing design. Get " +
-            "`template_id` from list_templates. Use render_pdf instead when you are " +
-            "writing the HTML yourself.\n\n" +
+            "`template_id` from list_templates. " +
+            (oauth ? "\n\n" : "Use render_pdf instead when you are writing the HTML yourself.\n\n") +
             "`data` supplies one row's worth of values: each key becomes a Jinja variable " +
             "in the template's HTML. To render a PDF for every row of a spreadsheet, load " +
             `the rows with ${datasetTools} and run create_batch_job ` +
             "rather than calling this repeatedly.\n\n" +
             "Omit `page_settings` to keep the template's own saved page setup — passing it " +
             "overrides that for this render only.\n\n" +
-            'Free-plan accounts get a "Made with SheetRender" footer on the PDF, same as ' +
-            "render_pdf — expected, not a bug.\n\n" +
+            'A "Made with SheetRender" footer is added when required by the account settings.\n\n' +
             pdfReturns,
 
-        createDataset:
+        createDataset: signedIn +
             `${WHAT_IS_SHEETRENDER} This tool turns rows you already hold — as JSON — ` +
             "into a dataset a batch job can render, and returns the dataset id plus the " +
             "column keys.\n\n" +
@@ -140,8 +154,7 @@ export function describeTools(hosted: boolean): ToolDescriptions {
             "in that project can render it and it stays available to later jobs.\n\n" +
             "Limits: 50,000 rows and 500,000 cells (rows x columns) per call. " +
             `${pastTheRowCap} ` +
-            "Creating a dataset is free; only rendering counts against the account's " +
-            "plan.\n\n" +
+            "Creating a dataset does not consume document volume; only rendering does.\n\n" +
             "Returns the dataset id and, for each column, the sanitized `key`. That key — " +
             "not the original header — is what the template's placeholders, " +
             "`filename_template` and `group_by` address, so read it off this result " +
@@ -160,13 +173,12 @@ export function describeTools(hosted: boolean): ToolDescriptions {
             "spreadsheet formats (.xls, .ods, .numbers) and .pdf are not parsed — convert " +
             "to .csv or .xlsx first.\n\n" +
             "Limits: 20 MB per file and 500,000 cells; larger data has to be split across " +
-            "several datasets and jobs. Uploading is free; only rendering counts against " +
-            "the account's plan.\n\n" +
+            "several datasets and jobs. Uploading does not consume document volume; only rendering does.\n\n" +
             "Returns the dataset id and each column's sanitized `key` — the name the " +
             "template's placeholders, `filename_template` and `group_by` use, which is " +
             'often not the header text verbatim ("Invoice No" becomes invoice_no).',
 
-        listDatasets:
+        listDatasets: signedIn +
             `${WHAT_IS_SHEETRENDER} This tool lists the datasets a batch job can render ` +
             "with a given template — everything in that template's project, newest " +
             "first — with each one's id, row count and column keys.\n\n" +
@@ -177,7 +189,9 @@ export function describeTools(hosted: boolean): ToolDescriptions {
             "It is also the quickest way to see a dataset's sanitized column keys before " +
             "writing a `filename_template` or choosing `group_by`.",
 
-        createBatchJob:
+        createBatchJob: signedIn +
+            (oauth ? "Renders every row of a saved dataset with a saved template as a background job; " +
+                "use for the user's own templates and datasets once signed in. " : "") +
             `${WHAT_IS_SHEETRENDER} This tool queues a batch job that renders one PDF per ` +
             "row of a dataset, and returns the job id.\n\n" +
             "Use it when the user wants many documents at once — \"an invoice for every " +
@@ -208,7 +222,7 @@ export function describeTools(hosted: boolean): ToolDescriptions {
                     : "create_dataset, upload_dataset or list_datasets"
             }. It must belong to the same template's project.`,
 
-        getJob:
+        getJob: signedIn +
             `${WHAT_IS_SHEETRENDER} This tool reports the progress of a batch job started ` +
             "by create_batch_job.\n\n" +
             "Returns the status, rows done/failed, and — once the job reaches a finished " +
@@ -218,7 +232,7 @@ export function describeTools(hosted: boolean): ToolDescriptions {
             "rather than assuming zero documents.\n\n" +
             "Pass those document ids to get_document to download the individual PDFs.",
 
-        getDocument:
+        getDocument: signedIn +
             `${WHAT_IS_SHEETRENDER} This tool downloads one PDF produced by a batch job ` +
             `${pdfHandoff}\n\n` +
             "`document_id` comes from get_job on a finished batch — that is the only place " +

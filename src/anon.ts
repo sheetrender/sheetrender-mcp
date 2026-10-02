@@ -18,9 +18,10 @@
  * The flood guard here (calls per hour) sits in front of the backend's own
  * per-subject monthly document volume, which is the real limit.
  *
- * Stdio and API-key callers never see any of this: http.ts only builds this
- * server for a request with no Authorization header, and only when a demo key
- * is configured.
+ * OAuth discovery includes these same tools alongside the account tools.
+ * They always use the demo client and the same subject limits, even when the
+ * request carries an OAuth token. Stdio and legacy API-key callers keep their
+ * own registry.
  */
 
 import { createHash, createHmac, randomBytes } from "node:crypto";
@@ -1035,6 +1036,8 @@ export function buildRenderResult(
 // ---------------------------------------------------------------------------
 
 export interface AnonServerOptions {
+    /** Adds the unchanged demo tools and widget to an existing OAuth registry. */
+    server?: McpServer;
     /** A client carrying the demo API key, one per HTTP request. */
     client: SheetRenderClient;
     /** Shared across requests: the flood guard. */
@@ -1102,7 +1105,7 @@ export function createAnonServer(options: AnonServerOptions): McpServer {
     const apiUrl = client.baseUrl;
     const apiOrigin = new URL(apiUrl).origin;
 
-    const server = new McpServer(
+    const server = options.server ?? new McpServer(
         { name: SERVER_NAME, version: SERVER_VERSION },
         { instructions: ANON_TEXT.instructions },
     );

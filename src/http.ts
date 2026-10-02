@@ -3,14 +3,18 @@
  * SheetRender MCP server over Streamable HTTP — the hosted endpoint at
  * https://mcp.sheetrender.com/mcp.
  *
- * Multi-tenant and stateless: every request carries the caller's SheetRender
- * API key as `Authorization: Bearer sr_...`, and every request gets its own
+ * Multi-tenant and stateless: a request can carry a SheetRender API key or
+ * OAuth access token as a Bearer credential, and every request gets its own
  * `SheetRenderClient`, `McpServer` and transport, torn down when the response
  * ends. Nothing about one caller survives into the next request, so a key can
  * never leak across tenants and any replica can answer any request. The cost
  * is re-registering the tools on every request, which is microseconds.
  *
- * With SHEETRENDER_DEMO_API_KEY set, a request with no Authorization header
+ * With OAuth enabled, discovery lists demo and account tools together. A
+ * gate before the SDK challenges protected calls, and only active tokens for
+ * this resource can reach account tools. The demo tools always use the demo
+ * client, with their existing subject limits. API keys keep their registry.
+ * With OAuth disabled and SHEETRENDER_DEMO_API_KEY set, a request with no Authorization header
  * at all gets the anonymous tool set instead (anon.ts): three tools that fill
  * the built-in templates through the demo account. That is what the ChatGPT
  * and Claude directory listings connect to. A request that does send a key
@@ -51,6 +55,20 @@ import {
     trustedOpenaiSubject,
 } from "./anon.js";
 import { ANON_TEXT } from "./anon-descriptions.js";
+import {
+    ANONYMOUS_TOOLS,
+    authFailureResponse,
+    authorizeTool,
+    IntrospectionUnavailable,
+    isChatGptCall,
+    oauthConfig,
+    PROTECTED_RESOURCE_PATH,
+    PROTECTED_TOOLS,
+    protectedResourceMetadata,
+    TokenIntrospector,
+    toolName,
+    type TokenStatus,
+} from "./auth.js";
 import { DEFAULT_API_URL, parseApiUrl, SheetRenderClient, SheetRenderError } from "./client.js";
 import { createServer, runningAsExecutable, SERVER_VERSION } from "./index.js";
 import { startOpenaiEgressRefresh } from "./openai-egress.js";
@@ -111,6 +129,10 @@ export interface HttpServerOptions {
     demoApiKey?: string;
     /** The URL users paste for this server, e.g. https://mcp.sheetrender.com/mcp. */
     publicUrl?: string;
+    /** Authorization server origin; OAuth is off unless the secret is also set. */
+    oauthIssuer?: string;
+    /** Shared with the backend's /api/oauth/introspect endpoint. Never logged. */
+    introspectSecret?: string;
     /** Served at /.well-known/openai-apps-challenge for OpenAI's domain check. */
     openaiAppsChallenge?: string;
     /** Anonymous flood guard: tool calls per subject per hour. */
@@ -153,6 +175,8 @@ export interface HttpConfig {
     idleTimeoutMs: number;
     demoApiKey?: string;
     publicUrl?: string;
+    oauthIssuer?: string;
+    introspectSecret?: string;
     openaiAppsChallenge?: string;
     anonCallsPerHour: number;
     claudeCallsPerHour: number;
@@ -170,7 +194,7 @@ export interface HttpConfig {
 export function loadHttpConfig(env: NodeJS.ProcessEnv = process.env): HttpConfig {
     const port = readInteger(env, "PORT", DEFAULT_PORT, 1, 65535);
     const host = env.HOST?.trim() || DEFAULT_HOST;
-    return {
+    const config: HttpConfig = {
         port,
         host,
         apiUrl: parseApiUrl(env.SHEETRENDER_API_URL?.trim() || DEFAULT_API_URL),
@@ -178,6 +202,8 @@ export function loadHttpConfig(env: NodeJS.ProcessEnv = process.env): HttpConfig
         idleTimeoutMs: readInteger(env, "IDLE_TIMEOUT_MS", DEFAULT_IDLE_TIMEOUT_MS, 1000),
         demoApiKey: readDemoKey(env),
         publicUrl: readPublicUrl(env),
+        oauthIssuer: env.OAUTH_ISSUER?.trim() || undefined,
+        introspectSecret: env.MCP_INTROSPECT_SECRET?.trim() || undefined,
         openaiAppsChallenge: env.OPENAI_APPS_CHALLENGE?.trim() || undefined,
         anonCallsPerHour: readInteger(env, "ANON_CALLS_PER_HOUR", DEFAULT_CALLS_PER_HOUR, 1),
         claudeCallsPerHour: readInteger(env, "CLAUDE_CALLS_PER_HOUR", DEFAULT_CLAUDE_CALLS_PER_HOUR, 1),
@@ -189,6 +215,8 @@ export function loadHttpConfig(env: NodeJS.ProcessEnv = process.env): HttpConfig
         openaiEgressCidrs: readCidrs(env, "OPENAI_EGRESS_CIDRS", OPENAI_EGRESS_CIDRS),
         openaiEgressFromEnv: Boolean(env.OPENAI_EGRESS_CIDRS?.trim()),
     };
+    oauthConfig(config);
+    return config;
 }
 
 /**
@@ -559,8 +587,30 @@ export function createHttpServer(options: HttpServerOptions): Server {
     const apiUrl = options.apiUrl.replace(/\/+$/, "");
     const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
     const idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
-    const log = options.log ?? logJson;
     const demoApiKey = options.demoApiKey;
+    const oauth = oauthConfig(options);
+    const writeLog = options.log ?? logJson;
+    const log = (entry: LogEntry): void => {
+        // Request paths, RPC names and SDK errors are caller-controlled too.
+        // Scrub reflected tokens and the configured secrets before any sink.
+        const secrets = [options.introspectSecret?.trim(), demoApiKey];
+        function redact(value: unknown): unknown {
+            if (typeof value === "string") {
+                let text = value;
+                for (const secret of secrets) {
+                    if (secret) text = text.split(secret).join("[redacted]");
+                }
+                return text.replace(/\bsr(?:o|r)?_[A-Za-z0-9_-]+/g, "[redacted]");
+            }
+            if (Array.isArray(value)) return value.map(redact);
+            if (value && typeof value === "object") {
+                return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redact(item)]));
+            }
+            return value;
+        }
+        writeLog(redact(entry) as LogEntry);
+    };
+    const introspector = oauth ? new TokenIntrospector(apiUrl, oauth, { now: options.now }) : undefined;
     const limiter = new SlidingWindowLimiter(
         options.anonCallsPerHour ?? DEFAULT_CALLS_PER_HOUR,
         60 * 60 * 1000,
@@ -634,7 +684,7 @@ export function createHttpServer(options: HttpServerOptions): Server {
 
         handle(req, res, url, method, fields).catch((error: unknown) => {
             log({ level: "error", msg: "unhandled request error", ...fields,
-                error: fields.anonymous ? "Anonymous request failed" : String(error) });
+                error: fields.oauth ? "Request failed" : fields.anonymous ? "Anonymous request failed" : String(error) });
             if (!res.headersSent) sendRpcError(res, 500, -32603, "Internal server error");
             else res.end();
         });
@@ -670,6 +720,19 @@ export function createHttpServer(options: HttpServerOptions): Server {
             return;
         }
 
+        if (url.pathname === PROTECTED_RESOURCE_PATH || url.pathname === "/.well-known/oauth-protected-resource") {
+            if (!oauth) {
+                sendJson(res, 404, { error: "not found" });
+                return;
+            }
+            if (method !== "GET" && method !== "HEAD") {
+                sendJson(res, 405, { error: "method not allowed" }, { Allow: "GET, HEAD" });
+                return;
+            }
+            sendJson(res, 200, protectedResourceMetadata(oauth), { "Cache-Control": "no-store" });
+            return;
+        }
+
         if (url.pathname !== "/mcp") {
             sendJson(res, 404, { error: "not found" });
             return;
@@ -680,16 +743,15 @@ export function createHttpServer(options: HttpServerOptions): Server {
             return;
         }
 
-        // Auth first, before any body is read or any transport built. Only
-        // the SheetRender API can say whether a key is valid, and it does so
-        // on the first tool call; the prefix check keeps a caller with no key
-        // at all from making the process read and parse a body.
-        // No Authorization header at all, and a demo key to serve it with: the
-        // anonymous tools. A header that is present but wrong is still a 401,
-        // so a client that meant to send a key learns it is broken.
+        // API keys retain the legacy registry and admission rules. OAuth
+        // requests must be parsed under the anonymous bounds before their
+        // per-tool gate can run; an unverified prefix grants nothing.
+        const bearer = bearerToken(req.headers.authorization);
+        const apiKeyMode = bearer?.startsWith(API_KEY_PREFIX) === true;
+        const oauthRequest = oauth !== undefined && !apiKeyMode;
         const anonymous = req.headers.authorization === undefined && demoApiKey !== undefined;
-        const apiKey = anonymous ? demoApiKey : bearerToken(req.headers.authorization);
-        if (!apiKey?.startsWith(API_KEY_PREFIX)) {
+        const apiKey = (anonymous ? demoApiKey : bearer) ?? "";
+        if (!oauthRequest && !apiKey.startsWith(API_KEY_PREFIX)) {
             sendRpcError(
                 res,
                 401,
@@ -700,14 +762,17 @@ export function createHttpServer(options: HttpServerOptions): Server {
             );
             return;
         }
-        if (anonymous) fields.anonymous = true;
-        else fields.key_fp = keyFingerprint(apiKey);
+        if (anonymous || oauthRequest) fields.anonymous = true;
+        if (oauthRequest) fields.oauth = true;
+        if (!anonymous && bearer) fields.key_fp = keyFingerprint(bearer);
 
         const ip = clientIp(req);
         // A key counts as real only once the API has answered a call made
         // with it. Until then the request gets exactly the anonymous bounds
         // below, so a made-up `sr_` key gains nothing over sending none.
-        const verified = !anonymous && verifiedKeys.has(apiKey);
+        const verified = oauthRequest
+            ? Boolean(bearer && introspector?.peek(bearer)?.active)
+            : !anonymous && verifiedKeys.has(apiKey);
         if (!anonymous) fields.key_verified = verified;
         const bounded = !verified;
         // ChatGPT's and Claude's egress addresses each carry many users: they
@@ -770,7 +835,10 @@ export function createHttpServer(options: HttpServerOptions): Server {
             }
             if (error instanceof BodyTooLarge) {
                 fields.refused = "body";
-                const message = !anonymous && limit < maxBodyBytes
+                const message = oauthRequest && bearer && limit < maxBodyBytes
+                    ? `Request body exceeds ${limit} bytes. Make a small account-tool call first ` +
+                        "(get_profile) so SheetRender can verify this sign-in, then retry."
+                    : !anonymous && limit < maxBodyBytes
                     ? `Request body exceeds ${limit} bytes. Bodies up to ${maxBodyBytes} bytes are accepted ` +
                         "once the SheetRender API has accepted this key: make a small call first " +
                         "(list_templates), then retry."
@@ -806,9 +874,11 @@ export function createHttpServer(options: HttpServerOptions): Server {
         // only the other messages count here. A key not yet accepted counts
         // every message, tool calls too: each would otherwise be a free call
         // to the API that ends in a 401.
-        const counted = anonymous
+        const counted = (anonymous || (oauthRequest && !bearer))
             ? messages.filter((message) =>
-                !(message && typeof message === "object" && (message as { method?: unknown }).method === "tools/call")
+                oauthRequest
+                    ? !ANONYMOUS_TOOLS.has(toolName(message) ?? "")
+                    : !(message && typeof message === "object" && (message as { method?: unknown }).method === "tools/call")
             ).length
             : messages.length;
         if (networkKey !== undefined && counted > 0) {
@@ -824,9 +894,47 @@ export function createHttpServer(options: HttpServerOptions): Server {
             rpcLimiter.takeMany(networkKey, counted);
         }
         const userAgent = req.headers["user-agent"];
-        if (anonymous) {
+        if (anonymous || oauthRequest) {
             Object.assign(fields, describeAnonCall(parsedBody, userAgent, ip, openaiEgress));
             if (fields.subject_untrusted) untrusted.note();
+        }
+
+        // Introspection follows admission and is needed only for account
+        // calls. Discovery and demo calls remain usable during an auth outage.
+        // Only cached positives lift the next request's limits; expiry is
+        // never extended by an API call.
+        let token: TokenStatus | undefined;
+        if (oauthRequest && oauth && introspector) {
+            if (bearer?.startsWith("sro_") && messages.some((message) => PROTECTED_TOOLS.has(toolName(message) ?? ""))) {
+                try {
+                    token = await introspector.introspect(bearer);
+                } catch (error) {
+                    if (!(error instanceof IntrospectionUnavailable)) throw error;
+                    fields.refused = "introspection_unavailable";
+                    sendRpcError(res, 503, -32000, error.message, { "Retry-After": "5", "Cache-Control": "no-store" });
+                    return;
+                }
+            }
+            // Preflight every message before dispatching any part of a batch.
+            for (const message of messages) {
+                const failure = authorizeTool(message, token, oauth);
+                if (!failure) continue;
+                const chatgpt = isChatGptCall(message, userAgent);
+                fields.refused = failure.error;
+                sendJson(res, chatgpt ? 200 : failure.status,
+                    // A successful HTTP status must answer every request id
+                    // in a batch so a ChatGPT client does not wait forever.
+                    chatgpt && Array.isArray(parsedBody)
+                        ? messages.filter((item) => item && typeof item === "object" && "id" in item)
+                            .map((item) => authFailureResponse(item, authorizeTool(item, token, oauth) ?? {
+                                ...failure, message: "This batch was not run because an account tool requires sign-in. Retry this call separately.",
+                            }, true))
+                        : authFailureResponse(message, failure, chatgpt), {
+                        "Cache-Control": "no-store",
+                        ...(!chatgpt ? { "WWW-Authenticate": failure.challenge } : {}),
+                    });
+                return;
+            }
         }
 
         // Aborted when the response closes, so a caller that disconnects mid
@@ -834,16 +942,19 @@ export function createHttpServer(options: HttpServerOptions): Server {
         const disconnected = new AbortController();
         const client = new SheetRenderClient({
             baseUrl: apiUrl,
-            apiKey,
+            apiKey: oauthRequest ? (token?.active ? bearer! : "") : apiKey,
             signal: disconnected.signal,
             // Every route the API-key tools call needs the key, so a 2xx is the
             // API vouching for it. Never for the demo key: anonymous requests
             // stay bounded whatever the API answers.
-            onAccepted: anonymous ? undefined : () => verifiedKeys.add(apiKey),
+            onAccepted: anonymous || oauthRequest ? undefined : () => verifiedKeys.add(apiKey),
         });
-        const mcp = anonymous
+        const mcp = anonymous || oauthRequest
             ? createAnonServer({
-                client,
+                ...(oauthRequest ? { server: createServer(client, { hosted: true, oauth: true }) } : {}),
+                client: oauthRequest ? new SheetRenderClient({
+                    baseUrl: apiUrl, apiKey: demoApiKey ?? "", signal: disconnected.signal,
+                }) : client,
                 limiter,
                 claudeLimiter,
                 networkLimiter,
@@ -860,10 +971,10 @@ export function createHttpServer(options: HttpServerOptions): Server {
         // request lands on a fresh transport, perhaps on another replica. So the
         // id is issued here and read from the request header in anon.ts.
         const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-        if (anonymous && isInitialize(parsedBody)) res.setHeader("Mcp-Session-Id", newSessionId());
+        if ((anonymous || oauthRequest) && isInitialize(parsedBody)) res.setHeader("Mcp-Session-Id", newSessionId());
         transport.onerror = (error) => {
             log({ level: "warn", msg: "transport error", ...fields,
-                error: anonymous ? "Anonymous transport failed" : error.message });
+                error: oauthRequest ? "Transport failed" : anonymous ? "Anonymous transport failed" : error.message });
         };
         res.on("close", () => {
             // Both are per-request; nothing else references them once the
@@ -903,7 +1014,7 @@ async function main(): Promise<void> {
         process.exit(1);
     }
 
-    if (config.demoApiKey) {
+    if (config.demoApiKey || oauthConfig(config)) {
         // The anonymous tools' view is inlined from the built bundle; refuse
         // to start without it rather than serve a broken view.
         try {
@@ -953,6 +1064,7 @@ async function main(): Promise<void> {
         max_body_bytes: config.maxBodyBytes,
         idle_timeout_ms: config.idleTimeoutMs,
         anonymous_tools: config.demoApiKey !== undefined,
+        oauth_enabled: Boolean(oauthConfig(config)),
         public_url: config.publicUrl ?? null,
         openai_apps_challenge: config.openaiAppsChallenge !== undefined,
         anon_calls_per_hour: config.anonCallsPerHour,
