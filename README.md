@@ -1,7 +1,18 @@
 # @sheetrender/mcp
 
-MCP server for [SheetRender](https://sheetrender.com). It lets your AI assistant
-render PDFs from HTML templates and spreadsheet data.
+MCP server for [SheetRender](https://sheetrender.com): turn rows of a
+spreadsheet into one PDF each, such as certificates, letters, donation receipts
+and offer letters.
+
+The quickest start needs no account and no install. Add the hosted server
+**`https://mcp.sheetrender.com/mcp`** as a connector in ChatGPT, Claude or any
+client that takes a Streamable HTTP URL, then paste or describe your rows. It
+fills SheetRender's built-in templates and returns a preview and a PDF per row
+([details](#without-a-key-chatgpt-and-claude-directory-listings)).
+
+With a SheetRender API key you get the full tool set: your own saved templates,
+HTML templates, datasets and batch jobs, either through the npm package below or
+the same hosted URL.
 
 ## Setup
 
@@ -33,7 +44,8 @@ installed; each request carries your API key:
 Authorization: Bearer sr_live_...
 ```
 
-Requests without that header get a 401. The key goes straight through to the
+Requests without that header get the smaller no-key tool set described
+[below](#without-a-key-chatgpt-and-claude-directory-listings). The key goes straight through to the
 SheetRender API for that one request and is never stored — the server keeps no
 sessions, so every request stands alone.
 
@@ -104,8 +116,7 @@ instead of a 401. These tools fill SheetRender's built-in templates
 rows in the chat, through a dedicated rendering account:
 
 - `list_document_templates`: the templates, their fields (key, label,
-  required, example, character and line limits) and each one's page on the
-  website.
+  required, example, character and line limits).
 - `render_documents`: up to 25 rows per call, one PDF per row; returns a PNG
   preview and a PDF link per document (both expire after an hour), the rows
   that missed a required field, and how many of the month's 50 documents per
