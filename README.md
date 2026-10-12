@@ -120,8 +120,10 @@ rows in the chat, through a dedicated rendering account:
 - `render_documents`: up to 25 rows per call, one PDF per row; returns a PNG
   preview and a PDF link per document (both expire after an hour), the rows
   that missed a required field, and how many of the month's 50 documents per
-  user remain. When a limit shared with other users is what cut or refused the
-  call, it says the limit is shared instead of showing a count. A value over
+  user (in Claude, per conversation) remain. When a limit shared with other
+  users is what cut or refused the call, it says the limit is shared instead of
+  showing a count. A refused or cut call also says the rows can be taken
+  to the website with a continue link. A value over
   its field's character or line limit is refused before the API is called, and
   the API's own reason for refusing rows (row number, field and rule, never the
   value) is passed on.

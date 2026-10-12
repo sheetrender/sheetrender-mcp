@@ -613,14 +613,14 @@ describe("render_documents", () => {
         assert.equal(result.isError, undefined);
         assert.equal(
             (result.content[0] as { text: string }).text,
-            "No documents were rendered: this month's 50 documents are used. The count resets on 2026-11-01.",
+            `No documents were rendered: this month's 50 documents are used. The count resets on 2026-11-01. ${ANON_TEXT.volumeWayOn}`,
         );
         const structured = result.structuredContent as { rows_rendered: number; volume: unknown };
         assert.equal(structured.rows_rendered, 0);
         assert.deepEqual(structured.volume, { used: 50, limit: 50, resets_at: "2026-11-01T00:00:00Z" });
     });
 
-    it("returns volume refusal messages verbatim as non-error render results", () => {
+    it("returns volume refusal messages, then where the rows can still go, as non-error render results", () => {
         for (const [status, message, used] of [
             ["volume_used", "This month's documents for this connection are used. The count resets on 2026-11-01.", 50],
             ["volume_short", "There are 2 documents left this month, fewer than the 3 rows sent. The count resets on 2026-11-01.", 48],
@@ -628,7 +628,7 @@ describe("render_documents", () => {
             const volume = { used, limit: 50, resets_at: "2026-11-01T00:00:00Z" };
             const result = buildRenderResult("letter", 3, { documents: [], status, message, volume }, API_URL);
             assert.equal(result.isError, false, status);
-            assert.equal(textOf(result), message);
+            assert.equal(textOf(result), `${message} ${ANON_TEXT.volumeWayOn}`);
             assert.deepEqual(result.structuredContent, {
                 template: "letter",
                 template_name: "Letter",
@@ -665,8 +665,8 @@ describe("render_documents", () => {
                 name: "render_documents", arguments: { template: "letter", rows: CERT_ROWS },
             });
             assert.ok(!result.isError, status);
-            if (documents.length === 0) assert.equal(textOf(result), message);
-            else assert.ok(textOf(result).startsWith(`${message}\nRendered 2 documents`));
+            if (documents.length === 0) assert.equal(textOf(result), `${message} ${ANON_TEXT.volumeWayOn}`);
+            else assert.ok(textOf(result).startsWith(`${message} ${ANON_TEXT.volumeWayOn}\nRendered 2 documents`));
             const structured = result.structuredContent as { message: string; status: string; rows_rendered: number };
             assert.equal(structured.message, message);
             assert.equal(structured.status, status);
@@ -683,7 +683,7 @@ describe("render_documents", () => {
         const result = buildRenderResult("certificate", 3, { ...RENDERED, status: "volume_short", message }, API_URL);
         assert.equal(result.isError, false);
         assert.deepEqual(result.structuredContent, { ...expected.structuredContent, status: "volume_short", message });
-        assert.equal(textOf(result), `${message}\n${textOf(expected)}`);
+        assert.equal(textOf(result), `${message} ${ANON_TEXT.volumeWayOn}\n${textOf(expected)}`);
     });
 
     it("preserves backend messages without trimming or truncating them, with and without documents", () => {
@@ -692,8 +692,8 @@ describe("render_documents", () => {
         for (const documents of [[], RENDERED.documents!]) {
             const result = buildRenderResult("certificate", 3, { ...RENDERED, documents, status: "volume_short", message }, API_URL);
             assert.equal(result.structuredContent!.message, message);
-            if (documents.length === 0) assert.equal(textOf(result), message);
-            else assert.ok(textOf(result).startsWith(`${message}\nRendered 2 documents`));
+            if (documents.length === 0) assert.equal(textOf(result), `${message} ${ANON_TEXT.volumeWayOn}`);
+            else assert.ok(textOf(result).startsWith(`${message} ${ANON_TEXT.volumeWayOn}\nRendered 2 documents`));
         }
     });
 
@@ -1519,7 +1519,7 @@ describe("shared-limit volume", () => {
         const message = "2 of the 3 rows were rendered. 1 did not fit in this month's volume, which is shared with other users. The count resets on 2026-11-01.";
         const result = buildRenderResult("certificate", 3, { ...RENDERED, status: "volume_short", message, volume: pool(10000, 10000) }, API_URL);
         const text = textOf(result as ToolResult);
-        assert.ok(text.startsWith(`${message}\n`));
+        assert.ok(text.startsWith(`${message} ${ANON_TEXT.volumeWayOn}\n`));
         assert.match(text, /This month's document limit is shared with other users; the count resets on 2026-11-01\./);
         assert.doesNotMatch(text, /\d+ of \d+ documents left/);
         assert.doesNotMatch(text, /10000|1000\b/);
@@ -1530,17 +1530,17 @@ describe("shared-limit volume", () => {
     it("words a shared refusal with no backend message without the pool's numbers", () => {
         const result = buildRenderResult("letter", 3, { documents: [], volume: pool(1000, 1000) }, API_URL);
         assert.equal(textOf(result as ToolResult),
-            "No documents were rendered: this month's documents are used. The limit is shared with other users and resets on 2026-11-01.");
+            `No documents were rendered: this month's documents are used. The limit is shared with other users and resets on 2026-11-01. ${ANON_TEXT.volumeWayOn}`);
     });
 
-    it("passes the backend's shared refusal through verbatim", async () => {
+    it("passes the backend's shared refusal through, then where the rows can still go", async () => {
         const message = "This month's documents are used. The limit is shared with other users and resets on 2026-11-01.";
         const body: BuiltinRenderResult = { documents: [], status: "volume_used", message, volume: pool(1000, 1000) };
         const { client } = await connect({ client: fakeClient({ renderBuiltin: async () => body }).client });
         await client.listTools();
         const result = await client.callTool({ name: "render_documents", arguments: { template: "letter", rows: [{ body: "x" }] } });
         assert.ok(!result.isError);
-        assert.equal(textOf(result), message);
+        assert.equal(textOf(result), `${message} ${ANON_TEXT.volumeWayOn}`);
         assert.deepEqual((result.structuredContent as { volume: unknown }).volume, pool(1000, 1000));
         assert.doesNotMatch(JSON.stringify(result), BANNED_WORDS);
     });

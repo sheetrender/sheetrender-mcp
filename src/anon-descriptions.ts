@@ -74,9 +74,11 @@ export const ANON_TEXT = {
         "must be text, numbers, true/false or null; a text value may hold at most 2000 " +
         "characters unless list_document_templates gives a different limit for that field. " +
         "Renders up to 25 rows per call and up to " +
-        "50 documents per month for each user; the response says how many documents remain " +
-        "this month (or that the month's limit is shared with other users) and when the count " +
-        "resets. Rows missing a required field are reported in " +
+        "50 documents per month for each user (in Claude, each conversation); callers the " +
+        "service cannot tell apart, such as all Claude users together, also share one monthly " +
+        "limit. The response says how many documents remain this month (or that the month's " +
+        "limit is shared with other users) and when the count resets. Rows missing a required " +
+        "field are reported in " +
         "missing_fields. Preview and PDF links expire after one hour. This tool only fills the " +
         "built-in templates; it does not accept HTML or custom designs.",
 
@@ -124,6 +126,11 @@ export const ANON_TEXT = {
     /** Too many requests being answered at once (http.ts), from one network or overall. */
     tooManyNetworkInFlight: "Too many requests from this network at once. Try again in a few seconds.",
     serverBusy: "The document service is busy. Try again in a few seconds.",
+    /**
+     * Follows every notice that the month's limit refused or cut a call, so a
+     * user who hits it (above all a shared one they did not use up) has a way on.
+     */
+    volumeWayOn: "The rows can also be taken to the SheetRender website with a continue link.",
     /** The volume line when the month's limit that applies is shared with other users. */
     sharedVolume: "This month's document limit is shared with other users",
     /** The backend refused for capacity reasons (HTTP 429 without a volume body). */

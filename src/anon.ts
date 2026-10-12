@@ -968,6 +968,10 @@ export function buildRenderResult(
     const expiresAt = typeof result.expires_at === "string" ? result.expires_at : null;
     const name = TEMPLATE_NAMES[key];
     const message = typeof result.message === "string" ? result.message : undefined;
+    // The backend's notice accompanies either a refusal or a partial render;
+    // both leave rows the month's limit kept out, so the model text says where
+    // they can still go. structuredContent keeps the notice as sent.
+    const notice = message !== undefined ? `${message} ${ANON_TEXT.volumeWayOn}` : undefined;
 
     const structured = {
         template: key,
@@ -983,9 +987,8 @@ export function buildRenderResult(
         ...(message !== undefined ? { message } : {}),
     };
 
-    // The backend's notice accompanies either a refusal or a partial render.
-    if (documents.length === 0 && message !== undefined) {
-        return { ...structuredResult(message, structured), isError: false };
+    if (documents.length === 0 && notice !== undefined) {
+        return { ...structuredResult(notice, structured), isError: false };
     }
 
     const resets = isoDate(volume?.resets_at ?? null);
@@ -995,15 +998,15 @@ export function buildRenderResult(
         return structuredResult(
             shared
                 ? "No documents were rendered: this month's documents are used. The limit is shared " +
-                    `with other users${resets ? ` and resets on ${resets}` : ""}.`
+                    `with other users${resets ? ` and resets on ${resets}` : ""}. ${ANON_TEXT.volumeWayOn}`
                 : `No documents were rendered: this month's ${volume.limit} documents are used.` +
-                    (resets ? ` The count resets on ${resets}.` : ""),
+                    (resets ? ` The count resets on ${resets}.` : "") + ` ${ANON_TEXT.volumeWayOn}`,
             structured,
         );
     }
 
     const lines: string[] = [
-        ...(message !== undefined ? [message] : []),
+        ...(notice !== undefined ? [notice] : []),
         `Rendered ${plural(documents.length, "document", "documents")} from ` +
             `${plural(rowsReceived, "row", "rows")} with the ${name} template.`,
     ];
