@@ -215,6 +215,27 @@ describe("create_dataset", () => {
         assert.equal(textOf(result), message);
         assert.doesNotMatch(textOf(result), /too old/);
     });
+
+    it("refuses bad rows with one issue however many there are, and still lists rows as objects", async () => {
+        const client = await connect({
+            createDatasetFromRows: async () => assert.fail("bad rows must not reach the API"),
+        });
+        // One issue per bad row is what let a few such calls exhaust the heap.
+        const result = await client.callTool({
+            name: "create_dataset",
+            arguments: { template_id: "tpl_1", rows: [...rows, ...Array(50_000).fill(1)] },
+        });
+        assert.equal(result.isError, true);
+        assert.equal(textOf(result).match(/Each row must be a JSON object/g)?.length, 1);
+        assert.match(textOf(result), /rows\[2\]/);
+        assert.ok(textOf(result).length < 500);
+
+        for (const tool of ["create_dataset", "design_template"]) {
+            const { tools } = await client.listTools();
+            const schema = tools.find((entry) => entry.name === tool)!.inputSchema.properties!.rows as { items: unknown };
+            assert.deepEqual(schema.items, { type: "object" }, tool);
+        }
+    });
 });
 
 describe("upload_dataset", () => {

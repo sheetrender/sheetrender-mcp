@@ -96,6 +96,15 @@ export const DEFAULT_CLAUDE_CALLS_PER_HOUR = 3000;
  */
 export const MAX_ANON_BATCH = 4;
 /**
+ * Most array elements and object members one anonymous tool call's arguments
+ * may carry, counted by the SDK before schema validation: the largest real
+ * call (create_continue_link's rows, each at the column cap) plus slack for
+ * the scalar arguments. Without it, a 2 MB body of a million tiny array
+ * elements makes validation build one issue per element and runs the 192 MiB
+ * heap out (GHSA-46jr-4wx8-v453).
+ */
+export const MAX_ANON_TOOL_INPUT_ELEMENTS = CONTINUE_ROW_LIMIT * (MAX_ROW_KEYS + 1) + 64;
+/**
  * Anonymous messages other than tool calls (initialize, tools/list,
  * resources/read, ...) per IPv4 /24 or IPv6 /48 per hour. A session sends a
  * handful; tool calls have their own buckets (guard() below). Not applied to
@@ -1107,7 +1116,7 @@ export function createAnonServer(options: AnonServerOptions): McpServer {
 
     const server = new McpServer(
         { name: SERVER_NAME, version: SERVER_VERSION },
-        { instructions: ANON_TEXT.instructions },
+        { instructions: ANON_TEXT.instructions, maxToolInputElements: MAX_ANON_TOOL_INPUT_ELEMENTS },
     );
 
     function safeResult(result: CallToolResult): CallToolResult {

@@ -87,6 +87,18 @@ const MAX_LOGGED_HEADER_CHARS = 40;
  */
 export const MAX_KEYED_BATCH = 20;
 /**
+ * Most array elements and object members one tool call's arguments may carry
+ * from an accepted key, and from a key not yet accepted. The SDK counts them
+ * before schema validation, which otherwise builds one issue per bad element:
+ * a 2 MB body of a million tiny elements runs the 192 MiB heap out
+ * (GHSA-46jr-4wx8-v453). The keyed tools' row arrays now fail with one issue
+ * (rowsSchema in index.ts), so the accepted-key cap only has to fit the API's
+ * own create_dataset limits: 500,000 cells, one per row and the few scalar
+ * arguments on top. Anonymous calls get MAX_ANON_TOOL_INPUT_ELEMENTS.
+ */
+export const MAX_KEYED_TOOL_INPUT_ELEMENTS = 600_000;
+export const MAX_UNVERIFIED_TOOL_INPUT_ELEMENTS = 20_000;
+/**
  * How long a key the API accepted keeps the API-key limits, renewed by every
  * accepted call. Only the limits ride on this: every tool call still sends
  * the key to the API, so a key revoked meanwhile is refused there at once.
@@ -854,7 +866,10 @@ export function createHttpServer(options: HttpServerOptions): Server {
                 publicUrl: options.publicUrl,
                 demoApiKey,
             })
-            : createServer(client, { hosted: true });
+            : createServer(client, {
+                hosted: true,
+                maxToolInputElements: verified ? MAX_KEYED_TOOL_INPUT_ELEMENTS : MAX_UNVERIFIED_TOOL_INPUT_ELEMENTS,
+            });
         // Left stateless on purpose: with a generator the SDK would check every
         // later request's id against this one transport instance, and the next
         // request lands on a fresh transport, perhaps on another replica. So the

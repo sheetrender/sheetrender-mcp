@@ -98,6 +98,11 @@ matter to hand-written clients. If the very first call is a body over 2 MB
 first and retry. Every request, with a key or without, counts toward the
 server-wide in-flight cap.
 
+One tool call's arguments may hold at most 600,000 values (array elements and
+object fields together) from an accepted key, enough for `create_dataset`'s
+500,000 cells, and 20,000 from a key not yet accepted. Anonymous calls are
+capped at a little over the largest real call.
+
 Bodies over 2 MB also take one of a few server-wide large-body slots, 1 by
 default (`LARGE_BODY_MAX_IN_FLIGHT`). A slot is taken before reading when
 `Content-Length` declares such a body, or as soon as a streamed body passes

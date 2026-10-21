@@ -9,7 +9,14 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { ClientRequestSchema, JSONRPCRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 
-import { CidrSet, MAX_ANON_BATCH, MAX_ANON_BODY_BYTES, OPENAI_EGRESS_CIDRS, subjectFingerprint } from "../src/anon.js";
+import {
+    CidrSet,
+    MAX_ANON_BATCH,
+    MAX_ANON_BODY_BYTES,
+    MAX_ANON_TOOL_INPUT_ELEMENTS,
+    OPENAI_EGRESS_CIDRS,
+    subjectFingerprint,
+} from "../src/anon.js";
 import { ANON_TEXT } from "../src/anon-descriptions.js";
 import {
     bearerToken,
@@ -18,6 +25,8 @@ import {
     keyFingerprint,
     loadHttpConfig,
     MAX_KEYED_BATCH,
+    MAX_KEYED_TOOL_INPUT_ELEMENTS,
+    MAX_UNVERIFIED_TOOL_INPUT_ELEMENTS,
     newSessionId,
     UntrustedSubjectTally,
     VerifiedKeys,
@@ -1115,6 +1124,29 @@ describe("anonymous mode", () => {
         await rawRpc(url, LIST_TEMPLATES_CALL, refused);
         assert.equal((await postRaw(url, listTools(MAX_ANON_BATCH + 1), refused)).status, 400);
         assert.deepEqual(backend.authHeaders, ["Bearer sr_live_real", "Bearer sr_live_revoked"]);
+    });
+
+    it("caps the values one tool call may carry before validating them, higher once the API accepted the key", async () => {
+        const backend = await keyCheckingBackend("sr_live_real");
+        const { url } = await startMcp(backend.url);
+        const real = { Authorization: "Bearer sr_live_real" };
+        // Bare numbers fail the row schema one by one: the shape that made
+        // validation build an issue per element and run the heap out.
+        const createDataset = (elements: number) => ({
+            jsonrpc: "2.0", id: 1, method: "tools/call",
+            params: { name: "create_dataset", arguments: { template_id: "tpl_1", rows: Array(elements - 1).fill(1) } },
+        });
+        const textOf = (json: unknown) => (json as { result: { content: { text: string }[] } }).result.content[0]!.text;
+        const capped = (max: number) => new RegExp(`more than the maximum of ${max} elements`);
+        // template_id plus the rows array is two members on top of the rows.
+        const atUnverified = await rawRpc(url, createDataset(MAX_UNVERIFIED_TOOL_INPUT_ELEMENTS - 1), real);
+        assert.doesNotMatch(textOf(atUnverified.json), /maximum of/);
+        const overUnverified = await rawRpc(url, createDataset(MAX_UNVERIFIED_TOOL_INPUT_ELEMENTS), real);
+        assert.match(textOf(overUnverified.json), capped(MAX_UNVERIFIED_TOOL_INPUT_ELEMENTS));
+        await rawRpc(url, LIST_TEMPLATES_CALL, real);
+        assert.doesNotMatch(textOf((await rawRpc(url, createDataset(MAX_UNVERIFIED_TOOL_INPUT_ELEMENTS), real)).json), /maximum of/);
+        const overKeyed = await rawRpc(url, createDataset(MAX_KEYED_TOOL_INPUT_ELEMENTS), real);
+        assert.match(textOf(overKeyed.json), capped(MAX_KEYED_TOOL_INPUT_ELEMENTS));
     });
 
     it("counts every message from an unconfirmed key toward the network budget, tool calls too", async () => {
