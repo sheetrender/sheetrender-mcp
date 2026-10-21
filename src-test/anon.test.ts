@@ -24,6 +24,7 @@ import {
     MAX_CELL_BYTES,
     MAX_HANDOFF_BYTES,
     MAX_ROW_KEYS,
+    MAX_ANON_TOOL_INPUT_ELEMENTS,
     normaliseCatalogue,
     OPENAI_EGRESS_CIDRS,
     parseCidr,
@@ -1609,5 +1610,28 @@ describe("subjectFingerprint", () => {
         assert.notEqual(tag, createHash("sha256").update(subject).digest("hex").slice(0, 12));
         assert.equal(subjectFingerprint(subject), tag);
         assert.notEqual(subjectFingerprint(`${subject}x`), tag);
+    });
+});
+
+describe("anonymous tool input size", () => {
+    it("refuses a call carrying more values than the largest real call, before validating them", async () => {
+        const { client, calls } = await connect();
+        const result = await client.callTool({
+            name: "render_documents",
+            arguments: { template: TEMPLATE_KEYS[0], rows: Array(MAX_ANON_TOOL_INPUT_ELEMENTS).fill(1) },
+        });
+        assert.equal(result.isError, true);
+        assert.match(textOf(result), new RegExp(`more than the maximum of ${MAX_ANON_TOOL_INPUT_ELEMENTS} elements`));
+        assert.equal(calls.renders.length, 0);
+    });
+
+    it("leaves room for a continue link at the row and column caps", async () => {
+        const { client } = await connect();
+        const row = Object.fromEntries(Array.from({ length: MAX_ROW_KEYS }, (_, index) => [`field_${index}`, "x"]));
+        const result = await client.callTool({
+            name: "create_continue_link",
+            arguments: { template: TEMPLATE_KEYS[0], rows: Array(CONTINUE_ROW_LIMIT).fill(row), title: "Everything" },
+        });
+        assert.doesNotMatch(textOf(result), /maximum of/);
     });
 });

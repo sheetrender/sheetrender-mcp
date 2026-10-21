@@ -158,6 +158,12 @@ export interface ServerOptions {
      * the stdio server's behaviour, is unchanged.
      */
     hosted?: boolean;
+    /**
+     * Most array elements and object members one tool call's arguments may
+     * carry, checked by the SDK before schema validation. Unset (the stdio
+     * server) means no limit; http.ts sets one per request.
+     */
+    maxToolInputElements?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -176,7 +182,7 @@ export function createServer(
 
     const server = new McpServer(
         { name: SERVER_NAME, version: SERVER_VERSION },
-        { instructions: text.instructions },
+        { instructions: text.instructions, maxToolInputElements: options.maxToolInputElements },
     );
 
     server.registerTool(
