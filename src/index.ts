@@ -93,6 +93,24 @@ const pageSettingsSchema = z
     })
     .describe("Optional page setup for the PDF.");
 
+/**
+ * One or more flat data rows. A bad row fails the call with one issue, for the
+ * first such row: z.array(z.record(...)) reports every failing element, so a
+ * call of 100,000 bare numbers built 100,000 issues and one message joining
+ * them, and a few such calls in one batch ran the hosted 192 MiB heap out. The
+ * item still reads as an object in tools/list.
+ */
+function rowsSchema() {
+    return z
+        .array(z.unknown().meta({ type: "object" }))
+        .min(1)
+        .superRefine((rows, ctx) => {
+            const bad = rows.findIndex((row) => row === null || typeof row !== "object" || Array.isArray(row));
+            if (bad >= 0) ctx.addIssue({ code: "custom", path: [bad], message: "Each row must be a JSON object." });
+        })
+        .transform((rows) => rows as Record<string, unknown>[]);
+}
+
 const dataSchema = z
     .record(z.string(), z.unknown())
     .describe(
@@ -239,7 +257,7 @@ export function createServer(
             description: text.designTemplate,
             inputSchema: {
                 dataset_id: z.string().min(1).describe("Existing dataset id; use exactly one data source.").optional(),
-                rows: z.array(z.record(z.string(), z.unknown())).min(1)
+                rows: rowsSchema()
                     .describe("Flat data rows; use exactly one data source.").optional(),
                 data_base64: z.string().min(1).describe("Base64 CSV or XLSX contents; at most 10 MB decoded.").optional(),
                 data_filename: z.string().min(1).describe("Data filename including .csv or .xlsx extension.").optional(),
@@ -361,9 +379,7 @@ export function createServer(
                         "Template id from list_templates. The dataset lands in that " +
                             "template's project.",
                     ),
-                rows: z
-                    .array(z.record(z.string(), z.unknown()))
-                    .min(1)
+                rows: rowsSchema()
                     .describe(
                         "One flat object per document. Keys become spreadsheet columns; " +
                             "values must be scalars (string, number, boolean or null).",

@@ -91,12 +91,12 @@ export const MAX_KEYED_BATCH = 20;
  * from an accepted key, and from a key not yet accepted. The SDK counts them
  * before schema validation, which otherwise builds one issue per bad element:
  * a 2 MB body of a million tiny elements runs the 192 MiB heap out
- * (GHSA-46jr-4wx8-v453). 200,000 values (20,000 rows of ten columns) is far
- * more than a model writes into one call and leaves validation well inside the
- * heap; data that large goes in as a file. Anonymous calls get
- * MAX_ANON_TOOL_INPUT_ELEMENTS.
+ * (GHSA-46jr-4wx8-v453). The keyed tools' row arrays now fail with one issue
+ * (rowsSchema in index.ts), so the accepted-key cap only has to fit the API's
+ * own create_dataset limits: 500,000 cells, one per row and the few scalar
+ * arguments on top. Anonymous calls get MAX_ANON_TOOL_INPUT_ELEMENTS.
  */
-export const MAX_KEYED_TOOL_INPUT_ELEMENTS = 200_000;
+export const MAX_KEYED_TOOL_INPUT_ELEMENTS = 600_000;
 export const MAX_UNVERIFIED_TOOL_INPUT_ELEMENTS = 20_000;
 /**
  * How long a key the API accepted keeps the API-key limits, renewed by every
