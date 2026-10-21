@@ -1,6 +1,6 @@
 {
   "name": "@sheetrender/mcp",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "mcpName": "io.github.sheetrender/sheetrender-mcp",
   "description": "MCP server for SheetRender: render PDFs from HTML templates and spreadsheet data via the SheetRender API.",
   "license": "MIT",
@@ -38,7 +38,7 @@
   "bugs": "https://github.com/sheetrender/sheetrender-mcp/issues",
   "author": "SheetRender <contact@sheetrender.com>",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.30.0",
+    "@modelcontextprotocol/sdk": "1.32.1",
     "zod": "4.4.3"
   },
   "devDependencies": {
