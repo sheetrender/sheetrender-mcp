@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: denoland/setup-deno@v2
         with:
-          deno-version: "2.9.4"
+          deno-version: "2.9.8"
       # The package.json scripts execute under node explicitly; pin it rather
       # than riding whatever the runner image happens to ship.
       - uses: actions/setup-node@v4

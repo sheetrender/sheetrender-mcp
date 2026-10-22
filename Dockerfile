@@ -10,8 +10,8 @@
 # pinned by digest; keep them in step with Dockerfile.dev and the sheetrender
 # repo's Dockerfiles. deploy/mcp/Dockerfile in the sheetrender repo mirrors
 # these stages against a tagged tarball of this repository — change both.
-FROM node:22.23.2-bookworm-slim@sha256:f32b81066cde10a75dbac96646099533316d94bac4150c55da1636e1f0ffdc46 AS build
-COPY --from=denoland/deno:bin-2.9.4@sha256:25675bd2a125b59bdcfbb6592ec5c332a2bc56e0dabf038184d8b2c6aec45c3b /deno /usr/local/bin/deno
+FROM node:22.23.4-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d AS build
+COPY --from=denoland/deno:bin-2.9.8@sha256:87522ebf680b22dc868397ca9d66f21e8de39a73e7fe918c43cd775dad5c92ae /deno /usr/local/bin/deno
 WORKDIR /app
 COPY package.json deno.lock ./
 RUN deno install --frozen
@@ -34,7 +34,7 @@ RUN node -e 'const fs = require("fs"); const p = JSON.parse(fs.readFileSync("pac
     && rm -rf node_modules \
     && deno install
 
-FROM node:22.23.2-bookworm-slim@sha256:f32b81066cde10a75dbac96646099533316d94bac4150c55da1636e1f0ffdc46
+FROM node:22.23.4-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d
 ENV NODE_ENV=production
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
