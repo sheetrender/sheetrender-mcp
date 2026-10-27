@@ -16,8 +16,10 @@ the same hosted URL.
 
 ## Setup
 
-Get an API key from [sheetrender.com](https://sheetrender.com) under Settings →
-API keys, then add this to your MCP client config:
+The npm package runs on your machine and needs an API key: it exits at startup
+without `SHEETRENDER_API_KEY`. (The [hosted endpoint](#hosted-endpoint) works
+without one.) Get a key from [sheetrender.com](https://sheetrender.com) under
+Settings → API keys, then add this to your MCP client config:
 
 ```json
 {
@@ -38,14 +40,16 @@ Set it only if you're pointing at a self-hosted or staging instance.
 
 The same server runs at **`https://mcp.sheetrender.com/mcp`** over Streamable
 HTTP, so clients that can't spawn a local process can use it too. Nothing is
-installed; each request carries your API key:
+installed, and the API key is optional. Send it on each request for the full
+tool set:
 
 ```
 Authorization: Bearer sr_live_...
 ```
 
 Requests without that header get the smaller no-key tool set described
-[below](#without-a-key-chatgpt-and-claude-directory-listings). The key goes straight through to the
+[below](#without-a-key-chatgpt-and-claude-directory-listings): SheetRender's
+built-in templates only. A key you send goes straight through to the
 SheetRender API for that one request and is never stored — the server keeps no
 sessions, so every request stands alone.
 
@@ -114,7 +118,8 @@ heap).
 
 ### Without a key (ChatGPT and Claude directory listings)
 
-When the server runs with `SHEETRENDER_DEMO_API_KEY` set, a request that
+When the server runs with `SHEETRENDER_DEMO_API_KEY` set, as the hosted
+server at `mcp.sheetrender.com` does, a request that
 sends **no** `Authorization` header gets a different, smaller tool set
 instead of a 401. These tools fill SheetRender's built-in templates
 (certificate of completion, letter, donation receipt, job offer letter) from
