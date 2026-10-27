@@ -17,7 +17,7 @@
       },
       "environmentVariables": [
         {
-          "description": "SheetRender API key (sr_live_...), from sheetrender.com under Settings",
+          "description": "SheetRender API key (sr_live_...), from sheetrender.com under Settings. Required by this local package, which exits without it; the hosted server at mcp.sheetrender.com works without a key",
           "isRequired": true,
           "format": "string",
           "isSecret": true,
@@ -40,8 +40,8 @@
       "headers": [
         {
           "name": "Authorization",
-          "description": "Bearer <SheetRender API key> (sr_live_..., from sheetrender.com under Settings)",
-          "isRequired": true,
+          "description": "Optional. Bearer <SheetRender API key> (sr_live_..., from sheetrender.com under Settings) for the full tool set: your own templates, HTML templates, datasets and batch jobs. Without it the server offers three tools that fill SheetRender's built-in templates (certificate, letter, donation receipt, job offer letter), up to 25 rows per call and a monthly document limit per user",
+          "isRequired": false,
           "isSecret": true,
           "format": "string",
           "placeholder": "Bearer sr_live_..."
